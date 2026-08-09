@@ -132,6 +132,12 @@ UI 用它区分同目录并存的会话 —— pane ID 能区分但不解释,标
 
 行类型不止 `user` / `assistant`,还包括 `queue-operation`、`attachment`、`ai-title`、`last-prompt`,以及子代理产生的 `isSidechain` 条目。解析时须用白名单,否则控制类记录会被当作对话渲染。
 
+### 2.10 服务端 timeline 与前端增量视图必须落同一套分组边界
+
+`GET /api/sessions/:id` 首次拉取用的是 `SessionManager` 自己维护的 `s.timeline`,与 WebSocket 增量更新走的前端 `onSessionEvent` 是两份独立实现,字段结构必须保持一致 —— 改其中一份而漏另一份,不会报类型错误(两边都是各自文件里的字面量对象),只在运行时表现为数据缺失。
+
+`turn_end` 一度只被前端 `onSessionEvent` 记录为 timeline 分组边界,`SessionManager.#absorb` 里同名分支只更新了计数器,没有写回 `s.timeline`。后果:每次刷新页面或重新打开会话,拉到的历史 timeline 里没有任何 `turn_end`,渲染时把整段历史当成"一个仍在进行中的轮次" —— 而进行中轮次只展示最新一步,已完成轮次的全部工具调用与中间文本因此从界面上消失,而非折叠。
+
 ---
 
 ## 3. 数据协议
