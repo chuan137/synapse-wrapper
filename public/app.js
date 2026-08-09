@@ -289,7 +289,9 @@ function renderTurns(d) {
 }
 
 function toolLine(t) {
-  if (t.kind === 'assistant') return `<div class="turn"><div class="who">Claude</div><div class="said">${esc(t.text)}</div></div>`;
+  // 过程中的 assistant 文本(非本轮结论)—— 弱于工具调用行,
+  // 也区分于 .turn .said 承载的结论,避免抢视觉、分不清主次。
+  if (t.kind === 'assistant') return `<div class="mid-text">${esc(t.text)}</div>`;
   const mark = !t.done ? '<span class="run-mark">running</span>'
     : t.isError ? '<span class="err-mark">✕</span>' : '<span class="ok-mark">✓</span>';
   return `<div class="tool-line"><span class="nm">${esc(t.name)}</span><span class="ar">${esc(t.summary)}</span>${mark}</div>`;
