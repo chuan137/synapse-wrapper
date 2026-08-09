@@ -213,13 +213,15 @@ main { flex: 1; display: flex; flex-direction: column; overflow: hidden; min-wid
 /* 已结束 turn 里工具调用与中间文本的折叠摘要 —— 减少结论之间的噪音。 */
 .proc { margin-bottom: 6px; }
 .proc-sum {
-  display: flex; align-items: center; gap: 6px; padding: 5px 2px;
-  font-size: 12px; color: var(--ink-3); cursor: pointer; user-select: none;
+  display: flex; align-items: center; gap: 7px; padding: 7px 10px;
+  font-size: 12px; color: var(--ink-2); cursor: pointer; user-select: none;
+  background: var(--surface); border: 1px solid var(--hair); border-radius: 8px;
 }
-.proc-sum:hover { color: var(--ink-2); }
-.proc-caret { display: inline-block; transition: transform .12s; font-size: 10px; }
+.proc-sum:hover { background: #fafafb; border-color: var(--ink-3); }
+/* 三角本身在小字号下太糊,看不出方向变化,故用更粗的字重和更高对比度替代。 */
+.proc-caret { display: inline-block; transition: transform .12s; font-size: 13px; color: var(--ink-3); font-weight: 700; }
 .proc.open .proc-caret { transform: rotate(90deg); }
-.proc-body { display: none; padding-top: 2px; }
+.proc-body { display: none; padding-top: 6px; }
 .proc.open .proc-body { display: block; }
 
 /* ── 终端输出 ── */
