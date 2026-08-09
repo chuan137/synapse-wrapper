@@ -48,6 +48,15 @@ const STATE_LABEL = {
   waiting: '等待批准', exited: '已退出',
 };
 
+// AskUserQuestion 之外的工具不再经网页批准(spec §2.3a),Claude Code
+// 内置权限系统若需要询问,会在没有 TTY 的 stream-json 管道里干等 ——
+// 网页看不到这类阻塞。超过此时长仍无结果回填,视为疑似卡住。
+const STALL_THRESHOLD_MS = 20_000;
+const isStalled = (s) => s.pendingToolSince != null && Date.now() - s.pendingToolSince > STALL_THRESHOLD_MS;
+const stallNotice = (s) => `<div class="c-why" style="border-radius:8px;margin-bottom:8px">
+  ⚠️ 工具调用已发出但${waited(s.pendingToolSince)}未返回结果,可能卡在本地终端的权限确认 —— 请去 tmux/终端查看该会话。
+</div>`;
+
 /** 把风险规则命中的片段标红。 */
 function renderCmd(summary, risk) {
   const safe = esc(summary);
@@ -149,6 +158,7 @@ function onSessionEvent(localId, ev) {
       if (kind && path && !d.files.some((f) => f.path === path)) {
         d.files.push({ path, kind, at: Date.now() });
       }
+      if (d.pendingToolSince == null) d.pendingToolSince = Date.now();
       break;
     }
     case 'tool_result': {
@@ -161,6 +171,9 @@ function onSessionEvent(localId, ev) {
           isError: ev.isError, at: Date.now(),
         });
       }
+      // 并发工具调用下,清掉的可能不是最早那个,需要重新取最小值
+      const openAts = d.timeline.filter((x) => x.kind === 'tool' && !x.done).map((x) => x.at);
+      d.pendingToolSince = openAts.length ? Math.min(...openAts) : null;
       break;
     }
     case 'turn_end':
@@ -371,7 +384,7 @@ function renderOverview() {
 
   if (busy.length) {
     html += `<div class="sect">进行中</div>`;
-    html += busy.map((s) => `<div class="card">
+    html += busy.map((s) => `${isStalled(s) ? stallNotice(s) : ''}<div class="card">
       <div class="c-top">
         <span class="c-repo">${displayName(s)}</span>
         <span class="c-tool">${STATE_LABEL[s.state]}${s.turns ? ` · 第 ${s.turns} 轮` : ''}</span>
@@ -416,7 +429,8 @@ function renderDetail() {
   if (!d) { $('body').innerHTML = `<div class="empty">加载中…</div>`; return; }
 
   const pend = pendingFor(d.localId).sort((a, b) => a.requestedAt - b.requestedAt);
-  let html = pend.map((a) => approvalCard(a, false)).join('');
+  let html = isStalled(d) ? stallNotice(d) : '';
+  html += pend.map((a) => approvalCard(a, false)).join('');
 
   if (state.tab === 'files') {
     if (d.files.length) {
@@ -558,6 +572,13 @@ setInterval(() => {
     el.textContent = countdown(Number(el.dataset.deadline));
   }
 }, 1000);
+
+// 卡住提示的触发条件(超过 STALL_THRESHOLD_MS)只靠时间推移达成,没有事件
+// 会触发它 —— 需要独立轮询,不能像倒计时那样只改文本,得整块增删 DOM。
+setInterval(() => {
+  if (state.view === 'overview' && [...state.sessions.values()].some(isStalled)) renderOverview();
+  else if (state.detail && isStalled(state.detail)) renderBody();
+}, 5000);
 
 // ── 启动 ────────────────────────────────────────────────────
 if (!token) {

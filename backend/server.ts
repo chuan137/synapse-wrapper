@@ -119,6 +119,10 @@ app.get('/api/sessions/:id', (req, res) => {
     res.status(404).json({ error: '会话不存在' });
     return;
   }
+  let pendingToolSince = null;
+  for (const t of s.openTools.values()) {
+    if (pendingToolSince === null || t.at < pendingToolSince) pendingToolSince = t.at;
+  }
   res.json({
     localId: s.localId,
     claudeId: s.claudeId,
@@ -135,6 +139,7 @@ app.get('/api/sessions/:id', (req, res) => {
     commands: s.commands,
     timeline: s.timeline,
     pending: s.claudeId ? permissions.listPending(s.claudeId) : [],
+    pendingToolSince,
   });
 });
 

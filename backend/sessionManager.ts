@@ -86,6 +86,10 @@ export interface SessionSummary {
   deletions: number;
   lastActivity: number;
   lastAction: string;
+  /** 最早一个未返回结果的工具调用发起时间;无挂起时为 null。
+   *  用于前端识别「已发出但卡住」—— 常见于本地权限系统等待 TTY 确认、
+   *  而 AskUserQuestion 之外的工具不再经网页批准(见 spec §2.3a)的场景。 */
+  pendingToolSince: number | null;
 }
 
 export interface Session {
@@ -175,6 +179,10 @@ export class SessionManager {
       if (f.kind === 'delete') deletions++;
       else additions++;
     }
+    let pendingToolSince: number | null = null;
+    for (const t of s.openTools.values()) {
+      if (pendingToolSince === null || t.at < pendingToolSince) pendingToolSince = t.at;
+    }
     return {
       localId: s.localId,
       claudeId: s.claudeId,
@@ -192,6 +200,7 @@ export class SessionManager {
       deletions,
       lastActivity: s.lastActivity,
       lastAction: s.lastAction,
+      pendingToolSince,
     };
   }
 
