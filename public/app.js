@@ -606,7 +606,8 @@ function wireApprovals(root) {
 // ── 渲染:主体 ──────────────────────────────────────────────
 function renderOverview() {
   const pend = [...state.pending.values()].sort((a, b) => a.requestedAt - b.requestedAt);
-  const all = [...state.sessions.values()];
+  // 组内按最新活动时间倒序 —— 同一优先级分组里,用户最可能想看的是刚动过的会话。
+  const all = [...state.sessions.values()].sort((a, b) => b.lastActivity - a.lastActivity);
   const busy = all.filter((s) => !pendingFor(s.localId).length && (s.state === 'busy' || s.state === 'starting'));
   const quiet = all.filter((s) => !pendingFor(s.localId).length && s.state !== 'busy' && s.state !== 'starting');
 
