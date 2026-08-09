@@ -152,6 +152,18 @@ UI 用它区分同目录并存的会话 —— pane ID 能区分但不解释,标
 
 重启后加载出的历史会话,`Session.transport` 落一个 `NullTransport` 占位(`alive()` 恒 `false`),避免 `Session.transport` 这个必填字段在历史记录上无处安放。
 
+### 2.12 任务清单工具实测有两套,不能只认 TodoWrite
+
+同一 2.1.226 环境下,同一会话实测调用的是 `TaskCreate` / `TaskUpdate` / `TaskGet` 这套增量工具,而非文档里常见的 `TodoWrite`。两者语义不同,不能共用一套归约逻辑:
+
+| | `TodoWrite` | `TaskCreate` / `TaskUpdate` |
+|---|---|---|
+| 更新方式 | 单次调用给全量清单,直接覆盖 | 增量:`TaskCreate` 建一项,`TaskUpdate` 按 `taskId` 改状态 |
+| 任务 ID | 无(数组顺序即身份) | 有,但 `TaskCreate` 的 `tool_use.input` 里**没有**,要等 `tool_result` |
+| ID 的实际来源 | 不适用 | `tool_result` 是人话确认文本 `"Task #4 created successfully: …"`,`taskId` 只能从这段文本正则解析(`/Task #(\S+) created/`),没有结构化字段 |
+
+哪套工具会被实际调用,目前判断依据不明(未观察到与 model/环境变量的明确关联),故两套都要接。两个来源(`s.todos` 全量数组、`s.tasks` 按 taskId 维护的 Map)合并成一份只读视图给前端,`TodoItem` 加一个可选 `id` 字段承载 `taskId`。归约逻辑并入 §2.11 提到的 `reduceEvent`,使其与 `#absorb`/`replayTranscriptTimeline` 两条路径天然共享,不需要单独维护;前端首次拉取详情页后要用 `id` 重建本地的 taskId 索引,否则后续 WS 增量的 `TaskUpdate` 事件找不到条目可改(参照 §2.10 的教训,这也是一处"服务端归约"与"前端增量"必须对齐的分叉点)。
+
 ---
 
 ## 3. 数据协议

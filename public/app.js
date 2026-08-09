@@ -171,6 +171,25 @@ function onSessionEvent(localId, ev) {
       if (kind && path && !d.files.some((f) => f.path === path)) {
         d.files.push({ path, kind, at: Date.now() });
       }
+      // TodoWrite 是整份清单替换,不是增量。
+      if (ev.name === 'TodoWrite' && Array.isArray(ev.input?.todos)) {
+        d.todos = ev.input.todos;
+      }
+      // Task* 系列(部分环境用它替代 TodoWrite):TaskCreate 的 tool_use 阶段
+      // 还没有 taskId(要等 tool_result 解出),先记生成信息;TaskUpdate 有
+      // taskId,直接改已建档任务的状态 —— 与后端 sessionManager.ts 同一套归约。
+      if (ev.name === 'TaskCreate') {
+        d.pendingTaskCreates.set(ev.toolUseId, {
+          subject: ev.input?.subject ?? '', activeForm: ev.input?.activeForm ?? '',
+        });
+      } else if (ev.name === 'TaskUpdate') {
+        const existing = d.tasks.get(ev.input?.taskId);
+        if (existing) {
+          if (['pending', 'in_progress', 'completed'].includes(ev.input?.status)) existing.status = ev.input.status;
+          if (typeof ev.input?.subject === 'string') existing.content = ev.input.subject;
+          if (typeof ev.input?.activeForm === 'string') existing.activeForm = ev.input.activeForm;
+        }
+      }
       if (d.pendingToolSince == null) d.pendingToolSince = Date.now();
       break;
     }
@@ -184,6 +203,16 @@ function onSessionEvent(localId, ev) {
           isError: ev.isError, at: Date.now(),
         });
       }
+      // TaskCreate 的 taskId 只在结果文本里给出("Task #4 created ..."),
+      // tool_use 阶段拿不到,等结果回填建档。
+      if (t?.name === 'TaskCreate' && !ev.isError) {
+        const pending = d.pendingTaskCreates.get(ev.toolUseId);
+        const match = typeof ev.content === 'string' ? ev.content.match(/Task #(\S+) created/) : null;
+        if (pending && match) {
+          d.tasks.set(match[1], { id: match[1], content: pending.subject, activeForm: pending.activeForm, status: 'pending' });
+        }
+        d.pendingTaskCreates.delete(ev.toolUseId);
+      }
       // 并发工具调用下,清掉的可能不是最早那个,需要重新取最小值
       const openAts = d.timeline.filter((x) => x.kind === 'tool' && !x.done).map((x) => x.at);
       d.pendingToolSince = openAts.length ? Math.min(...openAts) : null;
@@ -196,6 +225,12 @@ function onSessionEvent(localId, ev) {
       d.timeline.push({ kind: 'turn_end', at: Date.now() });
       break;
   }
+  // renderTodoPanel 只读 d.todos,Task* 分支只改了 d.tasks Map,
+  // 每次事件后都要重新合并 —— 与后端 sessionManager.ts 的 mergedTodos 同逻辑。
+  // TodoWrite 场景 d.todos 由该分支直接赋值,优先级更高,这里只在没有
+  // TodoWrite 数据时才用 tasks Map 兜底(不能靠 d.todos.length 判断 ——
+  // tasks 场景下上一次同步已经把它填成非空,length 再也不会掉回 0)。
+  if (ev.name !== 'TodoWrite' && d.tasks.size) d.todos = [...d.tasks.values()];
   renderBody();
   renderTabs();
 }
@@ -260,12 +295,47 @@ function toolLine(t) {
   return `<div class="tool-line"><span class="nm">${esc(t.name)}</span><span class="ar">${esc(t.summary)}</span>${mark}</div>`;
 }
 
+/** 迷你进度指示,列表侧栏与顶层卡片共用。 */
+function todoChip(progress) {
+  if (!progress || !progress.total) return '';
+  const pct = Math.round((progress.done / progress.total) * 100);
+  return `<span class="todo-chip" title="任务清单 ${progress.done}/${progress.total}">
+    <span class="todo-chip-bar"><span style="width:${pct}%"></span></span>
+    ${progress.done}/${progress.total}
+  </span>`;
+}
+
+/**
+ * 常驻任务清单面板 —— 不放进 renderTurns 的折叠逻辑里:
+ * 进行中的轮次只展示最新一步(见 renderTurns 顶部注释),TodoWrite 之后
+ * 一旦有别的工具调用,清单就会从"最新一步"里滚出去,必须独立于该规则常驻。
+ */
+function renderTodoPanel(d) {
+  if (!d.todos?.length) return '';
+  const STATUS_MARK = { completed: '✓', in_progress: '●', pending: '○' };
+  const rows = d.todos.map((t) => `<div class="todo-item ${t.status}">
+    <span class="todo-mark">${STATUS_MARK[t.status] ?? '○'}</span>
+    <span class="todo-text">${esc(t.status === 'in_progress' ? t.activeForm : t.content)}</span>
+  </div>`).join('');
+  const done = d.todos.filter((t) => t.status === 'completed').length;
+  return `<div class="card todo-panel">
+    <div class="c-top"><span class="c-repo">任务清单</span><span class="c-time">${done}/${d.todos.length} 完成</span></div>
+    ${rows}
+  </div>`;
+}
+
 function summarize(name, input) {
   if (name === 'Bash' && input?.command) return input.command;
   if (name === 'AskUserQuestion') {
     const qs = Array.isArray(input?.questions) ? input.questions : [];
     const first = qs[0]?.question;
     if (first) return qs.length > 1 ? `${first}(共 ${qs.length} 个问题)` : first;
+  }
+  if (name === 'TodoWrite') {
+    const todos = Array.isArray(input?.todos) ? input.todos : [];
+    if (!todos.length) return '更新任务清单';
+    const done = todos.filter((t) => t.status === 'completed').length;
+    return `更新任务清单(已完成 ${done}/${todos.length})`;
   }
   if (input?.file_path) return input.file_path;
   if (input?.pattern) return input.pattern;
@@ -319,6 +389,7 @@ function renderNav() {
     return `<div class="nav-item ${state.view === s.localId ? 'on' : ''}" data-id="${s.localId}">
       <span class="pip ${st}"></span>
       <span class="nav-name">${displayName(s)}</span>
+      ${todoChip(s.todoProgress)}
       ${n ? `<span class="nav-badge">${n}</span>` : ''}
     </div>`;
   };
@@ -545,6 +616,7 @@ function renderOverview() {
       <div class="c-cmd">${esc(s.lastAction)}</div>
       <div class="c-act">
         <span style="font-size:12px;color:var(--ink-3)">${s.fileCount ? `${s.fileCount} 个文件已改动` : ''}</span>
+        ${todoChip(s.todoProgress)}
         <button class="btn" style="margin-left:auto" data-open="${s.localId}">打开会话</button>
       </div>
     </div>`).join('');
@@ -585,7 +657,8 @@ function renderDetail() {
   // 其余页签没有"对话流"概念,沿用置顶,卡住提示同理。
   const pendCards = pend.map((a) => approvalCard(a, false)).join('');
   const stall = isStalled(d) ? stallNotice(d) : '';
-  let html = state.tab === 'chat' ? '' : stall + pendCards;
+  // 常驻所有页签顶部,不随对话页签的折叠规则隐藏 —— 见 renderTodoPanel 注释。
+  let html = renderTodoPanel(d) + (state.tab === 'chat' ? '' : stall + pendCards);
 
   if (state.tab === 'files') {
     if (d.files.length) {
@@ -664,7 +737,16 @@ async function navigate(id) {
     $('foot').style.display = 'block';
     try {
       state.detail = await api(`/api/sessions/${id}`);
-      if (state.detail) state.detail.expandedTurns = new Set();
+      if (state.detail) {
+        state.detail.expandedTurns = new Set();
+        // 后端已把 TodoWrite/Task* 两个来源合并进 todos 数组;Task* 来源的
+        // 条目带 id(见 sessionManager.ts TodoItem 注释),据此重建索引,
+        // 否则后续 WS 增量的 TaskUpdate 事件找不到条目可改。
+        state.detail.tasks = new Map(
+          state.detail.todos.filter((t) => t.id).map((t) => [t.id, t]),
+        );
+        state.detail.pendingTaskCreates = new Map();
+      }
     } catch {
       state.detail = null;
     }

@@ -13,7 +13,7 @@ import { randomUUID } from 'node:crypto';
 import { resolve } from 'node:path';
 import { existsSync, statSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { SessionManager, replayTranscriptTimeline, type ManagerEvent } from './sessionManager.ts';
+import { SessionManager, replayTranscriptTimeline, mergedTodos, type ManagerEvent } from './sessionManager.ts';
 import { PermissionEngine, HOOK_TIMEOUT_S, type PendingApproval } from './permissions.ts';
 import { writeState, clearState, DEFAULT_PORT, MAX_PORT_TRIES } from './daemon.ts';
 
@@ -130,15 +130,18 @@ app.get('/api/sessions/:id', async (req, res) => {
   }
 
   // 重启后加载的历史记录没有内存态 timeline —— 对话内容本就只写在转写文件里
-  // (sessions.json 只存元数据,见 backend/store.ts),按需现读。
+  // (sessions.json 只存元数据,见 backend/store.ts),按需现读。todos 同理:
+  // exited 会话的 s.todos/s.tasks 是初始化的空值,要靠重放才能补全(见 §2.12)。
   let files = [...s.files.values()];
   let commands = s.commands;
   let timeline = s.timeline;
+  let todos = mergedTodos(s);
   if (s.fromDisk && timeline.length === 0 && s.transcriptPath) {
     const history = await replayTranscriptTimeline(s.transcriptPath);
     files = history.files;
     commands = history.commands;
     timeline = history.timeline;
+    todos = history.todos;
   }
 
   res.json({
@@ -156,6 +159,7 @@ app.get('/api/sessions/:id', async (req, res) => {
     files,
     commands,
     timeline,
+    todos,
     pending: s.claudeId ? permissions.listPending(s.claudeId) : [],
     pendingToolSince,
   });
