@@ -60,6 +60,22 @@ export interface CommandRun {
   at: number;
 }
 
+/**
+ * 任务清单的单项。字段名对齐 TodoWrite 的 tool_input 结构;
+ * Task* 系列(见 §2.11)的字段名不同,读取时会映射到这套统一形状。
+ */
+export interface TodoItem {
+  content: string;
+  activeForm: string;
+  status: 'pending' | 'in_progress' | 'completed';
+  /**
+   * 仅 Task* 系列(s.tasks Map 的 key)才有 —— TodoWrite 语义是全量替换,
+   * 没有稳定 ID。前端首拉详情页后靠这个字段重建 taskId 索引,
+   * 否则后续 WS 增量的 TaskUpdate 事件找不到对应条目可改。
+   */
+  id?: string;
+}
+
 /** 对话与工具调用的时间线条目。 */
 export type TimelineItem =
   | { kind: 'user'; text: string; at: number }
@@ -93,6 +109,8 @@ export interface SessionSummary {
    *  用于前端识别「已发出但卡住」—— 常见于本地权限系统等待 TTY 确认、
    *  而 AskUserQuestion 之外的工具不再经网页批准(见 spec §2.3a)的场景。 */
   pendingToolSince: number | null;
+  /** 任务清单的完成度(TodoWrite 或 Task* 均可来源);从未用过时为 null。 */
+  todoProgress: { done: number; total: number } | null;
 }
 
 export interface Session {
@@ -117,6 +135,16 @@ export interface Session {
   lastAction: string;
   /** 未结束的工具调用,用于把结果回填到时间线。 */
   openTools: Map<string, TimelineItem & { kind: 'tool' }>;
+  /** TodoWrite 最近一次调用给出的全量清单 —— 该工具语义是整份替换,不是增量。 */
+  todos: TodoItem[];
+  /**
+   * TaskCreate/TaskUpdate/TaskGet 那套任务工具的状态,按 taskId 增量维护
+   * (与 TodoWrite 全量替换的语义不同)。同一会话通常只会用其中一套工具,
+   * #summarize / 详情页把两个来源合并成一份只读视图给前端,前端不关心来源。
+   */
+  tasks: Map<string, TodoItem>;
+  /** TaskCreate 调用发出但结果未回,等 tool_result 里解出 taskId 才能建档。 */
+  pendingTaskCreates: Map<string, { subject: string; activeForm: string }>;
 }
 
 export type ManagerEvent =
@@ -133,6 +161,14 @@ const REASON_LABEL: Record<string, string> = {
   bypass_permissions_disabled: '免批准模式关闭',
   other: '已退出',
 };
+
+/** TaskCreate 的 tool_result 是人话确认文本,taskId 只能从里面解析。 */
+const TASK_CREATED_RE = /Task #(\S+) created/;
+
+/** TodoWrite 全量清单与 TaskCreate/TaskUpdate 增量 Map 合并成一份视图,前端不关心来源。 */
+export function mergedTodos(s: Pick<Session, 'todos' | 'tasks'>): TodoItem[] {
+  return s.todos.length ? s.todos : [...s.tasks.values()];
+}
 
 const FILE_TOOLS: Record<string, FileChange['kind']> = {
   Edit: 'edit',
@@ -186,6 +222,12 @@ export class SessionManager {
     for (const t of s.openTools.values()) {
       if (pendingToolSince === null || t.at < pendingToolSince) pendingToolSince = t.at;
     }
+    let todoProgress: SessionSummary['todoProgress'] = null;
+    const todos = mergedTodos(s);
+    if (todos.length) {
+      const done = todos.filter((t) => t.status === 'completed').length;
+      todoProgress = { done, total: todos.length };
+    }
     return {
       localId: s.localId,
       claudeId: s.claudeId,
@@ -204,6 +246,7 @@ export class SessionManager {
       lastActivity: s.lastActivity,
       lastAction: s.lastAction,
       pendingToolSince,
+      todoProgress,
     };
   }
 
@@ -292,6 +335,9 @@ export class SessionManager {
       lastActivity: Date.now(),
       lastAction: '正在启动',
       openTools: new Map(),
+      todos: [],
+      tasks: new Map(),
+      pendingTaskCreates: new Map(),
     };
 
     this.#sessions.set(localId, session);
@@ -355,6 +401,35 @@ export class SessionManager {
         s.openTools.set(ev.toolUseId, item);
         s.lastAction = `${ev.name} ${summary}`.slice(0, 90);
 
+        // TodoWrite 是整份清单替换,不是增量 —— 直接覆盖即可,
+        // 不需要跟历史条目合并。
+        if (ev.name === 'TodoWrite') {
+          const todos = (ev.input as Record<string, unknown> | undefined)?.todos;
+          if (Array.isArray(todos)) s.todos = todos as TodoItem[];
+        }
+
+        // Task* 系列(部分环境用它替代 TodoWrite)是增量式:TaskCreate 的
+        // tool_use 阶段还没有 taskId(要等 tool_result 解析),先记生成信息;
+        // TaskUpdate 有 taskId,直接改已建档的任务状态。
+        if (ev.name === 'TaskCreate') {
+          const input = (ev.input ?? {}) as Record<string, unknown>;
+          s.pendingTaskCreates.set(ev.toolUseId, {
+            subject: typeof input.subject === 'string' ? input.subject : '',
+            activeForm: typeof input.activeForm === 'string' ? input.activeForm : '',
+          });
+        } else if (ev.name === 'TaskUpdate') {
+          const input = (ev.input ?? {}) as Record<string, unknown>;
+          const taskId = typeof input.taskId === 'string' ? input.taskId : '';
+          const existing = taskId ? s.tasks.get(taskId) : undefined;
+          if (existing) {
+            if (input.status === 'pending' || input.status === 'in_progress' || input.status === 'completed') {
+              existing.status = input.status;
+            }
+            if (typeof input.subject === 'string') existing.content = input.subject;
+            if (typeof input.activeForm === 'string') existing.activeForm = input.activeForm;
+          }
+        }
+
         // 文件类工具:记入改动列表
         const kind = FILE_TOOLS[ev.name];
         if (kind) {
@@ -384,6 +459,24 @@ export class SessionManager {
               isError: ev.isError,
               at: Date.now(),
             });
+          }
+
+          // TaskCreate 的 taskId 只在这段确认文本里给出(如 "Task #4 created
+          // successfully: ..."),tool_use 阶段拿不到,只能等结果回填建档。
+          if (open.name === 'TaskCreate' && !ev.isError) {
+            const pending = s.pendingTaskCreates.get(ev.toolUseId);
+            const text = typeof ev.content === 'string' ? ev.content : '';
+            const match = text.match(TASK_CREATED_RE);
+            const taskId = match?.[1];
+            if (pending && taskId) {
+              s.tasks.set(taskId, {
+                id: taskId,
+                content: pending.subject,
+                activeForm: pending.activeForm,
+                status: 'pending',
+              });
+            }
+            s.pendingTaskCreates.delete(ev.toolUseId);
           }
         }
         break;

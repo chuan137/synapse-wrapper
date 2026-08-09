@@ -138,6 +138,18 @@ UI 用它区分同目录并存的会话 —— pane ID 能区分但不解释,标
 
 `turn_end` 一度只被前端 `onSessionEvent` 记录为 timeline 分组边界,`SessionManager.#absorb` 里同名分支只更新了计数器,没有写回 `s.timeline`。后果:每次刷新页面或重新打开会话,拉到的历史 timeline 里没有任何 `turn_end`,渲染时把整段历史当成"一个仍在进行中的轮次" —— 而进行中轮次只展示最新一步,已完成轮次的全部工具调用与中间文本因此从界面上消失,而非折叠。
 
+### 2.11 任务清单工具实测有两套,不能只认 TodoWrite
+
+同一 2.1.226 环境下,同一会话实测调用的是 `TaskCreate` / `TaskUpdate` / `TaskGet` 这套增量工具,而非文档里常见的 `TodoWrite`。两者语义不同,不能共用一套归约逻辑:
+
+| | `TodoWrite` | `TaskCreate` / `TaskUpdate` |
+|---|---|---|
+| 更新方式 | 单次调用给全量清单,直接覆盖 | 增量:`TaskCreate` 建一项,`TaskUpdate` 按 `taskId` 改状态 |
+| 任务 ID | 无(数组顺序即身份) | 有,但 `TaskCreate` 的 `tool_use.input` 里**没有**,要等 `tool_result` |
+| ID 的实际来源 | 不适用 | `tool_result` 是人话确认文本 `"Task #4 created successfully: …"`,`taskId` 只能从这段文本正则解析(`/Task #(\S+) created/`),没有结构化字段 |
+
+哪套工具会被实际调用,目前判断依据不明(未观察到与 model/环境变量的明确关联),故两套都要接。落地时把两个来源(`s.todos` 全量数组、`s.tasks` 按 taskId 维护的 Map)合并成一份只读视图给前端,`TodoItem` 加一个可选 `id` 字段承载 `taskId`,前端首次拉取详情页后要用它重建本地的 taskId 索引,否则后续 WS 增量的 `TaskUpdate` 事件找不到条目可改(参照 §2.10 的教训,这也是一处"服务端归约"与"前端增量"必须对齐的分叉点)。
+
 ---
 
 ## 3. 数据协议

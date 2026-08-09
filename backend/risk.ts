@@ -118,6 +118,9 @@ export function summarizeInput(toolName: string, toolInput: unknown): string {
   const input = (toolInput ?? {}) as Record<string, unknown>;
   if (toolName === 'Bash' && typeof input.command === 'string') return input.command;
   if (toolName === 'AskUserQuestion') return summarizeQuestions(input);
+  if (toolName === 'TodoWrite') return summarizeTodos(input);
+  if (toolName === 'TaskCreate' && typeof input.subject === 'string') return `新建任务:${input.subject}`;
+  if (toolName === 'TaskUpdate' && typeof input.status === 'string') return `任务状态 → ${input.status}`;
   if (typeof input.file_path === 'string') return input.file_path;
   if (typeof input.pattern === 'string') return input.pattern;
   if (typeof input.url === 'string') return input.url;
@@ -134,4 +137,12 @@ function summarizeQuestions(input: Record<string, unknown>): string {
   const first = questions[0]?.question;
   if (typeof first !== 'string') return 'AskUserQuestion';
   return questions.length > 1 ? `${first}(共 ${questions.length} 个问题)` : first;
+}
+
+/** timeline 里那行工具调用摘要用:完成度而非整份清单的 JSON。 */
+function summarizeTodos(input: Record<string, unknown>): string {
+  const todos = Array.isArray(input.todos) ? input.todos : [];
+  if (!todos.length) return '更新任务清单';
+  const done = todos.filter((t: any) => t?.status === 'completed').length;
+  return `更新任务清单(已完成 ${done}/${todos.length})`;
 }

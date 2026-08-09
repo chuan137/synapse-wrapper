@@ -182,6 +182,33 @@ main { flex: 1; display: flex; flex-direction: column; overflow: hidden; min-wid
 
 .sect { font-size: 11.5px; font-weight: 600; color: var(--ink-3); margin: 20px 2px 9px; }
 .sect:first-child { margin-top: 0; }
+
+/* ── TodoWrite 任务清单 ── */
+.todo-panel .c-top { background: var(--blue-soft); }
+.todo-item {
+  display: flex; align-items: baseline; gap: 8px; padding: 7px 14px;
+  font-size: 13px; border-bottom: 1px solid var(--hair-soft);
+}
+.todo-item:last-child { border-bottom: 0; }
+.todo-mark { flex: none; width: 14px; text-align: center; color: var(--ink-3); }
+.todo-item.completed { color: var(--ink-3); }
+.todo-item.completed .todo-text { text-decoration: line-through; }
+.todo-item.completed .todo-mark { color: var(--green); }
+.todo-item.in_progress { font-weight: 500; }
+.todo-item.in_progress .todo-mark { color: var(--blue); }
+
+/* 侧栏/顶层卡片的迷你进度角标 */
+.todo-chip {
+  display: inline-flex; align-items: center; gap: 5px;
+  font: 11px var(--mono); color: var(--ink-3);
+}
+.nav-item.on .todo-chip { color: rgba(255,255,255,.8); }
+.todo-chip-bar {
+  width: 28px; height: 4px; border-radius: 2px; background: var(--hair); overflow: hidden;
+}
+.todo-chip-bar span { display: block; height: 100%; background: var(--blue); }
+.nav-item.on .todo-chip-bar { background: rgba(255,255,255,.3); }
+.nav-item.on .todo-chip-bar span { background: #fff; }
 .empty { padding: 40px 20px; text-align: center; color: var(--ink-3); font-size: 13px; }
 
 /* ── 改动文件 ── */

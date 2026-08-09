@@ -13,7 +13,7 @@ import { randomUUID } from 'node:crypto';
 import { resolve } from 'node:path';
 import { existsSync, statSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { SessionManager, type ManagerEvent } from './sessionManager.ts';
+import { SessionManager, mergedTodos, type ManagerEvent } from './sessionManager.ts';
 import { PermissionEngine, HOOK_TIMEOUT_S, type PendingApproval } from './permissions.ts';
 import { writeState, clearState, DEFAULT_PORT, MAX_PORT_TRIES } from './daemon.ts';
 
@@ -138,6 +138,7 @@ app.get('/api/sessions/:id', (req, res) => {
     files: [...s.files.values()],
     commands: s.commands,
     timeline: s.timeline,
+    todos: mergedTodos(s),
     pending: s.claudeId ? permissions.listPending(s.claudeId) : [],
     pendingToolSince,
   });
