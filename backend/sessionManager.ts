@@ -16,6 +16,8 @@ import { StreamJsonTransport } from './streamJson.ts';
 import { TmuxTransport } from './tmuxTransport.ts';
 import { HOOK_TIMEOUT_S } from './permissions.ts';
 import { summarizeInput } from './risk.ts';
+import { transcriptPathFor, replayTranscript } from './transcript.ts';
+import { loadSessions, SessionStore } from './store.ts';
 import type { SessionEvent, SessionTransport } from './transport.ts';
 
 /**
@@ -95,6 +97,28 @@ export interface SessionSummary {
   pendingToolSince: number | null;
 }
 
+/**
+ * 落盘的会话快照 —— 只含元数据,不含 timeline。
+ * 对话内容本就写在 transcriptPath 指向的转写文件里,重复存一份只会
+ * 造出两个可能不同步的历史来源(详见 docs/spec.md)。
+ */
+export interface PersistedSession {
+  localId: string;
+  claudeId: string | null;
+  name: string;
+  title: string | null;
+  workspace: string;
+  transportKind: TransportKind;
+  tmuxName: string | null;
+  turns: number;
+  costUsd: number;
+  fileCount: number;
+  lastActivity: number;
+  lastAction: string;
+  /** 会话进程已不在(总是如此 —— 只有重启后失去进程的会话才落这份快照)。 */
+  transcriptPath: string | null;
+}
+
 export interface Session {
   localId: string;
   claudeId: string | null;
@@ -117,6 +141,10 @@ export interface Session {
   lastAction: string;
   /** 未结束的工具调用,用于把结果回填到时间线。 */
   openTools: Map<string, TimelineItem & { kind: 'tool' }>;
+  /** claudeId 一旦确定即可推出,供退出后按需重读对话历史(见 backend/transcript.ts)。 */
+  transcriptPath: string | null;
+  /** 从 sessions.json 加载的记录,没有真实进程 —— files/commands/timeline 现读 transcript 时才补全。 */
+  fromDisk: boolean;
 }
 
 export type ManagerEvent =
@@ -140,17 +168,197 @@ const FILE_TOOLS: Record<string, FileChange['kind']> = {
   NotebookEdit: 'edit',
 };
 
+/** #absorb 与历史重放共用的数据形状 —— 只含可从事件流派生的字段,不含 state/lastAction 等运行时态。 */
+interface ReplayTarget {
+  timeline: TimelineItem[];
+  openTools: Map<string, TimelineItem & { kind: 'tool' }>;
+  files: Map<string, FileChange>;
+  commands: CommandRun[];
+  turns: number;
+  costUsd: number;
+}
+
+/**
+ * 把一个事件归约进 timeline/files/commands。#absorb 与「exited 会话按需重读
+ * transcript」共用此函数 —— 避免像 spec §2.10 那次事故一样,两条路径各写一份
+ * 归约逻辑、字段结构悄悄分叉,只在运行时表现为数据缺失。
+ */
+function reduceEvent(t: ReplayTarget, ev: SessionEvent, now: () => number): void {
+  switch (ev.kind) {
+    case 'assistant_text':
+      t.timeline.push({ kind: 'assistant', text: ev.text, at: now() });
+      break;
+
+    case 'tool_use': {
+      const summary = summarizeInput(ev.name, ev.input);
+      const item: TimelineItem & { kind: 'tool' } = {
+        kind: 'tool',
+        toolUseId: ev.toolUseId,
+        name: ev.name,
+        summary,
+        done: false,
+        isError: false,
+        at: now(),
+      };
+      t.timeline.push(item);
+      t.openTools.set(ev.toolUseId, item);
+
+      const kind = FILE_TOOLS[ev.name];
+      if (kind) {
+        const input = (ev.input ?? {}) as Record<string, unknown>;
+        const path = typeof input.file_path === 'string' ? input.file_path : '';
+        // 已存在的记录保持首次判定(new 优先于后续 edit)
+        if (path && !t.files.has(path)) t.files.set(path, { path, kind, at: now() });
+      }
+      break;
+    }
+
+    case 'tool_result': {
+      const open = t.openTools.get(ev.toolUseId);
+      if (open) {
+        open.done = true;
+        open.isError = ev.isError;
+        t.openTools.delete(ev.toolUseId);
+
+        if (open.name === 'Bash') {
+          t.commands.push({
+            toolUseId: ev.toolUseId,
+            command: open.summary,
+            output: typeof ev.content === 'string' ? ev.content : JSON.stringify(ev.content),
+            isError: ev.isError,
+            at: now(),
+          });
+        }
+      }
+      break;
+    }
+
+    case 'turn_end':
+      t.turns++;
+      if (ev.costUsd) t.costUsd += ev.costUsd;
+      t.timeline.push({ kind: 'turn_end', at: now() });
+      break;
+  }
+}
+
+export interface ReplayedHistory {
+  timeline: TimelineItem[];
+  files: FileChange[];
+  commands: CommandRun[];
+  turns: number;
+  costUsd: number;
+}
+
+/**
+ * exited 会话没有内存态时按需重读转写文件 —— sessions.json 只存元数据
+ * (见 backend/store.ts),对话内容单一来源是 Claude Code 自己写的转写文件。
+ * 时间戳统一退回文件读取时刻:转写行本身不带时间字段,不影响排序(读的是原始顺序)。
+ */
+export async function replayTranscriptTimeline(transcriptPath: string): Promise<ReplayedHistory> {
+  const t: ReplayTarget = {
+    timeline: [],
+    openTools: new Map(),
+    files: new Map(),
+    commands: [],
+    turns: 0,
+    costUsd: 0,
+  };
+  const now = Date.now();
+  for (const ev of await replayTranscript(transcriptPath)) {
+    reduceEvent(t, ev, () => now);
+  }
+  return {
+    timeline: t.timeline,
+    files: [...t.files.values()],
+    commands: t.commands,
+    turns: t.turns,
+    costUsd: t.costUsd,
+  };
+}
+
+/**
+ * 从磁盘加载的历史会话没有真实进程,占位实现供 Session.transport 落位。
+ * alive() 恒 false —— liveness 巡检据此不会误把它当活会话反复探测。
+ */
+class NullTransport implements SessionTransport {
+  readonly sessionId: string | null = null;
+  async start(): Promise<void> {}
+  send(): void {}
+  interrupt(): void {}
+  async stop(): Promise<void> {}
+  async alive(): Promise<boolean> { return false; }
+  onEvent(): () => void { return () => {}; }
+}
+
 export class SessionManager {
   #sessions = new Map<string, Session>();
   #byClaudeId = new Map<string, string>();
   #listeners: ((e: ManagerEvent) => void)[] = [];
   #port: () => number;
   #host: string;
+  #store: SessionStore;
 
-  /** 端口取函数而非定值 —— 监听时可能因占用递增,钩子 URL 必须用最终值。 */
-  constructor(host: string, port: () => number) {
+  /**
+   * port 是取函数而非定值 —— 监听时可能因占用递增,钩子 URL 必须用最终值。
+   * requestedPort 与之不同:它是持久化目录的 key(见 daemon.ts stateDir),
+   * 必须用「请求端口」而非「实际监听端口」,否则默认端口偶尔因占用而偏移时,
+   * 上次启动写的 sessions.json 会因为目录名对不上而读不到。
+   */
+  constructor(host: string, port: () => number, requestedPort: number) {
     this.#host = host;
     this.#port = port;
+    this.#store = new SessionStore(requestedPort, () => this.#persistedAll());
+    this.#loadPersisted(requestedPort);
+  }
+
+  /** 启动时把历史记录接回内存,标 exited(进程已经不在,只是记录还在)。 */
+  #loadPersisted(requestedPort: number): void {
+    for (const p of loadSessions(requestedPort)) {
+      if (this.#sessions.has(p.localId)) continue;  // 理论上不会撞,防御一下
+      const session: Session = {
+        localId: p.localId,
+        claudeId: p.claudeId,
+        name: p.name,
+        title: p.title,
+        workspace: p.workspace,
+        state: 'exited',
+        transport: new NullTransport(),
+        transportKind: p.transportKind,
+        tmuxName: p.tmuxName,
+        paneId: null,
+        settingsPath: join(p.workspace, '.claude', 'settings.local.json'),
+        turns: p.turns,
+        costUsd: p.costUsd,
+        files: new Map(),
+        commands: [],
+        timeline: [],
+        lastActivity: p.lastActivity,
+        lastAction: p.lastAction,
+        openTools: new Map(),
+        transcriptPath: p.transcriptPath,
+        fromDisk: true,
+      };
+      this.#sessions.set(p.localId, session);
+      if (p.claudeId) this.#byClaudeId.set(p.claudeId, p.localId);
+    }
+  }
+
+  #persistedAll(): PersistedSession[] {
+    return [...this.#sessions.values()].map((s) => ({
+      localId: s.localId,
+      claudeId: s.claudeId,
+      name: s.name,
+      title: s.title,
+      workspace: s.workspace,
+      transportKind: s.transportKind,
+      tmuxName: s.tmuxName,
+      turns: s.turns,
+      costUsd: s.costUsd,
+      fileCount: s.files.size,
+      lastActivity: s.lastActivity,
+      lastAction: s.lastAction,
+      transcriptPath: s.transcriptPath,
+    }));
   }
 
   onEvent(fn: (e: ManagerEvent) => void): void {
@@ -245,6 +453,7 @@ export class SessionManager {
     s.lastAction = lastAction;
     s.lastActivity = Date.now();
     this.#emit({ type: 'session_updated', session: this.#summarize(s) });
+    this.#store.scheduleSave();
   }
 
   /** 状态变更由外部(权限引擎)触发时调用,例如出现待批准项。 */
@@ -292,12 +501,15 @@ export class SessionManager {
       lastActivity: Date.now(),
       lastAction: '正在启动',
       openTools: new Map(),
+      transcriptPath: null,
+      fromDisk: false,
     };
 
     this.#sessions.set(localId, session);
     transport.onEvent((ev) => this.#absorb(session, ev));
 
     this.#emit({ type: 'session_added', session: this.#summarize(session) });
+    this.#store.scheduleSave();
 
     // 接管模式下 claude 尚未启动(CLI 拿到 settings 路径后才启动),
     // start() 会一直等到 TUI 就绪 —— 必须放行,否则注册请求要挂到超时。
@@ -328,73 +540,22 @@ export class SessionManager {
         }
         s.claudeId = ev.sessionId;
         this.#byClaudeId.set(ev.sessionId, s.localId);
+        s.transcriptPath = transcriptPathFor(s.workspace, ev.sessionId);
         break;
       }
-
-      case 'assistant_text':
-        s.timeline.push({ kind: 'assistant', text: ev.text, at: Date.now() });
-        break;
 
       case 'title':
         // 与 name 并存而非覆盖 —— name(目录名)仍用于分组与路径识别
         s.title = ev.title;
         break;
 
-      case 'tool_use': {
-        const summary = summarizeInput(ev.name, ev.input);
-        const item: TimelineItem & { kind: 'tool' } = {
-          kind: 'tool',
-          toolUseId: ev.toolUseId,
-          name: ev.name,
-          summary,
-          done: false,
-          isError: false,
-          at: Date.now(),
-        };
-        s.timeline.push(item);
-        s.openTools.set(ev.toolUseId, item);
-        s.lastAction = `${ev.name} ${summary}`.slice(0, 90);
-
-        // 文件类工具:记入改动列表
-        const kind = FILE_TOOLS[ev.name];
-        if (kind) {
-          const input = (ev.input ?? {}) as Record<string, unknown>;
-          const path = typeof input.file_path === 'string' ? input.file_path : '';
-          if (path) {
-            // 已存在的记录保持首次判定(new 优先于后续 edit)
-            if (!s.files.has(path)) s.files.set(path, { path, kind, at: Date.now() });
-          }
-        }
+      case 'tool_use':
+        s.lastAction = `${ev.name} ${summarizeInput(ev.name, ev.input)}`.slice(0, 90);
         break;
-      }
-
-      case 'tool_result': {
-        const open = s.openTools.get(ev.toolUseId);
-        if (open) {
-          open.done = true;
-          open.isError = ev.isError;
-          s.openTools.delete(ev.toolUseId);
-
-          // Bash 结果留档,供「终端输出」页签
-          if (open.name === 'Bash') {
-            s.commands.push({
-              toolUseId: ev.toolUseId,
-              command: open.summary,
-              output: typeof ev.content === 'string' ? ev.content : JSON.stringify(ev.content),
-              isError: ev.isError,
-              at: Date.now(),
-            });
-          }
-        }
-        break;
-      }
 
       case 'turn_end':
-        s.turns++;
-        if (ev.costUsd) s.costUsd += ev.costUsd;
         s.state = 'ready';
         s.lastAction = '等待输入';
-        s.timeline.push({ kind: 'turn_end', at: Date.now() });
         break;
 
       case 'status':
@@ -406,9 +567,11 @@ export class SessionManager {
         }
         break;
     }
+    reduceEvent(s, ev, Date.now);
 
     this.#emit({ type: 'session_event', localId: s.localId, event: ev });
     this.#emit({ type: 'session_updated', session: this.#summarize(s) });
+    this.#store.scheduleSave();
   }
 
   send(localId: string, text: string): boolean {
@@ -419,16 +582,31 @@ export class SessionManager {
     return true;
   }
 
+  /** 用户在网页上主动删除会话 —— 记录本身也从持久化里摘除,不留痕迹。 */
   async close(localId: string): Promise<void> {
     const s = this.#sessions.get(localId);
     if (!s) return;
     await s.transport.stop();
     if (s.claudeId) this.#byClaudeId.delete(s.claudeId);
     this.#sessions.delete(localId);
+    // 立即落盘而非等 debounce —— 否则紧接着的进程退出会让这条
+    // 「已删除」的记录因为磁盘上还是旧快照而在下次启动时复活。
+    this.#store.saveNow();
   }
 
-  async closeAll(): Promise<void> {
-    await Promise.all([...this.#sessions.keys()].map((id) => this.close(id)));
+  /**
+   * 后端进程退出(SIGINT/SIGTERM)时调用 —— 只停子进程,记录留着标 exited。
+   * 与 close() 语义不同:close() 是用户主动删除,这里是宿主进程退出,
+   * 目的正是让下次启动时左栏仍能看到这些会话(持久化的意义所在)。
+   */
+  async stopAll(): Promise<void> {
+    await Promise.all(
+      [...this.#sessions.values()].map(async (s) => {
+        await s.transport.stop();
+        this.#markExited(s, s.lastAction);
+      }),
+    );
+    this.#store.saveNow();
   }
 
   /**

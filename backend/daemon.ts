@@ -1,9 +1,17 @@
 /**
  * 守护进程管理 —— 状态落盘、健康检查、后台拉起。
  *
- * 状态存 ~/.synapse/:daemon.pid / port / token,由后端监听成功后自己写入
- * (端口递增重试发生在服务端,detached 启动的父进程拿不到 stdout,
- *  无从得知最终端口)。
+ * 状态存 ~/.synapse/<port>/:daemon.pid / port / token,由后端监听成功后
+ * 自己写入(端口递增重试发生在服务端,detached 启动的父进程拿不到 stdout,
+ * 无从得知最终端口)。
+ *
+ * 按「请求端口」(调用方想要的目标端口,不是最终实际监听的端口)分目录 ——
+ * 这是 Project List 落地后的新需求:不同 workspace 下开 wrapper 要能找到
+ * 同一个生产 daemon,但测试环境指定另一个端口时不能读到/污染生产的状态文件。
+ * 显式指定端口时不允许递增(见 server.ts),故「请求端口」与「实际监听端口」
+ * 精确相等,目录名可预测。默认端口仍走原有递增容错,此时两者也相等 ——
+ * 只有在默认端口已被非本工具的其他服务占用时才会有出入,这属于已知的
+ * 陈旧健康检查边界(见 checkHealth 的 token 校验)。
  *
  * 健康检查必须 PID 与 HTTP 双过:PID 可能被系统回收后分配给无关进程,
  * 单看 PID 会把陌生进程误认成后端;而端口可能被别的程序占着,
@@ -15,14 +23,13 @@ import { join, resolve } from 'node:path';
 import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 
-export const STATE_DIR = join(homedir(), '.synapse');
-const PID_FILE = join(STATE_DIR, 'daemon.pid');
-const PORT_FILE = join(STATE_DIR, 'port');
-const TOKEN_FILE = join(STATE_DIR, 'token');
+const SYNAPSE_DIR = join(homedir(), '.synapse');
 
 export const HOST = '127.0.0.1';
-export const DEFAULT_PORT = 3000;
-/** 端口递增重试上限。 */
+// 3000 是 React/Next.js/Rails 等大量工具的默认端口,极易撞;
+// 47100 落在常见开发端口段(<9000)与 Docker/K8s/数据库默认端口段之外。
+export const DEFAULT_PORT = 47100;
+/** 端口递增重试上限,仅默认端口适用(见 server.ts)。 */
 export const MAX_PORT_TRIES = 20;
 
 const ROOT = resolve(fileURLToPath(new URL('..', import.meta.url)));
@@ -34,20 +41,27 @@ export interface DaemonState {
   token: string;
 }
 
-/** 后端就绪后调用,把连接信息交给 CLI。 */
-export function writeState(state: DaemonState): void {
-  mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 });
-  writeFileSync(PID_FILE, String(state.pid), { mode: 0o600 });
-  writeFileSync(PORT_FILE, String(state.port), { mode: 0o600 });
-  // token 等价于批准任意命令的凭据,权限不能放宽
-  writeFileSync(TOKEN_FILE, state.token, { mode: 0o600 });
+/** 导出供 store.ts 用 —— 会话持久化跟着 daemon 实例走,同一状态目录同一份数据。 */
+export function stateDir(requestedPort: number): string {
+  return join(SYNAPSE_DIR, String(requestedPort));
 }
 
-export function readState(): DaemonState | null {
+/** 后端就绪后调用,把连接信息交给 CLI。requestedPort 决定落盘目录,见文件头注释。 */
+export function writeState(requestedPort: number, state: DaemonState): void {
+  const dir = stateDir(requestedPort);
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  writeFileSync(join(dir, 'daemon.pid'), String(state.pid), { mode: 0o600 });
+  writeFileSync(join(dir, 'port'), String(state.port), { mode: 0o600 });
+  // token 等价于批准任意命令的凭据,权限不能放宽
+  writeFileSync(join(dir, 'token'), state.token, { mode: 0o600 });
+}
+
+export function readState(requestedPort: number): DaemonState | null {
+  const dir = stateDir(requestedPort);
   try {
-    const pid = Number(readFileSync(PID_FILE, 'utf8').trim());
-    const port = Number(readFileSync(PORT_FILE, 'utf8').trim());
-    const token = readFileSync(TOKEN_FILE, 'utf8').trim();
+    const pid = Number(readFileSync(join(dir, 'daemon.pid'), 'utf8').trim());
+    const port = Number(readFileSync(join(dir, 'port'), 'utf8').trim());
+    const token = readFileSync(join(dir, 'token'), 'utf8').trim();
     if (!Number.isInteger(pid) || pid <= 0) return null;
     if (!Number.isInteger(port) || port <= 0) return null;
     if (!token) return null;
@@ -57,9 +71,10 @@ export function readState(): DaemonState | null {
   }
 }
 
-export function clearState(): void {
-  for (const f of [PID_FILE, PORT_FILE, TOKEN_FILE]) {
-    rmSync(f, { force: true });
+export function clearState(requestedPort: number): void {
+  const dir = stateDir(requestedPort);
+  for (const f of ['daemon.pid', 'port', 'token']) {
+    rmSync(join(dir, f), { force: true });
   }
 }
 
@@ -104,21 +119,25 @@ export async function checkHealth(state: DaemonState): Promise<boolean> {
 /**
  * 确保后端在跑,返回可用的连接信息。
  * 已有实例健康则直接复用;否则清掉陈旧状态重新拉起。
+ *
+ * port 是「请求端口」:不同 workspace 下不传 port 时都落在同一默认值,
+ * 天然复用同一个生产 daemon(Project List 能跨 workspace 聚合会话正是靠这个);
+ * 测试环境显式传入不同端口,则状态目录、daemon 实例都完全隔离,互不干扰。
  */
-export async function ensureDaemon(waitMs = 20_000): Promise<DaemonState> {
-  const existing = readState();
+export async function ensureDaemon(port = DEFAULT_PORT, waitMs = 20_000): Promise<DaemonState> {
+  const existing = readState(port);
   if (existing && (await checkHealth(existing))) return existing;
-  if (existing) clearState();
+  if (existing) clearState(port);
 
-  spawnDaemon();
-  return waitForDaemon(waitMs);
+  spawnDaemon(port);
+  return waitForDaemon(port, waitMs);
 }
 
 /**
  * 后台拉起后端。detached + stdio ignore + unref 三者缺一不可:
  * 少了任何一个,CLI 退出(或它 attach 的 tmux 结束)都会带走后端。
  */
-function spawnDaemon(): void {
+function spawnDaemon(port: number): void {
   const child = spawn(
     process.execPath,
     ['--disable-warning=ExperimentalWarning', SERVER_ENTRY],
@@ -126,22 +145,22 @@ function spawnDaemon(): void {
       cwd: ROOT,
       detached: true,
       stdio: 'ignore',
-      env: { ...process.env, SYNAPSE_DAEMON: '1' },
+      env: { ...process.env, SYNAPSE_DAEMON: '1', PORT: String(port) },
     },
   );
   child.unref();
 }
 
 /** 轮询状态文件直到后端写入并通过健康检查。 */
-async function waitForDaemon(waitMs: number): Promise<DaemonState> {
+async function waitForDaemon(port: number, waitMs: number): Promise<DaemonState> {
   const deadline = Date.now() + waitMs;
   while (Date.now() < deadline) {
-    const state = readState();
+    const state = readState(port);
     if (state && (await checkHealth(state))) return state;
     await new Promise((r) => setTimeout(r, 300));
   }
   throw new Error(
-    `后端启动超时(${waitMs / 1000}s)。手动排查:node ${SERVER_ENTRY}`,
+    `后端启动超时(${waitMs / 1000}s)。手动排查:PORT=${port} node ${SERVER_ENTRY}`,
   );
 }
 

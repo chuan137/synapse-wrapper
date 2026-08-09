@@ -15,7 +15,7 @@ import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { existsSync, statSync, realpathSync } from 'node:fs';
 import { resolve, basename } from 'node:path';
-import { ensureDaemon, urlFor, HOST } from '../backend/daemon.ts';
+import { ensureDaemon, urlFor, HOST, DEFAULT_PORT } from '../backend/daemon.ts';
 import { TmuxTransport } from '../backend/tmuxTransport.ts';
 
 const c = {
@@ -69,20 +69,53 @@ async function warnExisting(
   }
 }
 
+/**
+ * 从 argv 中摘出 --port(及其值)与位置参数(目录)。
+ * --port 决定要连接/拉起哪个 daemon 实例 —— 默认值下不同 workspace 都
+ * 落在同一个生产 daemon(Project List 能跨 workspace 聚合正是靠这个);
+ * 测试环境传入其他端口则完全隔离,见 daemon.ts 的状态目录分区。
+ */
+function parseArgv(argv: string[]): { dir: string | undefined; port: number } {
+  const rest: string[] = [];
+  let port = Number(process.env.PORT ?? DEFAULT_PORT);
+
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i]!;
+    if (a === '--port') {
+      const v = argv[++i];
+      if (!v || Number.isNaN(Number(v))) die(`--port 需要一个数字: ${v ?? '(缺失)'}`);
+      port = Number(v);
+    } else if (a.startsWith('--port=')) {
+      const v = a.slice('--port='.length);
+      if (Number.isNaN(Number(v))) die(`--port 需要一个数字: ${v}`);
+      port = Number(v);
+    } else {
+      rest.push(a);
+    }
+  }
+  return { dir: rest[0], port };
+}
+
 export async function main(argv: string[]): Promise<void> {
   if (argv[0] === '-h' || argv[0] === '--help') {
     console.log(`
-用法: wrapper [目录]
+用法: wrapper [目录] [--port <端口>]
 
   在当前 tmux pane 里启动 claude,同时接入网页端监管。
   目录默认为当前目录;后端未运行时自动以守护进程拉起。
+
+  --port 指定要连接/拉起的后端端口(默认 ${DEFAULT_PORT},也可用 PORT 环境变量)。
+  不同 workspace 下不传 --port 会连到同一个后端 —— 这是 Project List 能跨
+  workspace 聚合会话的前提。测试环境想避免和日常使用的实例混在一起,
+  传一个不同的端口即可,两边状态完全隔离。
 
   需在 tmux 会话中运行 —— 后端通过 pane 观察与注入。
 `);
     return;
   }
 
-  const given = resolve(argv[0] ?? process.cwd());
+  const { dir: dirArg, port } = parseArgv(argv);
+  const given = resolve(dirArg ?? process.cwd());
   if (!existsSync(given) || !statSync(given).isDirectory()) die(`目录不存在: ${given}`);
 
   // 解析符号链接后再上报(macOS 的 /tmp → /private/tmp)。
@@ -100,7 +133,7 @@ export async function main(argv: string[]): Promise<void> {
     process.exit(1);
   }
 
-  const state = await ensureDaemon().catch((err) => die(String(err?.message ?? err)));
+  const state = await ensureDaemon(port).catch((err) => die(String(err?.message ?? err)));
 
   // 同目录并存是允许的(裸 claude 亦然,且钩子按 claudeId 路由不会串),
   // 但要让用户知道网页端将出现同名会话。

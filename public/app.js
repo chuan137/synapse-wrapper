@@ -9,6 +9,18 @@
 const token = new URLSearchParams(location.search).get('token');
 const $ = (id) => document.getElementById(id);
 
+// 手动收起的 project(key = workspace 绝对路径)。记录「收起」而非「展开」,
+// 使新 workspace 默认展开 —— 新建会话应该立刻在左栏可见,不用用户再点一次。
+// 刷新页面后左栏布局要保持原样,故存 localStorage;会话数据本身仍是服务端权威、不缓存。
+const COLLAPSED_KEY = 'synapse.collapsedProjects';
+function loadCollapsed() {
+  try { return new Set(JSON.parse(localStorage.getItem(COLLAPSED_KEY) ?? '[]')); }
+  catch { return new Set(); }
+}
+function saveCollapsed(set) {
+  localStorage.setItem(COLLAPSED_KEY, JSON.stringify([...set]));
+}
+
 const state = {
   view: 'overview',
   tab: 'files',
@@ -16,6 +28,7 @@ const state = {
   pending: new Map(),    // toolUseId -> approval
   detail: null,          // 当前打开会话的详情
   connected: false,
+  collapsedProjects: loadCollapsed(),
 };
 
 // ── 工具函数 ────────────────────────────────────────────────
@@ -292,14 +305,14 @@ function displayName(s) {
   return `${name}<span class="s-tag">${esc(s.paneId ?? s.localId.slice(0, 4))}</span>`;
 }
 
-function renderNav() {
-  const groups = { waiting: [], active: [], quiet: [] };
-  for (const s of state.sessions.values()) {
-    if (pendingFor(s.localId).length) groups.waiting.push(s);
-    else if (s.state === 'busy' || s.state === 'starting') groups.active.push(s);
-    else groups.quiet.push(s);
-  }
+/** 会话的排序权重:需要你 > 进行中 > 静默,用于组内排序与判断组是否需要提醒。 */
+function sessionRank(s) {
+  if (pendingFor(s.localId).length) return 0;
+  if (s.state === 'busy' || s.state === 'starting') return 1;
+  return 2;
+}
 
+function renderNav() {
   const item = (s) => {
     const n = pendingFor(s.localId).length;
     const st = n ? 'waiting' : s.state;
@@ -310,16 +323,47 @@ function renderNav() {
     </div>`;
   };
 
+  // 按 workspace 分组(而非目录名 name)—— 绝对路径全局唯一,不会把同名的
+  // 不同目录混进一组。组内保留原「需要你/进行中/静默」的排序权重。
+  const byWorkspace = new Map();
+  for (const s of state.sessions.values()) {
+    if (!byWorkspace.has(s.workspace)) byWorkspace.set(s.workspace, []);
+    byWorkspace.get(s.workspace).push(s);
+  }
+  const projects = [...byWorkspace.entries()].map(([workspace, sessions]) => {
+    sessions.sort((a, b) => sessionRank(a) - sessionRank(b) || b.lastActivity - a.lastActivity);
+    return { workspace, name: sessions[0].name, sessions, rank: Math.min(...sessions.map(sessionRank)) };
+  });
+  projects.sort((a, b) => a.rank - b.rank || a.name.localeCompare(b.name));
+
   let html = `<div class="nav-item ${state.view === 'overview' ? 'on' : ''}" data-id="overview">
     <span class="nav-name" style="font-weight:500">全部会话</span>
   </div>`;
-  if (groups.waiting.length) html += `<div class="nav-h">需要你</div>` + groups.waiting.map(item).join('');
-  if (groups.active.length) html += `<div class="nav-h">进行中</div>` + groups.active.map(item).join('');
-  if (groups.quiet.length) html += `<div class="nav-h">静默</div>` + groups.quiet.map(item).join('');
+
+  for (const p of projects) {
+    const open = !state.collapsedProjects.has(p.workspace);
+    const attn = p.rank === 0;
+    const waitCount = p.sessions.reduce((n, s) => n + pendingFor(s.localId).length, 0);
+    html += `<div class="proj-h ${open ? 'open' : ''} ${attn ? 'attn' : ''}" data-ws="${esc(p.workspace)}">
+      <span class="proj-caret">▸</span>
+      <span class="proj-name">${esc(p.name)}</span>
+      <span class="proj-count">${waitCount ? `${waitCount} 待批准` : p.sessions.length}</span>
+    </div>
+    <div class="proj-body">${p.sessions.map(item).join('')}</div>`;
+  }
 
   $('nav').innerHTML = html;
   for (const el of $('nav').querySelectorAll('.nav-item')) {
     el.onclick = () => navigate(el.dataset.id);
+  }
+  for (const el of $('nav').querySelectorAll('.proj-h')) {
+    el.onclick = () => {
+      const ws = el.dataset.ws;
+      if (state.collapsedProjects.has(ws)) state.collapsedProjects.delete(ws);
+      else state.collapsedProjects.add(ws);
+      saveCollapsed(state.collapsedProjects);
+      renderNav();
+    };
   }
 }
 

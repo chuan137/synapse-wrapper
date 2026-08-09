@@ -12,6 +12,7 @@ import { join } from 'node:path';
 import { homedir, tmpdir } from 'node:os';
 import { randomUUID } from 'node:crypto';
 import { EventEmitterBase, type SessionTransport } from './transport.ts';
+import { parseTranscriptLineMulti, encodeProjectDir } from './transcript.ts';
 
 const exec = promisify(execFile);
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -31,11 +32,6 @@ export interface TmuxOptions {
    * 按 mtime 认领会张冠李戴,批准请求随之路由到错误的会话。
    */
   sessionId?: string;
-}
-
-/** /private/tmp/foo -> -private-tmp-foo */
-function encodeProjectDir(cwd: string): string {
-  return cwd.replace(/[/.]/g, '-');
 }
 
 /**
@@ -303,10 +299,7 @@ export class TmuxTransport extends EventEmitterBase implements SessionTransport 
     }
   }
 
-  /**
-   * 白名单解析。转写里还有 mode / permission-mode / file-history-snapshot /
-   * attachment / ai-title 等控制行,不应进入 UI。
-   */
+  /** 解析规则见 backend/transcript.ts(与历史重放共用);这里只管跨行去重与事件下发。 */
   #handleLine(line: string): void {
     let d: Record<string, any>;
     try {
@@ -315,57 +308,15 @@ export class TmuxTransport extends EventEmitterBase implements SessionTransport 
       return;
     }
 
-    if (d.isSidechain) return;  // 子代理不属于主对话
-
     if (d.uuid) {
       if (this.#seenUuids.has(d.uuid)) return;  // watch 抖动会重复读
       this.#seenUuids.add(d.uuid);
     }
 
-    if (d.type === 'assistant') {
-      for (const b of d.message?.content ?? []) {
-        if (b.type === 'text' && b.text?.trim()) {
-          this.emit({ kind: 'assistant_text', text: b.text });
-        } else if (b.type === 'tool_use') {
-          this.emit({ kind: 'tool_use', toolUseId: b.id, name: b.name, input: b.input });
-        }
-      }
-      return;
-    }
-
-    if (d.type === 'user') {
-      // 用户输入是字符串,工具结果是数组
-      const c = d.message?.content;
-      if (Array.isArray(c)) {
-        for (const b of c) {
-          if (b.type === 'tool_result') {
-            this.emit({
-              kind: 'tool_result',
-              toolUseId: b.tool_use_id,
-              content: b.content,
-              isError: Boolean(b.is_error),
-            });
-          }
-        }
-      }
-      return;
-    }
-
-    // claude 自己给会话起的标题(即 /resume 列表里显示的那个)。
-    // 该行没有 uuid,躲不过上面的去重,而同一标题会重复写入多次,故自行比对。
-    if (d.type === 'ai-title') {
-      const title = typeof d.aiTitle === 'string' ? d.aiTitle.trim() : '';
-      if (title && title !== this.#title) {
-        this.#title = title;
-        this.emit({ kind: 'title', title });
-      }
-      return;
-    }
-
-    // 转写没有显式的 result 行,last-prompt 最接近本轮收尾
-    if (d.type === 'last-prompt') {
-      this.emit({ kind: 'turn_end', result: '' });
-      this.emit({ kind: 'status', state: 'ready' });
+    for (const ev of parseTranscriptLineMulti(line, this.#title)) {
+      if (ev.kind === 'title') this.#title = ev.title;
+      this.emit(ev);
+      if (ev.kind === 'turn_end') this.emit({ kind: 'status', state: 'ready' });
     }
   }
 

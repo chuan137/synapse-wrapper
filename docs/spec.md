@@ -128,15 +128,29 @@ claude 会给会话起一个语义化标题(即 `/resume` 列表里显示的那�
 
 UI 用它区分同目录并存的会话 —— pane ID 能区分但不解释,标题才说明「这个会话在做什么」。标题与 `name`(目录名)并存而非覆盖,后者仍用于分组。
 
-### 2.9 转写文件结构(仅 tmux 需要)
+### 2.9 转写文件结构
 
 行类型不止 `user` / `assistant`,还包括 `queue-operation`、`attachment`、`ai-title`、`last-prompt`,以及子代理产生的 `isSidechain` 条目。解析时须用白名单,否则控制类记录会被当作对话渲染。
+
+实测确认:`claude -p --input-format stream-json` 与 tmux 里的原生 TUI 写的是**同一套路径规则**(`~/.claude/projects/<cwd 转写>/<session_id>.jsonl`),并非 tmux 独有。两种传输方式因此可以共用一份解析逻辑(`backend/transcript.ts`),既用于 tmux 的实时 tail,也用于 §2.11 的历史重放。
 
 ### 2.10 服务端 timeline 与前端增量视图必须落同一套分组边界
 
 `GET /api/sessions/:id` 首次拉取用的是 `SessionManager` 自己维护的 `s.timeline`,与 WebSocket 增量更新走的前端 `onSessionEvent` 是两份独立实现,字段结构必须保持一致 —— 改其中一份而漏另一份,不会报类型错误(两边都是各自文件里的字面量对象),只在运行时表现为数据缺失。
 
 `turn_end` 一度只被前端 `onSessionEvent` 记录为 timeline 分组边界,`SessionManager.#absorb` 里同名分支只更新了计数器,没有写回 `s.timeline`。后果:每次刷新页面或重新打开会话,拉到的历史 timeline 里没有任何 `turn_end`,渲染时把整段历史当成"一个仍在进行中的轮次" —— 而进行中轮次只展示最新一步,已完成轮次的全部工具调用与中间文本因此从界面上消失,而非折叠。
+
+### 2.11 会话元数据持久化,对话内容不重复存
+
+`SessionManager` 原本纯内存态,后端一重启会话列表就清空。持久化只落会话元数据(`~/.synapse/sessions.json`,0600):workspace、name、title、claudeId、turns/costUsd 等统计、以及 `transcriptPath`。
+
+**对话 timeline 不进这份快照。** Claude Code 自己已经把完整对话写在转写文件里(§2.9),重复落一份等于造出两个可能不同步的历史来源。`GET /api/sessions/:id` 对没有内存态 timeline 的 exited 会话,现读 `transcriptPath` 重放出 timeline/files/commands(`replayTranscriptTimeline`),与在线会话走的 `#absorb` 共用同一个归约函数 `reduceEvent` —— 避免 §2.10 那次事故的重演(两条路径分叉出不一致的字段结构)。
+
+写盘走 500ms debounce(`#absorb` 里几乎每条转写行都会触发一次状态变化,逐条同步写盘是明显的 I/O 负担),用户在网页上主动删除会话时改为立即 `saveNow()`,否则紧接着的进程退出会让磁盘上的旧快照把这条"已删除"的记录复活。
+
+**关停语义分两种,不能共用一个方法。** 早期实现让 `SIGINT/SIGTERM` 触发的 `closeAll()` 直接调用 `close()`,而 `close()` 的语义是"用户主动删除,记录也从磁盘摘除"—— 结果是每次 Ctrl-C 正常关闭后端,`sessions.json` 就被清空,持久化形同虚设。故拆成两个方法:`close(localId)` 保留给用户删除操作;`stopAll()` 供进程退出用,只停子进程、把状态标 `exited`,记录本身留着。
+
+重启后加载出的历史会话,`Session.transport` 落一个 `NullTransport` 占位(`alive()` 恒 `false`),避免 `Session.transport` 这个必填字段在历史记录上无处安放。
 
 ---
 
@@ -231,11 +245,17 @@ UI 用它区分同目录并存的会话 —— pane ID 能区分但不解释,标
 
 ### 守护进程(`backend/daemon.ts`)
 
-状态存 `~/.synapse/`(`daemon.pid` / `port` / `token`,均 `0600`),由后端监听成功后自己写入 —— 端口递增发生在服务端,detached 启动的父进程读不到 stdout,无从得知最终端口。
+状态存 `~/.synapse/<port>/`(`daemon.pid` / `port` / `token`,均 `0600`),由后端监听成功后自己写入 —— 端口递增发生在服务端,detached 启动的父进程读不到 stdout,无从得知最终端口。
 
 健康检查必须 **PID 存活 + HTTP 探活且 token 相符** 双过:PID 可能已被系统回收并分配给无关进程,单看 PID 会误认;端口可能被别的程序占着,单看 HTTP 会把陌生服务当成自己人。任一不过即清理陈旧文件重启。
 
 启动用 `detached: true` + `stdio: 'ignore'` + `unref()`,三者缺一都会让 CLI 退出时带走后端。
+
+**端口。** 默认端口 `47100` —— `3000` 是 React/Next.js/Rails 等大量工具的默认端口,极易撞。`wrapper --port <n>`(或 `PORT` 环境变量)可覆盖,用于测试环境与日常使用的生产实例隔离。
+
+状态目录按**请求端口**(调用方想要的目标端口,不是最终实际监听到的端口)分区。这是 Project List 落地后才有的需求:不同 workspace 下开 `wrapper` 不传 `--port` 时,都落在同一默认值上,天然复用同一个生产 daemon(`ensureDaemon()` 的健康检查通过就直接复用)—— Project List 能跨 workspace 聚合会话,前提正是这些会话本就活在同一个后端实例里。测试环境传入不同端口,则状态目录、daemon 实例、`sessions.json` 三者都完全隔离,不会读到/污染生产状态。
+
+显式指定端口时**不允许递增重试**,占用即报错退出;只有默认端口才走原有的递增容错(`MAX_PORT_TRIES`)。这不是随意选择 —— 状态目录用「请求端口」命名的前提是它必须等于「实际监听端口」,否则下次启动按请求端口去读状态目录,读到的 `port` 字段会跟真实监听地址对不上,健康检查看着像活的,实际连不上。默认端口允许偏移是因为此时没人会显式记住"我要的是哪个端口",复用逻辑本就是"矬子里拔将军"——先看有没有活的,没有就在默认值附近另起一个。
 
 ### SessionTransport(抽象)
 
@@ -258,7 +278,9 @@ onEvent(fn)  订阅事件流
 
 两层结构。
 
-**顶层 — 优先级流。** 左栏按状态分组列出会话;主区是跨会话的事件流,按「谁最需要你」排序。待批准项排最前并按等待时长排序,可就地批准无需进入会话。每项附风险说明(如「递归删除」「会直接改动线上基础设施」),而非仅展示命令原文。
+**顶层 — 优先级流。** 左栏按 workspace 分组(Project List),组内按「需要你 / 进行中 / 静默」排序;主区是跨会话的事件流,同样按「谁最需要你」排序。待批准项排最前并按等待时长排序,可就地批准无需进入会话。每项附风险说明(如「递归删除」「会直接改动线上基础设施」),而非仅展示命令原文。
+
+Project 分组默认展开,用户手动收起的记入 localStorage(键存收起集合而非展开集合,故新 workspace 不需要额外记录就默认可见)。这是纯 UI 布局状态,刷新页面保留,与下面的会话持久化是两回事。
 
 **详情 — 单会话。** 四个分段页签:
 

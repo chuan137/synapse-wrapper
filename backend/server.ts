@@ -13,11 +13,13 @@ import { randomUUID } from 'node:crypto';
 import { resolve } from 'node:path';
 import { existsSync, statSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { SessionManager, type ManagerEvent } from './sessionManager.ts';
+import { SessionManager, replayTranscriptTimeline, type ManagerEvent } from './sessionManager.ts';
 import { PermissionEngine, HOOK_TIMEOUT_S, type PendingApproval } from './permissions.ts';
 import { writeState, clearState, DEFAULT_PORT, MAX_PORT_TRIES } from './daemon.ts';
 
 const HOST = '127.0.0.1';
+/** 显式通过 PORT 环境变量指定过端口,还是用的默认值 —— 决定要不要允许递增重试。 */
+const PORT_EXPLICIT = process.env.PORT != null;
 const PORT = Number(process.env.PORT ?? DEFAULT_PORT);
 const ROOT = resolve(fileURLToPath(new URL('..', import.meta.url)));
 
@@ -25,12 +27,15 @@ const ROOT = resolve(fileURLToPath(new URL('..', import.meta.url)));
 const AUTH_TOKEN = randomUUID();
 
 /**
- * 实际监听端口 —— 可能因占用而高于 PORT。
+ * 实际监听端口 —— 默认端口占用时会递增(见 listenWithRetry)。
+ * 显式指定端口时不允许递增(见 §「端口」),此时恒等于 PORT ——
+ * 测试/生产各自传入不同端口时,才能保证「请求端口」与「实际监听端口」
+ * 精确相等,持久化目录名(daemon.ts stateDir)才可预测。
  * Origin 校验与钩子 URL 都必须用它,用 PORT 会在端口递增后全线失配。
  */
 let activePort = PORT;
 
-const manager = new SessionManager(HOST, () => activePort);
+const manager = new SessionManager(HOST, () => activePort, PORT);
 const permissions = new PermissionEngine();
 const stopLivenessWatch = manager.startLivenessWatch();
 
@@ -112,7 +117,7 @@ app.post('/api/sessions', async (req, res) => {
 });
 
 /** 单会话详情:改动文件、命令记录、时间线。 */
-app.get('/api/sessions/:id', (req, res) => {
+app.get('/api/sessions/:id', async (req, res) => {
   if (!checkOrigin(req, res)) return;
   const s = manager.get(String(req.params.id));
   if (!s) {
@@ -123,6 +128,19 @@ app.get('/api/sessions/:id', (req, res) => {
   for (const t of s.openTools.values()) {
     if (pendingToolSince === null || t.at < pendingToolSince) pendingToolSince = t.at;
   }
+
+  // 重启后加载的历史记录没有内存态 timeline —— 对话内容本就只写在转写文件里
+  // (sessions.json 只存元数据,见 backend/store.ts),按需现读。
+  let files = [...s.files.values()];
+  let commands = s.commands;
+  let timeline = s.timeline;
+  if (s.fromDisk && timeline.length === 0 && s.transcriptPath) {
+    const history = await replayTranscriptTimeline(s.transcriptPath);
+    files = history.files;
+    commands = history.commands;
+    timeline = history.timeline;
+  }
+
   res.json({
     localId: s.localId,
     claudeId: s.claudeId,
@@ -135,9 +153,9 @@ app.get('/api/sessions/:id', (req, res) => {
     paneId: s.paneId,
     turns: s.turns,
     costUsd: s.costUsd,
-    files: [...s.files.values()],
-    commands: s.commands,
-    timeline: s.timeline,
+    files,
+    commands,
+    timeline,
     pending: s.claudeId ? permissions.listPending(s.claudeId) : [],
     pendingToolSince,
   });
@@ -239,11 +257,20 @@ permissions.onApprovalResolved((toolUseId, decision, reason) => {
 /**
  * 端口递增重试必须在这里做,不能交给 CLI:守护进程是 detached 起的,
  * 父进程读不到 stdout,只能靠本进程把最终端口写进状态文件。
+ *
+ * 仅默认端口走递增:显式指定端口(测试环境常用来避免撞生产)时,
+ * 「请求端口」必须精确等于「实际监听端口」,否则持久化目录(按请求端口
+ * 分目录,见 daemon.ts)会对不上实际服务监听的地址,daemon.ts 的健康检查
+ * 也会因为读到的 port 字段与真实监听端口不一致而失真。故占用即报错退出,
+ * 不静默换port。
  */
 function listenWithRetry(port: number, triesLeft: number): void {
   const onError = (err: NodeJS.ErrnoException) => {
     if (err.code !== 'EADDRINUSE' || triesLeft <= 0) {
-      console.error(`监听 ${port} 失败:`, err.message);
+      const hint = PORT_EXPLICIT
+        ? `端口 ${PORT} 已被占用 —— 显式指定端口时不会自动改用其他端口,换一个再试。`
+        : `监听 ${port} 失败:`;
+      console.error(hint, err.code === 'EADDRINUSE' ? '' : err.message);
       process.exit(1);
     }
     server.removeListener('error', onError);
@@ -255,7 +282,7 @@ function listenWithRetry(port: number, triesLeft: number): void {
     server.removeListener('error', onError);
     activePort = port;
 
-    writeState({ pid: process.pid, port, token: AUTH_TOKEN });
+    writeState(PORT, { pid: process.pid, port, token: AUTH_TOKEN });
 
     console.log(`\n  Synapse Wrapper`);
     console.log(`  钩子超时: ${HOOK_TIMEOUT_S}s(后端 fail-closed 兜底更短)`);
@@ -273,14 +300,15 @@ function listenWithRetry(port: number, triesLeft: number): void {
   });
 }
 
-listenWithRetry(PORT, MAX_PORT_TRIES);
+listenWithRetry(PORT, PORT_EXPLICIT ? 0 : MAX_PORT_TRIES);
 
 async function shutdown(): Promise<void> {
   console.log('\n正在关闭...');
   stopLivenessWatch();
-  clearState();
+  clearState(PORT);
   permissions.drain();
-  await manager.closeAll();
+  // stopAll 而非 closeAll —— 会话记录要留着,下次启动时左栏仍能看到(持久化的意义)。
+  await manager.stopAll();
   server.close();
   process.exit(0);
 }
