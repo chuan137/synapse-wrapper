@@ -195,7 +195,10 @@ wss.on('connection', (ws) => {
 
       case 'decision':
         if (typeof msg.toolUseId === 'string' && (msg.decision === 'allow' || msg.decision === 'deny')) {
-          permissions.decide(msg.toolUseId, msg.decision);
+          // AskUserQuestion 没有「允许执行」的意义 —— 钩子协议不支持带着答案放行
+          // 工具调用,只能 deny 并把用户选择塞进 reason,由模型读取后继续对话。
+          const reason = typeof msg.answer === 'string' && msg.answer.trim() ? msg.answer.trim() : undefined;
+          permissions.decide(msg.toolUseId, msg.decision, reason);
         }
         break;
 

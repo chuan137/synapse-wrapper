@@ -372,7 +372,15 @@ function approvalCard(a, showSession) {
   const s = [...state.sessions.values()].find((x) => x.claudeId === a.sessionId);
   const why = a.risk
     ? `<div class="c-why ${a.risk.level === 'medium' ? 'medium' : ''}">${esc(a.risk.text)}</div>` : '';
-  const body = a.toolName === 'AskUserQuestion' ? renderQuestions(a.toolInput) : `<div class="c-cmd">${renderCmd(a.summary, a.risk)}</div>`;
+  const isQuestion = a.toolName === 'AskUserQuestion';
+  const body = isQuestion ? renderQuestions(a.toolInput) : `<div class="c-cmd">${renderCmd(a.summary, a.risk)}</div>`;
+  // AskUserQuestion 没有「批准/拒绝」这个执行层面的选择,钩子协议也不支持带着
+  // 结构化答案放行工具调用 —— 提交答案的唯一路径是 deny + reason(见 server.ts)。
+  const actions = isQuestion
+    ? `<button class="btn pri" data-act="answer" disabled>提交回答</button>
+       <button class="btn" data-act="skip">跳过</button>`
+    : `<button class="btn pri" data-act="allow">批准</button>
+       <button class="btn dan" data-act="deny">拒绝</button>`;
   return `<div class="card act" data-tuid="${a.toolUseId}">
     <div class="c-top">
       ${showSession ? `<span class="c-repo">${displayName(s)}</span>` : '<span class="c-repo">等待批准</span>'}
@@ -382,32 +390,27 @@ function approvalCard(a, showSession) {
     ${body}
     ${why}
     <div class="c-act">
-      <button class="btn pri" data-act="allow">批准</button>
-      <button class="btn dan" data-act="deny">拒绝</button>
+      ${actions}
       ${showSession && s ? `<button class="btn" data-open="${s.localId}">打开会话</button>` : ''}
       <span class="cd" data-deadline="${a.deadlineAt}">${countdown(a.deadlineAt)}</span>
     </div>
   </div>`;
 }
 
-/**
- * AskUserQuestion 的选项是只读展示,不是实际作答——批准只放行工具调用本身,
- * 真正的回答仍需在 Claude Code 所在终端里选择(PreToolUse 钩子拿不到工具结果)。
- */
 function renderQuestions(toolInput) {
   const questions = Array.isArray(toolInput?.questions) ? toolInput.questions : [];
   if (!questions.length) return `<div class="c-cmd">${esc(JSON.stringify(toolInput ?? {}))}</div>`;
 
-  return questions.map((q) => {
+  return questions.map((q, qi) => {
     const options = Array.isArray(q.options) ? q.options : [];
-    return `<div class="qblock">
+    return `<div class="qblock" data-qi="${qi}" data-multi="${q.multiSelect ? '1' : ''}">
       <div class="qhead">
         ${q.header ? `<span class="qtag">${esc(q.header)}</span>` : ''}
         ${q.multiSelect ? '<span class="qtag multi">多选</span>' : ''}
       </div>
       <div class="qtext">${esc(q.question ?? '')}</div>
       <div class="qopts">
-        ${options.map((o) => `<div class="qopt">
+        ${options.map((o, oi) => `<div class="qopt" data-oi="${oi}" data-label="${esc(o.label ?? '')}">
           <span class="qmark">${q.multiSelect ? '☐' : '○'}</span>
           <span class="qopt-body"><span class="qlabel">${esc(o.label ?? '')}</span>${o.description ? `<span class="qdesc">${esc(o.description)}</span>` : ''}</span>
         </div>`).join('')}
@@ -416,13 +419,56 @@ function renderQuestions(toolInput) {
   }).join('');
 }
 
+/** 选中态存在 DOM(data-selected)上,提交时直接读取,不额外维护 state。 */
+function wireQuestionPicker(card) {
+  const submit = card.querySelector('[data-act="answer"]');
+  const anySelected = () => card.querySelector('.qopt[data-selected]') != null;
+
+  for (const block of card.querySelectorAll('.qblock')) {
+    const multi = block.dataset.multi === '1';
+    for (const opt of block.querySelectorAll('.qopt')) {
+      opt.onclick = () => {
+        if (!multi) {
+          for (const sib of block.querySelectorAll('.qopt')) {
+            delete sib.dataset.selected;
+            sib.querySelector('.qmark').textContent = '○';
+          }
+          opt.dataset.selected = '1';
+          opt.querySelector('.qmark').textContent = '●';
+        } else {
+          const on = opt.dataset.selected == null;
+          if (on) opt.dataset.selected = '1'; else delete opt.dataset.selected;
+          opt.querySelector('.qmark').textContent = on ? '☑' : '☐';
+        }
+        if (submit) submit.disabled = !anySelected();
+      };
+    }
+  }
+}
+
+/** 把各 qblock 里选中的项拼成模型能读的回答文本。 */
+function collectAnswer(card) {
+  const parts = [];
+  for (const block of card.querySelectorAll('.qblock')) {
+    const question = block.querySelector('.qtext')?.textContent ?? '';
+    const labels = [...block.querySelectorAll('.qopt[data-selected]')].map((o) => o.dataset.label);
+    if (labels.length) parts.push(`${question}: ${labels.join(', ')}`);
+  }
+  return parts.join('\n');
+}
+
 function wireApprovals(root) {
   for (const card of root.querySelectorAll('[data-tuid]')) {
     const tuid = card.dataset.tuid;
+    wireQuestionPicker(card);
+
     for (const b of card.querySelectorAll('[data-act]')) {
       b.onclick = () => {
+        const act = b.dataset.act;
+        const decision = act === 'allow' ? 'allow' : 'deny';
+        const answer = act === 'answer' ? collectAnswer(card) : undefined;
         for (const x of card.querySelectorAll('button')) x.disabled = true;
-        ws.send(JSON.stringify({ type: 'decision', toolUseId: tuid, decision: b.dataset.act }));
+        ws.send(JSON.stringify({ type: 'decision', toolUseId: tuid, decision, answer }));
       };
     }
     const open = card.querySelector('[data-open]');

@@ -278,6 +278,14 @@ onEvent(fn)  订阅事件流
 
 视觉风格:macOS 系统应用 —— 浅色、发丝分隔线、系统蓝作唯一强调色、状态用淡彩底、整体弱对比。
 
+### 5.1 AskUserQuestion 的回传机制
+
+`PreToolUse` 钩子协议只支持 `permissionDecision: allow/deny`(+ `permissionDecisionReason`),**没有「允许执行并附带结构化结果」这个选项**。这意味着网页无法把用户在问题卡片上的选择当作 `AskUserQuestion` 的工具返回值直接注入。
+
+`allow` 会放行工具调用本身去真正执行 —— 但 stream-json 管道没有交互 TTY,`AskUserQuestion` 会挂起等不到任何输入,表现为卡住(即 `pendingToolSince` / 疑似卡住提示要覆盖的场景之一)。
+
+故网页问题卡片走 **deny + reason** 路径:用户选择后,后端对该工具调用发 `deny`,把选中项拼成文本塞进 `permissionDecisionReason`。Claude 会把这段 reason 当作工具失败原因读到,继而在对话里据此继续 —— 这是唯一能让网页选择真正生效的通道。卡片按钮因此不叫「批准/拒绝」,而是「提交回答/跳过」,语义上更贴近这条路径的实际效果。
+
 ---
 
 ## 6. 安全
