@@ -18,6 +18,16 @@ import { HOOK_TIMEOUT_S } from './permissions.ts';
 import { summarizeInput } from './risk.ts';
 import type { SessionEvent, SessionTransport } from './transport.ts';
 
+/**
+ * PreToolUse hook 的拦截范围。`*` 会连读操作也拦下网页审批,
+ * 且拦截发生在 Claude Code 内置权限判断之前,内置 allow 规则/权限模式全部失效
+ * (实测确认:hook 无条件触发,不是内置引擎判断"需要询问"后才转发)。
+ * 默认收窄到 AskUserQuestion —— 保留主动提问上网页,把其余工具还给内置权限系统。
+ * 需要恢复全量监管时改回 '*' 即可。
+ */
+const ENABLE_FULL_APPROVAL = false;
+const APPROVAL_MATCHER = ENABLE_FULL_APPROVAL ? '*' : 'AskUserQuestion';
+
 export type SessionState = 'starting' | 'ready' | 'busy' | 'waiting' | 'exited';
 
 /** 网页新建走 stream-json;wrapper CLI 走 tmux —— 后者可 attach 且存活于后端重启。 */
@@ -448,7 +458,7 @@ export class SessionManager {
       ...existing,
       hooks: {
         ...(existing.hooks ?? {}),
-        PreToolUse: appendHook(existing.hooks?.PreToolUse, '*'),
+        PreToolUse: appendHook(existing.hooks?.PreToolUse, APPROVAL_MATCHER),
         Stop: appendHook(existing.hooks?.Stop),
         SessionEnd: appendHook(existing.hooks?.SessionEnd, '*'),
       },

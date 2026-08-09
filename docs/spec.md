@@ -54,6 +54,14 @@
 
 延迟响应有效:模拟人工思考延迟 6 秒后返回 deny,工具被成功拦下。这是网页批准流程可行的前提。
 
+### 2.3a PreToolUse hook 无条件触发,早于内置权限判断
+
+`matcher` 只按工具名匹配,匹配即触发 HTTP 请求 —— 与 `permissions.allow/deny/ask` 规则、权限模式(`default`/`acceptEdits`/`auto`/`bypassPermissions`)无关,发生在内置权限引擎判断之前。不存在「内置引擎判定需要询问时才转发」这种钩子事件,`settings.json` 里配得再全的 allow 规则也拦不住已匹配 matcher 的请求。
+
+因此 `matcher: "*"` 会让**所有**工具调用(包括只读操作)绕开 Claude Code 自身的权限模式,一律先挂起等网页决策。这在早期是有意选择(见 §6 全量监管前提),但代价是繁琐 —— 常规操作也要网页确认一遍,且与 Auto/Edit Mode 的直觉不符(切了模式,网页请求仍照发)。
+
+现按 `backend/sessionManager.ts` 的 `ENABLE_FULL_APPROVAL` 开关收窄:默认 `matcher` 只匹配 `AskUserQuestion`,其余工具（Bash/Write/Edit 等）交还给 Claude Code 内置权限系统处理，不再经过网页。需要恢复全量监管时把开关改回 `true` 即可，钩子入口与决策协议不变。
+
 ### 2.3 ⚠ 钩子超时是 fail-open
 
 | 项目 | 实测值 |
@@ -144,7 +152,7 @@ UI 用它区分同目录并存的会话 —— pane ID 能区分但不解释,标
   "hooks": {
     "PreToolUse": [
       {
-        "matcher": "*",
+        "matcher": "AskUserQuestion",
         "hooks": [
           {
             "type": "http",
@@ -157,6 +165,8 @@ UI 用它区分同目录并存的会话 —— pane ID 能区分但不解释,标
   }
 }
 ```
+
+`matcher` 由 `ENABLE_FULL_APPROVAL` 开关控制,见 §2.3a。
 
 ### 3.2 PreToolUse 钩子载荷(Claude Code → 后端)
 
