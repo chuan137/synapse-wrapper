@@ -330,8 +330,7 @@ function renderTurns(d) {
     if (process.length) {
       const failed = process.some((s) => s.kind === 'tool' && s.isError);
       const open = d.expandedTurns.has(i);
-      who += `<span class="proc-sum ${failed ? 'has-error' : ''}" data-turn="${i}">
-        <span class="proc-dot"></span>
+      who += `<span class="proc-sum" data-turn="${i}">
         <span class="proc-steps">${process.length} 步</span>
         ${failed ? '<span class="err-mark">含出错</span>' : ''}
       </span>`;

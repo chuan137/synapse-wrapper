@@ -338,11 +338,9 @@ main { flex: 1; display: flex; flex-direction: column; overflow: hidden; min-wid
   transition: background .12s;
 }
 .proc-sum:hover { background: var(--hair); }
-.proc-dot { width: 5px; height: 5px; border-radius: 50%; flex: none; background: var(--green); }
-.proc-sum.has-error .proc-dot { background: var(--red); }
 .proc-steps { font-weight: 500; }
-/* 进行中变体:不可点击(没有可展开的折叠详情),点数徽标换成跳动的
-   三个点,呼应 --blue 的"进行中"配色语言,与已结束轮次的绿点区分。
+/* 进行中变体:不可点击(没有可展开的折叠详情),背景换成 --blue 呼应
+   跳动三点的"进行中"配色语言,与已结束轮次的灰底徽标区分。
    .live-dots 默认给"贴在内容末尾"场景留了 margin-left,这里靠徽标
    自身的 gap 排间距,须清零避免跟 gap 叠加出两倍空隙。 */
 .proc-sum.live { cursor: default; background: var(--blue-soft); }
