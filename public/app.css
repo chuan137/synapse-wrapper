@@ -248,6 +248,15 @@ main { flex: 1; display: flex; flex-direction: column; overflow: hidden; min-wid
 
 /* ── 对话 ── */
 .turn { margin-bottom: 16px; }
+/* 进行中的滚动列表整块换成折叠结论气泡时,DOM 是整体重建的(见
+   renderBody 的 innerHTML 替换),没有过渡的余地 —— 靠气泡自身的一次性
+   入场动画(轻微下沉 + 淡入)缓解这个突变感,而非试图跨越两份 DOM 做
+   transition。只在这一轮第一次结束时播放,见 renderTurns settledTurns。 */
+.turn.settle-in { animation: turn-settle .32s cubic-bezier(.2,.7,.3,1) both; }
+@keyframes turn-settle {
+  from { opacity: 0; transform: translateY(-4px); }
+  to { opacity: 1; transform: translateY(0); }
+}
 .who { display: flex; align-items: center; gap: 8px; font-size: 11.5px; color: var(--ink-3); margin-bottom: 5px; font-weight: 500; }
 /* 结论气泡是对话页签里权重最高的元素 —— 字号/圆角/阴影都明显高于折叠区
    (.proc)与其子项,靠对比而非把次要内容压小来分层(压小会牺牲可读性)。 */

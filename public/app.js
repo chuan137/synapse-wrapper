@@ -292,6 +292,10 @@ function onSessionEvent(localId, ev) {
  */
 function renderTurns(d) {
   if (!d.expandedTurns) d.expandedTurns = new Set();
+  // 记录"已经以已结束态渲染过"的轮次索引 —— 每次事件都会整块重绘
+  // innerHTML,若无差别给所有已结束气泡加入场动画,历史气泡会跟着任何
+  // 新事件反复重播,只在进行中→已结束的第一次渲染时补一次性 class。
+  if (!d.settledTurns) d.settledTurns = new Set();
   const groups = [];
   let cur = null;
   for (const t of d.timeline) {
@@ -340,7 +344,11 @@ function renderTurns(d) {
     }
     if (procHtml || conclude) {
       const text = conclude ? renderMarkdown(conclude.text) : '<span class="no-conclude">(无文字回复)</span>';
-      out += `<div class="turn"><div class="who">${who}</div><div class="said">${procHtml}${text}</div></div>`;
+      // 首次以已结束态渲染:补一次性入场动画,缓解「滚动列表→折叠结论」
+      // 的突变感;之后每次重绘(如别的轮次触发的事件)不再重播。
+      const justSettled = !d.settledTurns.has(i);
+      d.settledTurns.add(i);
+      out += `<div class="turn ${justSettled ? 'settle-in' : ''}"><div class="who">${who}</div><div class="said">${procHtml}${text}</div></div>`;
     }
     return out;
   }).join('');
@@ -821,6 +829,7 @@ async function navigate(id) {
       state.detail = await api(`/api/sessions/${id}`);
       if (state.detail) {
         state.detail.expandedTurns = new Set();
+        state.detail.settledTurns = new Set();
         // 后端已把 TodoWrite/Task* 两个来源合并进 todos 数组;Task* 来源的
         // 条目带 id(见 sessionManager.ts TodoItem 注释),据此重建索引,
         // 否则后续 WS 增量的 TaskUpdate 事件找不到条目可改。
