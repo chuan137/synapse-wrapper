@@ -23,7 +23,7 @@ function saveCollapsed(set) {
 
 const state = {
   view: 'overview',
-  tab: 'files',
+  tab: 'chat',
   sessions: new Map(),   // localId -> summary
   pending: new Map(),    // toolUseId -> approval
   detail: null,          // 当前打开会话的详情
@@ -272,18 +272,28 @@ function renderTurns(d) {
     const conclude = concludeIdx === -1 ? null : g.steps[concludeIdx];
     const process = g.steps.filter((_, idx) => idx !== concludeIdx);
 
+    // 折叠摘要不再单独占一个框,并入结论气泡内部 —— 但过程在时间线上
+    // 发生在结论之前,故置于结论文字上方,保持"先过程、后结论"的阅读
+    // 顺序,不能反过来。没有结论文字时(纯工具调用轮次)才退化为独立
+    // 卡片,避免摘要本身没地方挂。
+    let procHtml = '';
     if (process.length) {
       const failed = process.some((s) => s.kind === 'tool' && s.isError);
       const open = d.expandedTurns.has(i);
-      out += `<div class="proc ${open ? 'open' : ''}" data-turn="${i}">
+      procHtml = `<div class="proc ${open ? 'open' : ''} ${failed ? 'has-error' : ''}" data-turn="${i}">
         <div class="proc-sum">
-          <span class="proc-caret">▸</span>
-          <span>${process.length} 步${failed ? ' · 含出错' : ''}</span>
+          <span class="proc-dot"></span>
+          <span class="proc-steps">${process.length} 步</span>
+          ${failed ? '<span class="err-mark">含出错</span>' : ''}
         </div>
-        <div class="proc-body">${process.map(toolLine).join('')}</div>
+        <div class="proc-body-wrap"><div class="proc-body">${process.map(toolLine).join('')}</div></div>
       </div>`;
     }
-    if (conclude) out += `<div class="turn"><div class="who">Claude</div><div class="said">${esc(conclude.text)}</div></div>`;
+    if (conclude) {
+      out += `<div class="turn"><div class="who">Claude</div><div class="said">${procHtml}${esc(conclude.text)}</div></div>`;
+    } else {
+      out += procHtml;
+    }
     return out;
   }).join('');
 }
@@ -472,8 +482,8 @@ function renderTabs() {
   const d = state.detail;
   $('tabs').style.display = 'flex';
   const defs = [
-    ['files', '改动文件', d?.files.length ?? 0],
     ['chat', '对话', 0],
+    ['files', '改动文件', d?.files.length ?? 0],
     ['term', '终端输出', d?.commands.length ?? 0],
   ];
   $('tabs').innerHTML = defs.map(([k, label, n]) =>
