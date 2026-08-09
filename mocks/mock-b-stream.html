@@ -1,0 +1,223 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>方案 B · 优先级流</title>
+<style>
+  /* 方向:值班台 / 事故响应队列。
+     不按会话分格,而是把所有会话的事件汇成一条按紧急度排序的流。
+     左侧固定一列会话导航,右侧是「现在该看什么」。 */
+  :root {
+    --bg: #101215;
+    --panel: #171a1f;
+    --raise: #1e222a;
+    --edge: #282d36;
+    --ink: #e6eaef;
+    --dim: #838d9b;
+    --faint: #545c68;
+    --urge: #ff7a45;   /* 需要决策 */
+    --run: #4a9eff;    /* 进行中 */
+    --ok: #46b877;
+    --bad: #e0574a;
+    --mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, monospace;
+    --sans: system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 14px/1.55 var(--sans); display: flex; height: 100vh; overflow: hidden;
+  }
+
+  /* ── 左:会话导航 ── */
+  aside {
+    width: 232px; flex: none; background: var(--panel);
+    border-right: 1px solid var(--edge); display: flex; flex-direction: column;
+  }
+  .logo {
+    padding: 15px 16px 13px; font: 11px var(--mono); letter-spacing: .22em;
+    color: var(--faint); border-bottom: 1px solid var(--edge);
+  }
+  .nav { overflow-y: auto; padding: 7px 0; flex: 1; }
+  .nav-item {
+    padding: 8px 16px; display: flex; align-items: center; gap: 9px;
+    cursor: pointer; border-left: 2px solid transparent; font-size: 13px;
+  }
+  .nav-item:hover { background: var(--raise); }
+  .nav-item.on { background: var(--raise); border-left-color: var(--urge); }
+  .pip { width: 6px; height: 6px; border-radius: 50%; flex: none; background: var(--faint); }
+  .pip.urge { background: var(--urge); animation: pulse 1.3s infinite; }
+  .pip.run { background: var(--run); animation: pulse 1.3s infinite; }
+  .pip.ok { background: var(--ok); }
+  .pip.bad { background: var(--bad); }
+  @keyframes pulse { 50% { opacity: .3; } }
+  .nav-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .nav-badge {
+    font: 10px var(--mono); background: var(--urge); color: #2a1000;
+    padding: 1px 6px; border-radius: 8px; font-weight: 700;
+  }
+  .nav-h {
+    padding: 11px 16px 5px; font: 10px var(--mono); letter-spacing: .12em;
+    color: var(--faint); text-transform: uppercase;
+  }
+
+  /* ── 右:优先级流 ── */
+  main { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
+  .head {
+    padding: 14px 22px; border-bottom: 1px solid var(--edge);
+    display: flex; align-items: baseline; gap: 12px;
+  }
+  .head h2 { margin: 0; font-size: 15px; font-weight: 600; }
+  .head .sub { font: 12px var(--mono); color: var(--faint); margin-left: auto; }
+
+  .flow { flex: 1; overflow-y: auto; padding: 16px 22px 40px; }
+  .sect { font: 10px var(--mono); letter-spacing: .14em; color: var(--faint);
+          text-transform: uppercase; margin: 20px 0 10px; }
+  .sect:first-child { margin-top: 0; }
+
+  .card {
+    background: var(--panel); border: 1px solid var(--edge);
+    border-radius: 7px; margin-bottom: 9px; overflow: hidden;
+  }
+  .card.act { border-color: var(--urge); background: #1c1613; }
+  .c-top {
+    display: flex; align-items: center; gap: 9px; padding: 10px 14px;
+    font-size: 12px; border-bottom: 1px solid var(--edge);
+  }
+  .c-repo { font-weight: 600; font-size: 13px; }
+  .c-tool { font: 11px var(--mono); color: var(--dim); }
+  .c-time { margin-left: auto; font: 11px var(--mono); color: var(--faint); }
+  .c-body {
+    padding: 11px 14px; font: 12px/1.6 var(--mono);
+    background: #0c0e11; color: var(--ink);
+    white-space: pre-wrap; word-break: break-all;
+  }
+  .c-body .risk { color: var(--bad); font-weight: 700; }
+  .c-body .path { color: var(--run); }
+  .c-act { padding: 10px 14px; display: flex; gap: 7px; align-items: center; }
+  .b {
+    font: 12px var(--sans); padding: 6px 15px; border-radius: 5px;
+    border: 1px solid var(--edge); background: var(--raise); color: var(--ink); cursor: pointer;
+  }
+  .b:hover { border-color: var(--dim); }
+  .b.go { background: var(--ok); border-color: var(--ok); color: #04160c; font-weight: 600; }
+  .b.no { border-color: var(--bad); color: var(--bad); background: transparent; }
+  .cd { margin-left: auto; font: 11px var(--mono); color: var(--urge); }
+  .why {
+    padding: 8px 14px; font-size: 11.5px; color: var(--dim);
+    background: rgba(224,87,74,.07); border-top: 1px solid rgba(224,87,74,.2);
+  }
+  .why b { color: var(--bad); font-weight: 600; }
+
+  .quiet { opacity: .62; }
+  .quiet .c-body { display: none; }
+
+  .note { padding: 18px 22px; color: var(--faint); font-size: 12px; line-height: 1.7; max-width: 700px; }
+  .note b { color: var(--dim); font-weight: 600; }
+</style>
+</head>
+<body>
+
+<aside>
+  <div class="logo">SYNAPSE</div>
+  <div class="nav">
+    <div class="nav-h">需要你</div>
+    <div class="nav-item on"><span class="pip urge"></span><span class="nav-name">payments-api</span><span class="nav-badge">1</span></div>
+    <div class="nav-item"><span class="pip urge"></span><span class="nav-name">infra-terraform</span><span class="nav-badge">1</span></div>
+    <div class="nav-h">进行中</div>
+    <div class="nav-item"><span class="pip run"></span><span class="nav-name">synapse-wrapper</span></div>
+    <div class="nav-h">静默</div>
+    <div class="nav-item"><span class="pip ok"></span><span class="nav-name">docs-site</span></div>
+    <div class="nav-item"><span class="pip bad"></span><span class="nav-name">legacy-etl</span></div>
+    <div class="nav-item"><span class="pip"></span><span class="nav-name">mobile-app</span></div>
+  </div>
+</aside>
+
+<main>
+  <div class="head">
+    <h2>全部会话</h2>
+    <span class="sub">6 个会话 · 2 个待决策</span>
+  </div>
+
+  <div class="flow">
+
+    <div class="sect">需要决策 — 按等待时长排序</div>
+
+    <div class="card act">
+      <div class="c-top">
+        <span class="c-repo">payments-api</span>
+        <span class="c-tool">Bash</span>
+        <span class="c-time">已等 4 分 12 秒</span>
+      </div>
+      <div class="c-body"><span class="risk">rm -rf</span> node_modules && npm install</div>
+      <div class="why"><b>注意</b> — 递归删除。当前目录 ~/work/payments-api</div>
+      <div class="c-act">
+        <button class="b go">批准</button>
+        <button class="b no">拒绝</button>
+        <button class="b">查看会话</button>
+        <span class="cd">4:12 后自动拒绝</span>
+      </div>
+    </div>
+
+    <div class="card act">
+      <div class="c-top">
+        <span class="c-repo">infra-terraform</span>
+        <span class="c-tool">Bash</span>
+        <span class="c-time">已等 12 秒</span>
+      </div>
+      <div class="c-body">terraform apply -auto-approve</div>
+      <div class="why"><b>注意</b> — 会直接改动线上基础设施,无二次确认</div>
+      <div class="c-act">
+        <button class="b go">批准</button>
+        <button class="b no">拒绝</button>
+        <button class="b">查看会话</button>
+        <span class="cd">4:48 后自动拒绝</span>
+      </div>
+    </div>
+
+    <div class="sect">进行中</div>
+
+    <div class="card">
+      <div class="c-top">
+        <span class="c-repo">synapse-wrapper</span>
+        <span class="c-tool">Edit</span>
+        <span class="c-time">刚刚</span>
+      </div>
+      <div class="c-body"><span class="path">backend/permissions.ts</span>
++  const timer = setTimeout(() => {
++    this.#settle(toolUseId, 'deny', '超时未获批准');
++  }, DECISION_TIMEOUT_MS);</div>
+    </div>
+
+    <div class="sect">最近完成</div>
+
+    <div class="card quiet">
+      <div class="c-top">
+        <span class="c-repo">docs-site</span>
+        <span class="c-tool">轮次结束</span>
+        <span class="c-time">2 分钟前</span>
+      </div>
+      <div class="c-act"><button class="b">查看 6 处改动</button></div>
+    </div>
+
+    <div class="card quiet">
+      <div class="c-top">
+        <span class="c-repo">legacy-etl</span>
+        <span class="c-tool">进程退出</span>
+        <span class="c-time">18 分钟前</span>
+      </div>
+      <div class="c-act"><button class="b">恢复会话</button></div>
+    </div>
+
+  </div>
+
+  <div class="note">
+    <b>方案 B · 优先级流。</b>不按会话分格,而是把所有会话的事件汇成一条流,按「谁最需要你」排序。
+    会话数量多时比网格更耐用 —— 网格会溢出屏幕,流不会。
+    <b>危险性说明是一等公民</b>:每个待批准项下面直接讲清风险在哪(递归删除、直接改线上),
+    而不是只把命令原文丢给你自己判断。左栏是导航,右栏永远是「现在该看什么」。
+  </div>
+</main>
+
+</body>
+</html>

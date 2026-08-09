@@ -1,0 +1,223 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>方案 A · 状态墙</title>
+<style>
+  /* 方向:机场航班信息牌 / 机房监控墙。
+     深底 + 单色为主 + 状态色只用在真正需要注意的地方。
+     刻意避开「暖米白+衬线+赤陶」这个 AI 默认模板。 */
+  :root {
+    --void: #0b0d10;
+    --slab: #14171c;
+    --slab-hi: #1b1f26;
+    --line: #262b33;
+    --ink: #e8ecf1;
+    --dim: #7d8794;
+    --faint: #4a525d;
+    --wait: #ffb02e;   /* 待批准 —— 唯一的高饱和色 */
+    --live: #3ba55c;   /* 运行中 */
+    --dead: #d9584a;   /* 出错 */
+    --mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--void); color: var(--ink);
+    font: 14px/1.5 var(--mono);
+    -webkit-font-smoothing: antialiased;
+  }
+
+  /* ── 顶栏:整体态势 ── */
+  .bar {
+    display: flex; align-items: baseline; gap: 22px;
+    padding: 14px 20px; border-bottom: 1px solid var(--line);
+    position: sticky; top: 0; background: var(--void); z-index: 10;
+  }
+  .brand { font-size: 12px; letter-spacing: .22em; color: var(--dim); }
+  .tally { display: flex; gap: 18px; margin-left: auto; font-size: 12px; }
+  .tally b { font-weight: 500; font-variant-numeric: tabular-nums; }
+  .t-wait b { color: var(--wait); }
+  .t-live b { color: var(--live); }
+  .t-idle b { color: var(--faint); }
+
+  /* ── 待批准横幅:穿透两层的关键 ── */
+  .alert {
+    display: flex; align-items: center; gap: 14px;
+    padding: 11px 20px; background: rgba(255,176,46,.09);
+    border-bottom: 1px solid rgba(255,176,46,.28);
+  }
+  .alert-dot {
+    width: 7px; height: 7px; border-radius: 50%; background: var(--wait);
+    animation: blink 1.4s ease-in-out infinite; flex: none;
+  }
+  @keyframes blink { 50% { opacity: .25; } }
+  .alert-txt { font-size: 13px; }
+  .alert-txt b { color: var(--wait); font-weight: 500; }
+  .alert-go {
+    margin-left: auto; font: inherit; font-size: 12px;
+    background: var(--wait); color: #221600; border: 0;
+    padding: 5px 14px; border-radius: 3px; cursor: pointer; font-weight: 600;
+  }
+
+  /* ── 会话网格 ── */
+  .grid {
+    display: grid; gap: 1px; background: var(--line);
+    grid-template-columns: repeat(auto-fill, minmax(310px, 1fr));
+    border-bottom: 1px solid var(--line);
+  }
+  .cell {
+    background: var(--slab); padding: 15px 17px 13px;
+    cursor: pointer; position: relative; transition: background .12s;
+    min-height: 152px; display: flex; flex-direction: column;
+  }
+  .cell:hover { background: var(--slab-hi); }
+  .cell:focus-visible { outline: 2px solid var(--wait); outline-offset: -2px; }
+
+  /* 左侧状态条 —— 不用图标,用色块,扫视更快 */
+  .cell::before {
+    content: ''; position: absolute; left: 0; top: 0; bottom: 0; width: 3px;
+    background: var(--faint);
+  }
+  .cell.wait::before { background: var(--wait); }
+  .cell.live::before { background: var(--live); }
+  .cell.dead::before { background: var(--dead); }
+  .cell.wait { background: #1a1710; }
+  .cell.wait:hover { background: #201c13; }
+
+  .cell-top { display: flex; align-items: baseline; gap: 9px; margin-bottom: 3px; }
+  .repo { font-size: 14px; font-weight: 600; letter-spacing: -.01em; }
+  .branch { font-size: 11px; color: var(--faint); }
+  .path { font-size: 11px; color: var(--faint); margin-bottom: 11px; }
+
+  .state { display: flex; align-items: center; gap: 7px; font-size: 12px; margin-bottom: 9px; }
+  .state .lbl { text-transform: uppercase; letter-spacing: .08em; font-size: 10px; }
+  .wait .state .lbl { color: var(--wait); }
+  .live .state .lbl { color: var(--live); }
+  .idle .state .lbl, .done .state .lbl { color: var(--faint); }
+  .dead .state .lbl { color: var(--dead); }
+
+  /* 最近动作:一行,超出截断 */
+  .last {
+    font-size: 12px; color: var(--dim); margin-top: auto;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .last .verb { color: var(--ink); }
+
+  /* 待批准时,卡片里直接给按钮 —— 不用点进去 */
+  .inline-ask { margin-top: 10px; }
+  .ask-cmd {
+    background: var(--void); border: 1px solid var(--line); border-radius: 3px;
+    padding: 7px 9px; font-size: 11.5px; color: var(--ink);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-bottom: 8px;
+  }
+  .ask-cmd .risk { color: var(--dead); font-weight: 600; }
+  .ask-row { display: flex; gap: 6px; align-items: center; }
+  .btn {
+    font: inherit; font-size: 11.5px; padding: 5px 13px; border-radius: 3px;
+    border: 1px solid var(--line); background: var(--slab-hi); color: var(--ink);
+    cursor: pointer;
+  }
+  .btn:hover { border-color: var(--dim); }
+  .btn.ok { background: var(--live); border-color: var(--live); color: #04180c; font-weight: 600; }
+  .btn.no { background: transparent; border-color: var(--dead); color: var(--dead); }
+  .clock {
+    margin-left: auto; font-size: 11px; color: var(--wait);
+    font-variant-numeric: tabular-nums;
+  }
+
+  .spin { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: var(--live); animation: blink 1.1s infinite; }
+
+  .note {
+    padding: 18px 20px; color: var(--faint); font-size: 12px; line-height: 1.7;
+    max-width: 760px;
+  }
+  .note b { color: var(--dim); font-weight: 500; }
+</style>
+</head>
+<body>
+
+<div class="bar">
+  <span class="brand">SYNAPSE</span>
+  <div class="tally">
+    <span class="t-wait">待批准 <b>2</b></span>
+    <span class="t-live">运行中 <b>1</b></span>
+    <span class="t-idle">空闲 <b>3</b></span>
+  </div>
+</div>
+
+<div class="alert">
+  <span class="alert-dot"></span>
+  <span class="alert-txt"><b>2 个会话</b>在等你决定 · 最早的已等 4 分 12 秒</span>
+  <button class="alert-go">跳到第一个</button>
+</div>
+
+<div class="grid">
+
+  <div class="cell wait" tabindex="0">
+    <div class="cell-top"><span class="repo">payments-api</span><span class="branch">fix/webhook-retry</span></div>
+    <div class="path">~/work/payments-api</div>
+    <div class="state"><span class="lbl">等待批准</span></div>
+    <div class="inline-ask">
+      <div class="ask-cmd"><span class="risk">rm -rf</span> node_modules && npm install</div>
+      <div class="ask-row">
+        <button class="btn ok">批准</button>
+        <button class="btn no">拒绝</button>
+        <span class="clock">4:12 后自动拒绝</span>
+      </div>
+    </div>
+  </div>
+
+  <div class="cell wait" tabindex="0">
+    <div class="cell-top"><span class="repo">infra-terraform</span><span class="branch">main</span></div>
+    <div class="path">~/work/infra-terraform</div>
+    <div class="state"><span class="lbl">等待批准</span></div>
+    <div class="inline-ask">
+      <div class="ask-cmd">terraform apply -auto-approve</div>
+      <div class="ask-row">
+        <button class="btn ok">批准</button>
+        <button class="btn no">拒绝</button>
+        <span class="clock">4:48 后自动拒绝</span>
+      </div>
+    </div>
+  </div>
+
+  <div class="cell live" tabindex="0">
+    <div class="cell-top"><span class="repo">synapse-wrapper</span><span class="branch">main</span></div>
+    <div class="path">~/Claude/Projects/synapse-wrapper</div>
+    <div class="state"><span class="spin"></span><span class="lbl">运行中</span></div>
+    <div class="last"><span class="verb">编辑</span> backend/permissions.ts · 第 3 轮</div>
+  </div>
+
+  <div class="cell done" tabindex="0">
+    <div class="cell-top"><span class="repo">docs-site</span><span class="branch">feat/i18n</span></div>
+    <div class="path">~/work/docs-site</div>
+    <div class="state"><span class="lbl">已完成 · 2 分钟前</span></div>
+    <div class="last">改了 6 个文件 · $0.42</div>
+  </div>
+
+  <div class="cell dead" tabindex="0">
+    <div class="cell-top"><span class="repo">legacy-etl</span><span class="branch">main</span></div>
+    <div class="path">~/work/legacy-etl</div>
+    <div class="state"><span class="lbl">已退出 · 进程中断</span></div>
+    <div class="last">可用 --resume 恢复会话</div>
+  </div>
+
+  <div class="cell idle" tabindex="0">
+    <div class="cell-top"><span class="repo">mobile-app</span><span class="branch">main</span></div>
+    <div class="path">~/work/mobile-app</div>
+    <div class="state"><span class="lbl">空闲</span></div>
+    <div class="last">等待输入</div>
+  </div>
+
+</div>
+
+<div class="note">
+  <b>方案 A · 状态墙。</b>参照机场航班牌:状态用左侧色条编码,扫一眼就知道哪张卡要你动。
+  关键取舍 —— <b>批准按钮直接放在卡片里</b>,不必点进会话;高频动作零跳转。
+  待批准的卡片底色微微偏暖,黄色是全页唯一的高饱和色,不用它装饰任何别的东西。
+  危险命令片段(<span style="color:var(--dead)">rm -rf</span>)在预览里标红。
+</div>
+
+</body>
+</html>

@@ -1,0 +1,396 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>单会话详情 · Synapse</title>
+<style>
+  /* 风格:macOS / iOS 系统应用。
+     柔和灰白底、克制的发丝分隔线、系统蓝唯一强调色。
+     状态用淡彩底而非高饱和块面 —— 弱对比,久看不累。 */
+  :root {
+    --bg: #f5f5f7;          /* 窗口底 */
+    --surface: #ffffff;     /* 卡片面 */
+    --sidebar: #ececee;     /* 侧栏(半透感) */
+    --hair: #e2e2e5;        /* 发丝线 */
+    --hair-soft: #ededf0;
+    --ink: #1d1d1f;
+    --ink-2: #6e6e73;       /* 次要文字 */
+    --ink-3: #9a9aa0;       /* 三级文字 */
+    --blue: #0071e3;        /* 系统蓝 */
+    --blue-soft: #e8f1fd;
+    --green: #34a853;
+    --green-soft: #e7f5ea;
+    --amber: #b8860b;
+    --amber-soft: #fdf3e0;
+    --red: #c9372c;
+    --red-soft: #fdedeb;
+    --mono: ui-monospace, "SF Mono", Menlo, monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif;
+    --r: 10px;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 14px/1.55 var(--sans); -webkit-font-smoothing: antialiased;
+    display: flex; height: 100vh; overflow: hidden;
+  }
+
+  /* ── 侧栏 ── */
+  aside {
+    width: 224px; flex: none; background: var(--sidebar);
+    border-right: 1px solid var(--hair); display: flex; flex-direction: column;
+  }
+  .brand {
+    padding: 14px 16px 12px; font-size: 12px; font-weight: 600;
+    letter-spacing: .04em; color: var(--ink-3);
+  }
+  .nav { flex: 1; overflow-y: auto; padding: 0 8px; }
+  .nav-h {
+    padding: 12px 8px 5px; font-size: 11px; font-weight: 600;
+    color: var(--ink-3); letter-spacing: .02em;
+  }
+  .nav-item {
+    display: flex; align-items: center; gap: 8px; padding: 7px 8px;
+    border-radius: 7px; cursor: pointer; font-size: 13.5px; margin-bottom: 1px;
+  }
+  .nav-item:hover { background: rgba(0,0,0,.04); }
+  .nav-item.on { background: var(--blue); color: #fff; }
+  .nav-item.on .nav-sub { color: rgba(255,255,255,.75); }
+  .pip { width: 7px; height: 7px; border-radius: 50%; flex: none; background: var(--ink-3); }
+  .pip.run { background: var(--blue); }
+  .nav-item.on .pip.run { background: #fff; }
+  .pip.wait { background: var(--amber); }
+  .pip.ok { background: var(--green); }
+  .pip.bad { background: var(--red); }
+  .nav-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .nav-badge {
+    font-size: 11px; font-weight: 600; background: var(--amber);
+    color: #fff; padding: 0 6px; border-radius: 9px; line-height: 17px;
+  }
+  .back {
+    padding: 9px 16px; border-top: 1px solid var(--hair);
+    font-size: 13px; color: var(--blue); cursor: pointer;
+  }
+
+  /* ── 主区 ── */
+  main { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
+  .topbar {
+    background: rgba(255,255,255,.8); backdrop-filter: saturate(180%) blur(20px);
+    border-bottom: 1px solid var(--hair); padding: 11px 20px;
+    display: flex; align-items: center; gap: 10px;
+  }
+  .topbar h1 { margin: 0; font-size: 15px; font-weight: 600; letter-spacing: -.01em; }
+  .chip {
+    font-size: 11.5px; padding: 2px 8px; border-radius: 20px;
+    background: var(--blue-soft); color: var(--blue); font-weight: 500;
+  }
+  .path { font: 11.5px var(--mono); color: var(--ink-3); }
+  .cost { margin-left: auto; font-size: 12px; color: var(--ink-2); }
+
+  /* 分段控件 —— iOS segmented control */
+  .tabs {
+    display: flex; gap: 2px; padding: 3px; background: rgba(0,0,0,.05);
+    border-radius: 9px; margin: 12px 20px 0; width: fit-content;
+  }
+  .tab {
+    padding: 5px 15px; border-radius: 7px; font-size: 13px; cursor: pointer;
+    color: var(--ink-2); border: 0; background: transparent; font-family: inherit;
+  }
+  .tab.on {
+    background: var(--surface); color: var(--ink); font-weight: 500;
+    box-shadow: 0 1px 3px rgba(0,0,0,.09);
+  }
+  .tab .n { color: var(--ink-3); margin-left: 4px; font-size: 12px; }
+
+  .body { flex: 1; overflow-y: auto; padding: 16px 20px 40px; }
+  .pane { display: none; }
+  .pane.on { display: block; }
+
+  /* ── 卡片 ── */
+  .card {
+    background: var(--surface); border: 1px solid var(--hair);
+    border-radius: var(--r); margin-bottom: 12px; overflow: hidden;
+  }
+  .card-h {
+    padding: 10px 14px; display: flex; align-items: center; gap: 9px;
+    border-bottom: 1px solid var(--hair-soft); font-size: 13px;
+  }
+  .card-h .t { font-weight: 600; }
+  .card-h .meta { margin-left: auto; font-size: 12px; color: var(--ink-3); }
+
+  /* ── 改动文件 ── */
+  .file-row {
+    display: flex; align-items: center; gap: 11px; padding: 10px 14px;
+    border-bottom: 1px solid var(--hair-soft); cursor: pointer; font-size: 13.5px;
+  }
+  .file-row:last-child { border-bottom: 0; }
+  .file-row:hover { background: #fafafb; }
+  .file-row.sel { background: var(--blue-soft); }
+  .tagm {
+    font-size: 10.5px; font-weight: 600; padding: 1px 6px; border-radius: 5px;
+    min-width: 42px; text-align: center;
+  }
+  .tagm.edit { background: var(--amber-soft); color: var(--amber); }
+  .tagm.new  { background: var(--green-soft); color: var(--green); }
+  .tagm.del  { background: var(--red-soft); color: var(--red); }
+  .fname { flex: 1; font-family: var(--mono); font-size: 12.5px; }
+  .fdir { color: var(--ink-3); }
+  .diffstat { font: 11.5px var(--mono); color: var(--ink-3); }
+  .diffstat .p { color: var(--green); }
+  .diffstat .m { color: var(--red); }
+
+  /* ── diff ── */
+  .diff { font: 12px/1.65 var(--mono); overflow-x: auto; }
+  .dl { display: flex; padding: 0 14px; white-space: pre; }
+  .dl .ln { width: 34px; flex: none; color: var(--ink-3); user-select: none; font-size: 11px; text-align: right; padding-right: 12px; }
+  .dl.add { background: var(--green-soft); }
+  .dl.add .ln { color: #6ba97a; }
+  .dl.rem { background: var(--red-soft); }
+  .dl.rem .ln { color: #c99; }
+  .dl.hunk { background: #f7f7f9; color: var(--ink-3); font-size: 11.5px; }
+
+  /* ── artifacts ── */
+  .art-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(215px,1fr)); gap: 11px; }
+  .art {
+    background: var(--surface); border: 1px solid var(--hair);
+    border-radius: var(--r); overflow: hidden; cursor: pointer;
+  }
+  .art:hover { border-color: #cfcfd4; }
+  .art-prev {
+    height: 108px; background: #fafafb; display: flex; align-items: center;
+    justify-content: center; border-bottom: 1px solid var(--hair-soft);
+    color: var(--ink-3); font-size: 11.5px;
+  }
+  .art-b { padding: 9px 12px; }
+  .art-n { font-size: 13px; font-weight: 500; }
+  .art-m { font-size: 11.5px; color: var(--ink-3); margin-top: 1px; }
+
+  /* ── 对话 ── */
+  .turn { margin-bottom: 16px; }
+  .who { font-size: 11.5px; color: var(--ink-3); margin-bottom: 4px; font-weight: 500; }
+  .said {
+    background: var(--surface); border: 1px solid var(--hair);
+    border-radius: var(--r); padding: 10px 14px; font-size: 13.5px;
+  }
+  .turn.me .said { background: var(--blue-soft); border-color: #d3e5fb; }
+  .tool-line {
+    display: flex; align-items: center; gap: 9px; padding: 8px 12px;
+    background: var(--surface); border: 1px solid var(--hair);
+    border-radius: 8px; font-size: 12.5px; margin-bottom: 6px;
+  }
+  .tool-line .nm { font-weight: 600; }
+  .tool-line .ar { font-family: var(--mono); font-size: 12px; color: var(--ink-2); flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .ok-mark { color: var(--green); font-size: 13px; }
+
+  /* ── 待批准(浅色版)── */
+  .approve {
+    background: var(--surface); border: 1px solid #f0dcb4;
+    border-radius: var(--r); overflow: hidden; margin-bottom: 12px;
+  }
+  .approve-h {
+    background: var(--amber-soft); padding: 9px 14px;
+    display: flex; align-items: center; gap: 8px; font-size: 13px;
+  }
+  .approve-h b { font-weight: 600; color: var(--amber); }
+  .approve-h .cd { margin-left: auto; font: 11.5px var(--mono); color: var(--amber); }
+  .approve-cmd {
+    padding: 12px 14px; font: 12.5px var(--mono); background: #fcfcfd;
+    border-bottom: 1px solid var(--hair-soft); word-break: break-all;
+  }
+  .approve-cmd .risk { color: var(--red); font-weight: 700; }
+  .approve-why { padding: 9px 14px; font-size: 12.5px; color: var(--ink-2); background: var(--red-soft); }
+  .approve-act { padding: 11px 14px; display: flex; gap: 8px; }
+  .btn {
+    font: 500 13px var(--sans); padding: 7px 18px; border-radius: 8px;
+    border: 1px solid var(--hair); background: var(--surface);
+    color: var(--ink); cursor: pointer;
+  }
+  .btn:hover { background: #fafafb; }
+  .btn.pri { background: var(--blue); border-color: var(--blue); color: #fff; }
+  .btn.pri:hover { background: #0062c4; }
+  .btn.dan { color: var(--red); border-color: #eccac6; }
+
+  .note {
+    margin: 4px 20px 24px; padding: 13px 15px; background: var(--surface);
+    border: 1px solid var(--hair); border-radius: var(--r);
+    font-size: 12.5px; line-height: 1.7; color: var(--ink-2); max-width: 720px;
+  }
+  .note b { color: var(--ink); font-weight: 600; }
+</style>
+</head>
+<body>
+
+<aside>
+  <div class="brand">Synapse</div>
+  <div class="nav">
+    <div class="nav-h">需要你</div>
+    <div class="nav-item"><span class="pip wait"></span><span class="nav-name">payments-api</span><span class="nav-badge">1</span></div>
+    <div class="nav-item"><span class="pip wait"></span><span class="nav-name">infra-terraform</span><span class="nav-badge">1</span></div>
+    <div class="nav-h">进行中</div>
+    <div class="nav-item on"><span class="pip run"></span><span class="nav-name">synapse-wrapper</span></div>
+    <div class="nav-h">静默</div>
+    <div class="nav-item"><span class="pip ok"></span><span class="nav-name">docs-site</span></div>
+    <div class="nav-item"><span class="pip bad"></span><span class="nav-name">legacy-etl</span></div>
+    <div class="nav-item"><span class="pip"></span><span class="nav-name">mobile-app</span></div>
+  </div>
+  <div class="back">‹ 返回全部会话</div>
+</aside>
+
+<main>
+  <div class="topbar">
+    <h1>synapse-wrapper</h1>
+    <span class="chip">运行中 · 第 4 轮</span>
+    <span class="path">~/Claude/Projects/synapse-wrapper</span>
+    <span class="cost">$0.68 · 12 分钟</span>
+  </div>
+
+  <div class="tabs">
+    <button class="tab on" data-p="files">改动文件<span class="n">4</span></button>
+    <button class="tab" data-p="arts">Artifacts<span class="n">3</span></button>
+    <button class="tab" data-p="chat">对话</button>
+    <button class="tab" data-p="term">终端输出</button>
+  </div>
+
+  <div class="body">
+
+    <!-- 改动文件 -->
+    <div class="pane on" id="files">
+      <div class="approve">
+        <div class="approve-h"><b>等待批准</b><span>Bash · 要执行命令</span><span class="cd">4:12 后自动拒绝</span></div>
+        <div class="approve-cmd"><span class="risk">rm -rf</span> node_modules && npm install</div>
+        <div class="approve-why">递归删除目录。node_modules 可重装,但请确认路径无误。</div>
+        <div class="approve-act">
+          <button class="btn pri">批准</button>
+          <button class="btn dan">拒绝</button>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-h"><span class="t">本次会话改动</span><span class="meta">4 个文件 · +187 −23</span></div>
+        <div class="file-row sel">
+          <span class="tagm edit">修改</span>
+          <span class="fname"><span class="fdir">backend/</span>permissions.ts</span>
+          <span class="diffstat"><span class="p">+94</span> <span class="m">−12</span></span>
+        </div>
+        <div class="file-row">
+          <span class="tagm new">新增</span>
+          <span class="fname"><span class="fdir">backend/</span>transport.ts</span>
+          <span class="diffstat"><span class="p">+61</span></span>
+        </div>
+        <div class="file-row">
+          <span class="tagm edit">修改</span>
+          <span class="fname"><span class="fdir">backend/</span>server.ts</span>
+          <span class="diffstat"><span class="p">+32</span> <span class="m">−8</span></span>
+        </div>
+        <div class="file-row">
+          <span class="tagm del">删除</span>
+          <span class="fname"><span class="fdir">backend/</span>legacy-ipc.ts</span>
+          <span class="diffstat"><span class="m">−3</span></span>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-h"><span class="t">permissions.ts</span><span class="meta">+94 −12</span></div>
+        <div class="diff">
+          <div class="dl hunk"><span class="ln"></span>@@ -41,7 +41,14 @@ export class PermissionEngine</div>
+          <div class="dl"><span class="ln">41</span>     const now = Date.now();</div>
+          <div class="dl rem"><span class="ln">42</span>-    const timer = setTimeout(() =&gt; {</div>
+          <div class="dl rem"><span class="ln">43</span>-      this.#settle(toolUseId, 'allow');</div>
+          <div class="dl add"><span class="ln">42</span>+    // fail-closed 兜底:钩子自然超时会放行(实测),</div>
+          <div class="dl add"><span class="ln">43</span>+    // 因此必须在截止前主动拒绝。</div>
+          <div class="dl add"><span class="ln">44</span>+    const timer = setTimeout(() =&gt; {</div>
+          <div class="dl add"><span class="ln">45</span>+      this.#settle(toolUseId, 'deny', '超时未获批准');</div>
+          <div class="dl"><span class="ln">46</span>     }, DECISION_TIMEOUT_MS);</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Artifacts -->
+    <div class="pane" id="arts">
+      <div class="card">
+        <div class="card-h"><span class="t">本次会话产出</span><span class="meta">3 项</span></div>
+      </div>
+      <div class="art-grid">
+        <div class="art">
+          <div class="art-prev">图表预览</div>
+          <div class="art-b"><div class="art-n">权限时序图</div><div class="art-m">SVG · 2 分钟前</div></div>
+        </div>
+        <div class="art">
+          <div class="art-prev">HTML 页面</div>
+          <div class="art-b"><div class="art-n">仪表盘原型</div><div class="art-m">HTML · 6 分钟前</div></div>
+        </div>
+        <div class="art">
+          <div class="art-prev">测试报告</div>
+          <div class="art-b"><div class="art-n">端到端验证结果</div><div class="art-m">Markdown · 9 分钟前</div></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 对话 -->
+    <div class="pane" id="chat">
+      <div class="turn me">
+        <div class="who">你</div>
+        <div class="said">把超时兜底改成 fail-closed,别让钩子自然过期。</div>
+      </div>
+      <div class="turn">
+        <div class="who">Claude</div>
+        <div class="said">好的。实测确认钩子自然超时会放行,所以后端要在截止前主动返回 deny。我改 permissions.ts。</div>
+      </div>
+      <div class="tool-line"><span class="nm">Read</span><span class="ar">backend/permissions.ts</span><span class="ok-mark">✓</span></div>
+      <div class="tool-line"><span class="nm">Edit</span><span class="ar">backend/permissions.ts · +94 −12</span><span class="ok-mark">✓</span></div>
+      <div class="turn">
+        <div class="who">Claude</div>
+        <div class="said">改好了。内部截止 280 秒,短于 settings 里配的 300 秒,留出响应回传余量。</div>
+      </div>
+    </div>
+
+    <!-- 终端输出 -->
+    <div class="pane" id="term">
+      <div class="card">
+        <div class="card-h"><span class="t">npx tsc --noEmit</span><span class="meta">退出码 0 · 1.8s</span></div>
+        <div class="diff" style="padding:12px 0">
+          <div class="dl"><span class="ln"></span>=== 类型检查通过 ===</div>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-h"><span class="t">端到端测试</span><span class="meta">退出码 0 · 14s</span></div>
+        <div class="diff" style="padding:12px 0">
+          <div class="dl"><span class="ln"></span>[WS] 已连接</div>
+          <div class="dl"><span class="ln"></span>[批准请求] tool= Bash | 倒计时秒= 280</div>
+          <div class="dl"><span class="ln"></span>[已裁决] allow - 用户在网页批准</div>
+          <div class="dl"><span class="ln"></span>[工具结果] "E2E_OK"</div>
+        </div>
+      </div>
+    </div>
+
+  </div>
+
+  <div class="note">
+    <b>单会话详情页 · 浅色。</b>顶层仍是 B 的优先级流,点进某个会话后到这里。
+    四个分段页签把「改动文件 / Artifacts / 对话 / 终端输出」分开 ——
+    <b>代码改动不再淹没在对话流里</b>,这是相对终端最实在的增量。
+    风格取 macOS 系统应用:发丝分隔线、系统蓝唯一强调色、状态用淡彩底而非高饱和块面。
+    待批准项即使在详情页也置顶,保证不会漏。
+  </div>
+
+</main>
+
+<script>
+  for (const t of document.querySelectorAll('.tab')) {
+    t.onclick = () => {
+      document.querySelector('.tab.on').classList.remove('on');
+      t.classList.add('on');
+      document.querySelector('.pane.on').classList.remove('on');
+      document.getElementById(t.dataset.p).classList.add('on');
+    };
+  }
+  for (const r of document.querySelectorAll('.file-row')) {
+    r.onclick = () => {
+      document.querySelector('.file-row.sel')?.classList.remove('sel');
+      r.classList.add('sel');
+    };
+  }
+</script>
+</body>
+</html>

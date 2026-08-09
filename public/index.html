@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Synapse Wrapper</title>
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+
+<aside>
+  <div class="brand"><span class="conn" id="conn"></span>Synapse</div>
+  <div class="nav" id="nav"></div>
+  <div class="side-foot"><button class="add-btn" id="add">+ 新建会话</button></div>
+</aside>
+
+<main>
+  <div class="topbar" id="topbar"></div>
+  <div class="tabs" id="tabs" style="display:none"></div>
+  <div class="body" id="body"></div>
+  <footer id="foot" style="display:none">
+    <div class="composer">
+      <textarea id="input" rows="2" placeholder="输入消息…  (Enter 发送,Shift+Enter 换行)"></textarea>
+      <button class="btn pri" id="send">发送</button>
+    </div>
+  </footer>
+</main>
+
+<script type="module" src="/app.js"></script>
+</body>
+</html>
