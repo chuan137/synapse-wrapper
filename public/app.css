@@ -259,6 +259,33 @@ main { flex: 1; display: flex; flex-direction: column; overflow: hidden; min-wid
 }
 .turn.me .said { background: var(--blue-soft); border-color: #cfe4fb; color: #0a2f57; }
 
+/* Markdown 渲染出的块级/行内元素(.said 结论、.mid-text 思路都会用到)——
+   延续发丝线/弱对比的系统应用风格,不引入额外强调色(链接用系统蓝已经
+   是唯一强调色,其余元素靠间距/字重区分层级)。 */
+.said h3, .said h4, .said h5, .said h6,
+.mid-text h3, .mid-text h4, .mid-text h5, .mid-text h6 {
+  margin: 10px 0 4px; font-weight: 600; line-height: 1.4;
+}
+.said h3, .mid-text h3 { font-size: 15.5px; }
+.said h4, .mid-text h4 { font-size: 14.5px; }
+.said h5, .said h6, .mid-text h5, .mid-text h6 { font-size: 13.5px; }
+.said > :first-child, .mid-text > :first-child { margin-top: 0; }
+.said ul, .said ol, .mid-text ul, .mid-text ol { margin: 6px 0; padding-left: 20px; }
+.said li, .mid-text li { margin-bottom: 2px; }
+.said code, .mid-text code {
+  font: 12.5px var(--mono); background: var(--hair-soft);
+  padding: 1px 5px; border-radius: 4px;
+}
+.turn.me .said code { background: rgba(255,255,255,.55); }
+.said pre.md-code, .mid-text pre.md-code {
+  margin: 8px 0; padding: 10px 12px; background: var(--bg);
+  border: 1px solid var(--hair); border-radius: 8px;
+  font: 12.5px/1.5 var(--mono); overflow-x: auto; white-space: pre;
+}
+.said pre.md-code code, .mid-text pre.md-code code { background: none; padding: 0; }
+.said a, .mid-text a { color: var(--blue); text-decoration: none; }
+.said a:hover, .mid-text a:hover { text-decoration: underline; }
+
 /* 工具调用是执行细节,权重弱于 mid-text —— 不再是通栏行(通栏本身是一种
    "主结构"的形状语言,颜色再浅也压不住),改成缩进的紧凑细节行,读起来
    像"嵌套在思路下面的日志",而非并列条目。 */

@@ -35,6 +35,54 @@ const state = {
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) =>
   ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 
+/**
+ * 极简 Markdown 渲染,只覆盖 Claude 输出里常见的语法(粗体/斜体/行内代码/
+ * 代码块/链接/标题/列表),不追求 CommonMark 完整规范。用户自己发的消息
+ * 不经过这里 —— 原样转义显示,不该被解释成 markdown。
+ *
+ * 先整体 HTML 转义再逐步替换成标签,任何用户可控内容都不会被当成 HTML
+ * 注入执行。代码块/行内代码先抽成占位符,避免块内内容被后续的粗体/链接
+ * 等行内规则误伤(比如代码里的 * 或 [ ] 被当语法解析)。
+ */
+function renderMarkdown(src) {
+  const blocks = [];
+  let text = esc(src).replace(/```([a-zA-Z0-9_+-]*)\n?([\s\S]*?)```/g, (_, lang, code) => {
+    const i = blocks.push(`<pre class="md-code"><code>${code.replace(/\n$/, '')}</code></pre>`) - 1;
+    return `@@B${i}@@`;
+  });
+
+  const inlineCode = [];
+  text = text.replace(/`([^`\n]+)`/g, (_, code) => {
+    const i = inlineCode.push(`<code>${code}</code>`) - 1;
+    return `@@I${i}@@`;
+  });
+
+  text = text.replace(/^(#{1,4})\s+(.+)$/gm, (_, h, t) => `@@H${h.length}@@${t}@@/H@@`);
+  text = text.replace(/\*\*([^*\n]+)\*\*/g, '<strong>$1</strong>');
+  text = text.replace(/(^|[^*])\*([^*\n]+)\*(?!\*)/g, '$1<em>$2</em>');
+  text = text.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
+
+  text = text.replace(/(?:^|\n)((?:[-*] .+(?:\n|$))+)/g, (m, block) =>
+    `\n@@UL@@${block.trim().split('\n').map((l) => `<li>${l.replace(/^[-*]\s+/, '')}</li>`).join('')}@@/UL@@`);
+  text = text.replace(/(?:^|\n)((?:\d+\. .+(?:\n|$))+)/g, (m, block) =>
+    `\n@@OL@@${block.trim().split('\n').map((l) => `<li>${l.replace(/^\d+\.\s+/, '')}</li>`).join('')}@@/OL@@`);
+
+  text = text.replace(/@@H(\d)@@([\s\S]*?)@@\/H@@/g, (_, n, t) => `<h${Number(n) + 2}>${t}</h${Number(n) + 2}>`);
+  text = text.replace(/@@UL@@/g, '<ul>').replace(/@@\/UL@@/g, '</ul>');
+  text = text.replace(/@@OL@@/g, '<ol>').replace(/@@\/OL@@/g, '</ol>');
+
+  // 代码块占位符此时还不是真正的块级标签,换行折 <br> 前先临时套一层
+  // div,避免占位符前后的换行被误转成 <br>(块级标签自带换行,不需要)。
+  text = text.replace(/@@B(\d+)@@/g, '<div data-b>@@B$1@@</div>');
+  text = text.replace(/\n(?!<\/?(h\d|ul|ol|li|div))/g, '<br>');
+  text = text.replace(/<br>(<\/?(ul|ol|h\d|div)>)/g, '$1').replace(/(<\/?(ul|ol|h\d|div)>)<br>/g, '$1');
+  text = text.replace(/<div data-b>(@@B\d+@@)<\/div>/g, '$1');
+
+  text = text.replace(/@@I(\d+)@@/g, (_, i) => inlineCode[i]);
+  text = text.replace(/@@B(\d+)@@/g, (_, i) => blocks[i]);
+  return text;
+}
+
 function ago(ts) {
   const s = Math.round((Date.now() - ts) / 1000);
   if (s < 10) return '刚刚';
@@ -261,7 +309,7 @@ function renderTurns(d) {
       // 进行中:只展示最新一步,旧步骤不追加显示。
       const last = g.steps[g.steps.length - 1];
       out += last.kind === 'assistant'
-        ? `<div class="turn"><div class="who">Claude</div><div class="said">${esc(last.text)}</div></div>`
+        ? `<div class="turn"><div class="who">Claude</div><div class="said">${renderMarkdown(last.text)}</div></div>`
         : toolLine(last);
       return out;
     }
@@ -290,7 +338,7 @@ function renderTurns(d) {
       </div>`;
     }
     if (conclude) {
-      out += `<div class="turn"><div class="who">Claude</div><div class="said">${procHtml}${esc(conclude.text)}</div></div>`;
+      out += `<div class="turn"><div class="who">Claude</div><div class="said">${procHtml}${renderMarkdown(conclude.text)}</div></div>`;
     } else {
       out += procHtml;
     }
@@ -301,7 +349,7 @@ function renderTurns(d) {
 function toolLine(t) {
   // 过程中的 assistant 文本(非本轮结论)—— 弱于工具调用行,
   // 也区分于 .turn .said 承载的结论,避免抢视觉、分不清主次。
-  if (t.kind === 'assistant') return `<div class="mid-text">${esc(t.text)}</div>`;
+  if (t.kind === 'assistant') return `<div class="mid-text">${renderMarkdown(t.text)}</div>`;
   const mark = !t.done ? '<span class="run-mark">running</span>'
     : t.isError ? '<span class="err-mark">✕</span>' : '<span class="ok-mark">✓</span>';
   return `<div class="tool-line"><span class="nm">${esc(t.name)}</span><span class="ar">${esc(t.summary)}</span>${mark}</div>`;
