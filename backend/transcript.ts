@@ -52,6 +52,14 @@ export function parseTranscriptLineMulti(
         events.push({ kind: 'tool_use', toolUseId: b.id, name: b.name, input: b.input });
       }
     }
+    // stop_reason 是模型自己对本轮的收尾判断:'tool_use' 表示还要接着调用
+    // 工具、后面还有更多 assistant 消息属于同一轮;其他值(end_turn 等)
+    // 才是这一轮真正说完了。曾经改用转写里的 last-prompt 行近似判断,
+    // 实测它标记的是"CLI 回到顶层输入态"而非"这一轮说完",大多数轮次
+    // 等不到它,turn_end 永久缺失。stop_reason 每轮必有恰好一条,可靠。
+    if (d.message?.stop_reason && d.message.stop_reason !== 'tool_use') {
+      events.push({ kind: 'turn_end', result: '' });
+    }
     return events;
   }
 
@@ -79,11 +87,6 @@ export function parseTranscriptLineMulti(
     const title = typeof d.aiTitle === 'string' ? d.aiTitle.trim() : '';
     if (title && title !== lastTitle) return [{ kind: 'title', title }];
     return [];
-  }
-
-  // 转写没有显式的 result 行,last-prompt 最接近本轮收尾
-  if (d.type === 'last-prompt') {
-    return [{ kind: 'turn_end', result: '' }];
   }
 
   return [];

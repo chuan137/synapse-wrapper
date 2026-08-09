@@ -134,6 +134,8 @@ UI 用它区分同目录并存的会话 —— pane ID 能区分但不解释,标
 
 实测确认:`claude -p --input-format stream-json` 与 tmux 里的原生 TUI 写的是**同一套路径规则**(`~/.claude/projects/<cwd 转写>/<session_id>.jsonl`),并非 tmux 独有。两种传输方式因此可以共用一份解析逻辑(`backend/transcript.ts`),既用于 tmux 的实时 tail,也用于 §2.11 的历史重放。
 
+**`last-prompt` 不能当作逐轮 `turn_end` 信号。** 早期实现认为转写没有显式的 result 行,拿 `last-prompt`(CLI 回到顶层输入态时写入)当"本轮结束"的近似判断。实测某会话 93 次用户输入只对应 15 次 `last-prompt` —— 它标记的是空闲态,不是每轮回复的收尾,二者不是一一对应。多数轮次因此永远等不到配对的 `turn_end`,界面对话气泡与 header 状态卡死在"进行中"。改用 `assistant` 消息自带的 `stop_reason` 字段:值为 `tool_use` 表示后面还要继续调工具、同一轮未结束;其他值(如 `end_turn`)才是这一轮真正说完。每轮必有恰好一条这样的收尾消息,是可靠的逐轮边界。
+
 ### 2.10 服务端 timeline 与前端增量视图必须落同一套分组边界
 
 `GET /api/sessions/:id` 首次拉取用的是 `SessionManager` 自己维护的 `s.timeline`,与 WebSocket 增量更新走的前端 `onSessionEvent` 是两份独立实现,字段结构必须保持一致 —— 改其中一份而漏另一份,不会报类型错误(两边都是各自文件里的字面量对象),只在运行时表现为数据缺失。
