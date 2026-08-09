@@ -286,8 +286,9 @@ function onSessionEvent(localId, ev) {
 /**
  * 按 user 消息切分 turn,组内除最后一条 assistant 文本外全部算「过程」
  * (工具调用 + 中间文本)。已结束的 turn 把过程折叠成一行,默认收起,
- * 减少两次结论之间的噪音;进行中的 turn 没有「最后一条」的概念,
- * 只显示过程中最新一步,原地更新而非持续追加。
+ * 减少两次结论之间的噪音;进行中的 turn 没有「结论」的概念,过程原样
+ * 滚动展示(不折叠),跳动的三个点跟步数徽标并排挂在"Claude"旁边,
+ * 表示还在继续、后面还有内容要来。
  */
 function renderTurns(d) {
   if (!d.expandedTurns) d.expandedTurns = new Set();
@@ -306,11 +307,11 @@ function renderTurns(d) {
     if (!g.steps.length) return out;
 
     if (!g.ended) {
-      // 进行中:只展示最新一步,旧步骤不追加显示。
-      const last = g.steps[g.steps.length - 1];
-      out += last.kind === 'assistant'
-        ? `<div class="turn"><div class="who">Claude</div><div class="said">${renderMarkdown(last.text)}</div></div>`
-        : toolLine(last);
+      // 进行中:全部步骤原样滚动显示,不折叠(折叠是「已结束」轮次专属
+      // 的降噪手段,进行中还不知道最终会有几步,折叠了也没有稳定的
+      // 「结论」可露出)。
+      const who = `Claude<span class="proc-sum live">${LIVE_DOTS}<span class="proc-steps">${g.steps.length} 步</span></span>`;
+      out += `<div class="turn"><div class="who">${who}</div><div class="said">${g.steps.map(toolLine).join('')}</div></div>`;
       return out;
     }
 
@@ -320,37 +321,41 @@ function renderTurns(d) {
     const conclude = concludeIdx === -1 ? null : g.steps[concludeIdx];
     const process = g.steps.filter((_, idx) => idx !== concludeIdx);
 
-    // 折叠摘要不再单独占一个框,并入结论气泡内部 —— 但过程在时间线上
-    // 发生在结论之前,故置于结论文字上方,保持"先过程、后结论"的阅读
-    // 顺序,不能反过来。没有结论文字时(纯工具调用轮次)才退化为独立
-    // 卡片,避免摘要本身没地方挂。
+    // 步骤摘要挂在"Claude"标签旁边而非气泡内部 —— 折叠/展开是对这一轮
+    // 过程的元信息,跟发言人一起出现比塞进正文顶部更符合"这是谁、做了
+    // 多少步"的阅读顺序。展开后的过程详情仍放在气泡内、结论文字上方
+    // (过程先于结论发生,顺序不能反)。
+    let who = 'Claude';
     let procHtml = '';
     if (process.length) {
       const failed = process.some((s) => s.kind === 'tool' && s.isError);
       const open = d.expandedTurns.has(i);
-      procHtml = `<div class="proc ${open ? 'open' : ''} ${failed ? 'has-error' : ''}" data-turn="${i}">
-        <div class="proc-sum">
-          <span class="proc-dot"></span>
-          <span class="proc-steps">${process.length} 步</span>
-          ${failed ? '<span class="err-mark">含出错</span>' : ''}
-        </div>
+      who += `<span class="proc-sum ${failed ? 'has-error' : ''}" data-turn="${i}">
+        <span class="proc-dot"></span>
+        <span class="proc-steps">${process.length} 步</span>
+        ${failed ? '<span class="err-mark">含出错</span>' : ''}
+      </span>`;
+      procHtml = `<div class="proc ${open ? 'open' : ''}">
         <div class="proc-body-wrap"><div class="proc-body">${process.map(toolLine).join('')}</div></div>
       </div>`;
     }
-    if (conclude) {
-      out += `<div class="turn"><div class="who">Claude</div><div class="said">${procHtml}${renderMarkdown(conclude.text)}</div></div>`;
-    } else {
-      out += procHtml;
+    if (procHtml || conclude) {
+      const text = conclude ? renderMarkdown(conclude.text) : '<span class="no-conclude">(无文字回复)</span>';
+      out += `<div class="turn"><div class="who">${who}</div><div class="said">${procHtml}${text}</div></div>`;
     }
     return out;
   }).join('');
 }
 
+// 轮次/工具调用"进行中"的统一动效标记 —— 三个依次跳动的圆点,
+// 比静态的"running"文字更直观地传达"还没结束,后面还有内容"。
+const LIVE_DOTS = '<span class="live-dots"><span></span><span></span><span></span></span>';
+
 function toolLine(t) {
   // 过程中的 assistant 文本(非本轮结论)—— 弱于工具调用行,
   // 也区分于 .turn .said 承载的结论,避免抢视觉、分不清主次。
   if (t.kind === 'assistant') return `<div class="mid-text">${renderMarkdown(t.text)}</div>`;
-  const mark = !t.done ? '<span class="run-mark">running</span>'
+  const mark = !t.done ? LIVE_DOTS
     : t.isError ? '<span class="err-mark">✕</span>' : '<span class="ok-mark">✓</span>';
   return `<div class="tool-line"><span class="nm">${esc(t.name)}</span><span class="ar">${esc(t.summary)}</span>${mark}</div>`;
 }
@@ -456,8 +461,11 @@ function renderNav() {
 
   // 按 workspace 分组(而非目录名 name)—— 绝对路径全局唯一,不会把同名的
   // 不同目录混进一组。组内保留原「需要你/进行中/静默」的排序权重。
+  // exited 的会话不在左栏出现 —— 进程已经不在了,不算 active;仍能在
+  // 「全部会话」总览页的「静默」分组里找到,不是彻底消失。
   const byWorkspace = new Map();
   for (const s of state.sessions.values()) {
+    if (s.state === 'exited') continue;
     if (!byWorkspace.has(s.workspace)) byWorkspace.set(s.workspace, []);
     byWorkspace.get(s.workspace).push(s);
   }
@@ -522,6 +530,18 @@ function renderTopbar() {
     <span class="path">${esc(s.workspace)}</span>
     <span class="spacer"></span>
     <span class="cost">${s.costUsd ? '$' + s.costUsd.toFixed(4) : ''}</span>`;
+  updateComposer(st);
+}
+
+/**
+ * 会话不是 ready 时(忙碌/待批准/启动中/已退出)禁用发送按钮 —— 但不禁用
+ * 输入框本身,用户仍可以先把下一条想法打好、攒着,等轮到自己时再点发送。
+ * 这是 pendingTurns 那次修复的补充:从源头减少叠加发送的场景,而不是
+ * 只在后端把状态修正回来。
+ */
+function updateComposer(st) {
+  $('send').disabled = st !== 'ready';
+  $('send').title = st !== 'ready' ? '会话尚未就绪,等当前轮次结束后再发送' : '';
 }
 
 // ── 渲染:页签 ──────────────────────────────────────────────
@@ -770,9 +790,11 @@ function renderDetail() {
 }
 
 function wireProcs(root, d) {
-  for (const el of root.querySelectorAll('.proc-sum')) {
+  // .proc-sum.live(进行中轮次)没有 data-turn、也没有对应的 .proc 可展开,
+  // 排除在外,否则点击会把 NaN 塞进 expandedTurns。
+  for (const el of root.querySelectorAll('.proc-sum:not(.live)')) {
     el.onclick = () => {
-      const i = Number(el.parentElement.dataset.turn);
+      const i = Number(el.dataset.turn);
       if (d.expandedTurns.has(i)) d.expandedTurns.delete(i); else d.expandedTurns.add(i);
       renderDetail();
     };
@@ -862,7 +884,9 @@ $('add').onclick = () => {
 // ── 发送 ────────────────────────────────────────────────────
 function send() {
   const text = $('input').value.trim();
-  if (!text || state.view === 'overview' || !state.connected) return;
+  // 按钮 disabled 挡不住 Enter 键路径,这里兜底同一条判断 —— 不清空
+  // 输入框,内容留着等就绪了再发。
+  if (!text || state.view === 'overview' || !state.connected || $('send').disabled) return;
   ws.send(JSON.stringify({ type: 'prompt', localId: state.view, text }));
   $('input').value = '';
 }

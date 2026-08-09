@@ -173,6 +173,13 @@ export interface Session {
   tasks: Map<string, TodoItem>;
   /** TaskCreate 调用发出但结果未回,等 tool_result 里解出 taskId 才能建档。 */
   pendingTaskCreates: Map<string, { subject: string; activeForm: string }>;
+  /**
+   * 已发送但尚未收到 turn_end 的轮次计数。网页不禁用输入框,允许在上一轮
+   * 还没结束时就发下一条消息 —— 若 turn_end 无条件把 state 设回 ready,
+   * 上一轮的收尾会盖掉下一轮已经在跑的 busy,header 显示"就绪"但实际
+   * 还有轮次在处理。turn_end 只在计数归零(没有轮次还挂着)时才置 ready。
+   */
+  pendingTurns: number;
 }
 
 export type ManagerEvent =
@@ -433,6 +440,7 @@ export class SessionManager {
         todos: [],
         tasks: new Map(),
         pendingTaskCreates: new Map(),
+        pendingTurns: 0,
       };
       this.#sessions.set(p.localId, session);
       if (p.claudeId) this.#byClaudeId.set(p.claudeId, p.localId);
@@ -609,6 +617,7 @@ export class SessionManager {
       todos: [],
       tasks: new Map(),
       pendingTaskCreates: new Map(),
+      pendingTurns: 0,
     };
 
     this.#sessions.set(localId, session);
@@ -663,8 +672,14 @@ export class SessionManager {
         break;
 
       case 'turn_end':
-        s.state = 'ready';
-        s.lastAction = '等待输入';
+        // 网页不禁用输入框,上一轮结束时下一轮可能已经在跑(见 pendingTurns
+        // 字段注释)—— 只有没有轮次还挂着时才能把 state 收回 ready,否则会
+        // 把下一轮的 busy 盖掉,header 显示"就绪"但实际还在处理。
+        s.pendingTurns = Math.max(0, s.pendingTurns - 1);
+        if (s.pendingTurns === 0) {
+          s.state = 'ready';
+          s.lastAction = '等待输入';
+        }
         break;
 
       case 'status':
@@ -687,6 +702,9 @@ export class SessionManager {
     const s = this.#sessions.get(localId);
     if (!s) return false;
     s.timeline.push({ kind: 'user', text, at: Date.now() });
+    // 每条 prompt 对应一次 turn_end,先记下再发送,避免跟 transport 的
+    // status:busy 事件时序产生竞态(见 pendingTurns 字段注释)。
+    s.pendingTurns++;
     s.transport.send(text);
     return true;
   }

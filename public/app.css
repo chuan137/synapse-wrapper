@@ -248,7 +248,7 @@ main { flex: 1; display: flex; flex-direction: column; overflow: hidden; min-wid
 
 /* ── 对话 ── */
 .turn { margin-bottom: 16px; }
-.who { font-size: 11.5px; color: var(--ink-3); margin-bottom: 5px; font-weight: 500; }
+.who { display: flex; align-items: center; gap: 8px; font-size: 11.5px; color: var(--ink-3); margin-bottom: 5px; font-weight: 500; }
 /* 结论气泡是对话页签里权重最高的元素 —— 字号/圆角/阴影都明显高于折叠区
    (.proc)与其子项,靠对比而非把次要内容压小来分层(压小会牺牲可读性)。 */
 .said {
@@ -258,6 +258,10 @@ main { flex: 1; display: flex; flex-direction: column; overflow: hidden; min-wid
   white-space: pre-wrap; word-wrap: break-word;
 }
 .turn.me .said { background: var(--blue-soft); border-color: #cfe4fb; color: #0a2f57; }
+
+/* 纯工具调用轮次的兜底文案 —— 弱化显示,跟真正的结论文字区分开,
+   避免看起来像是 Claude 真的说了"无文字回复"这四个字。 */
+.no-conclude { color: var(--ink-3); font-size: 13px; font-style: italic; }
 
 /* Markdown 渲染出的块级/行内元素(.said 结论、.mid-text 思路都会用到)——
    延续发丝线/弱对比的系统应用风格,不引入额外强调色(链接用系统蓝已经
@@ -298,7 +302,21 @@ main { flex: 1; display: flex; flex-direction: column; overflow: hidden; min-wid
 .tool-line .ar { font-family: var(--mono); font-size: 11.5px; color: var(--ink-3); flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .ok-mark { color: var(--green); }
 .err-mark { color: var(--red); }
-.run-mark { color: var(--blue); }
+
+/* 轮次/工具调用"进行中"的动效 —— 三个依次跳动的圆点,贴在最新内容
+   末尾,提示这里还没结束、后面还有内容要来。复用 --blue,跟侧栏
+   busy 状态的脉冲圆点(.pip.busy)是同一套"进行中"配色语言。 */
+.live-dots { display: inline-flex; gap: 3px; margin-left: 6px; vertical-align: middle; }
+.live-dots span {
+  width: 4px; height: 4px; border-radius: 50%; background: var(--blue);
+  animation: dot-bounce 1.1s infinite ease-in-out both;
+}
+.live-dots span:nth-child(1) { animation-delay: -0.24s; }
+.live-dots span:nth-child(2) { animation-delay: -0.12s; }
+@keyframes dot-bounce {
+  0%, 80%, 100% { opacity: .3; transform: scale(.7); }
+  40% { opacity: 1; transform: scale(1); }
+}
 
 /* 过程中的 assistant 文本(思路本身,非本轮结论)—— 用户更想看的是这个。
    不用边框/竖线,靠比结论气泡的白底更深一档的底色(--bg)和圆角把它
@@ -310,31 +328,37 @@ main { flex: 1; display: flex; flex-direction: column; overflow: hidden; min-wid
   white-space: pre-wrap; word-wrap: break-word;
 }
 
-/* 已结束 turn 里工具调用与中间文本的折叠摘要 —— 并入 .said 结论气泡内部
-   (结论文字上方,过程先于结论发生,顺序不能反),不再是并列的独立卡片。
-   .said 本身已经是这个视觉单元的外框,.proc 只用一条底部发丝线跟结论
-   正文分开,左右负边距抵消 .said 的 padding,让摘要行能贴到气泡边缘。
-   间距整体收紧,折叠态不应比一行文字占更多空间。 */
-.proc {
-  margin: -12px -16px 6px; padding-bottom: 0;
-  border-bottom: 1px solid var(--hair);
-  /* .proc 是纯结构标记(按钮/图标),不是自由文本 —— 必须重置继承自 .said
-     的 white-space: pre-wrap,否则 procHtml 模板字符串里为可读性而加的
-     换行缩进会被当真实换行渲染,在折叠态凭空多出上百像素空白。.mid-text
-     承载真正的文本内容,已自行重新声明 pre-wrap,不受此重置影响。 */
-  white-space: normal;
-}
+/* 步骤摘要挂在 .who(发言人行)旁边的小徽标,点击展开/折叠气泡内的
+   过程详情(.proc)。摘要留在标题行而非正文顶部,是因为"这一轮走了几
+   步"是关于发言人的元信息,不是结论内容的一部分。 */
 .proc-sum {
-  display: flex; align-items: center; gap: 6px; padding: 5px 16px;
-  font-size: 12.5px; color: var(--ink-2); cursor: pointer; user-select: none;
+  display: inline-flex; align-items: center; gap: 4px; padding: 1px 7px;
+  border-radius: 999px; background: var(--hair-soft);
+  font-size: 11px; color: var(--ink-2); cursor: pointer; user-select: none;
   transition: background .12s;
 }
-.proc-sum:hover { background: var(--hair-soft); }
-.proc-sum:active { background: var(--hair); }
-.proc-dot { width: 6px; height: 6px; border-radius: 50%; flex: none; background: var(--green); }
-.proc.has-error .proc-dot { background: var(--red); }
-.proc-steps { font-weight: 500; color: var(--ink); }
-.proc.open .proc-body-wrap { padding-bottom: 2px; }
+.proc-sum:hover { background: var(--hair); }
+.proc-dot { width: 5px; height: 5px; border-radius: 50%; flex: none; background: var(--green); }
+.proc-sum.has-error .proc-dot { background: var(--red); }
+.proc-steps { font-weight: 500; }
+/* 进行中变体:不可点击(没有可展开的折叠详情),点数徽标换成跳动的
+   三个点,呼应 --blue 的"进行中"配色语言,与已结束轮次的绿点区分。
+   .live-dots 默认给"贴在内容末尾"场景留了 margin-left,这里靠徽标
+   自身的 gap 排间距,须清零避免跟 gap 叠加出两倍空隙。 */
+.proc-sum.live { cursor: default; background: var(--blue-soft); }
+.proc-sum.live:hover { background: var(--blue-soft); }
+.proc-sum.live .live-dots { margin-left: 0; }
+
+/* 已结束 turn 里工具调用与中间文本的折叠详情 —— 并入 .said 结论气泡内部
+   (结论文字上方,过程先于结论发生,顺序不能反),展开状态由 .who 里的
+   .proc-sum 控制。.proc 是纯结构标记,不是自由文本 —— 必须重置继承自
+   .said 的 white-space: pre-wrap,否则 procHtml 模板字符串里为可读性而
+   加的换行缩进会被当真实换行渲染,在折叠态凭空多出上百像素空白。
+   .mid-text 承载真正的文本内容,已自行重新声明 pre-wrap,不受此重置影响。 */
+.proc { white-space: normal; }
+.proc.open .proc-body-wrap {
+  padding-bottom: 8px; margin-bottom: 6px; border-bottom: 1px solid var(--hair);
+}
 /* 高度用 grid-template-rows 做过渡(而非 max-height 硬编码上限或
    display:none 的无动画切换),0fr↔1fr 能精确贴合内容真实高度。 */
 .proc-body-wrap {
