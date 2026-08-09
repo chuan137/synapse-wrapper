@@ -807,7 +807,7 @@ $('add').onclick = () => {
     }
   };
   bg.querySelector('#mOk').onclick = submit;
-  inp.onkeydown = (e) => { if (e.key === 'Enter') submit(); };
+  inp.onkeydown = (e) => { if (e.key === 'Enter' && !e.isComposing) submit(); };
 };
 
 // ── 发送 ────────────────────────────────────────────────────
@@ -819,7 +819,9 @@ function send() {
 }
 $('send').onclick = send;
 $('input').onkeydown = (e) => {
-  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
+  // isComposing 排除中文输入法候选词确认的回车 —— 否则拼音上屏会被
+  // 误判成发送,把还没选完的内容连着输入法自己的回车一起提交出去。
+  if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); send(); }
 };
 
 // ── 倒计时:每秒刷新,不重绘整页 ─────────────────────────────
