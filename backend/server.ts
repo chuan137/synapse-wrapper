@@ -253,7 +253,14 @@ permissions.onSessionEnd((claudeId, reason) => {
   manager.endByClaudeId(claudeId, reason);
 });
 
-permissions.onApprovalResolved((toolUseId, decision, reason) => {
+permissions.onApprovalResolved((toolUseId, decision, reason, sessionId) => {
+  // 决策落定后若该会话已无其它待批准项,状态从 waiting 收回 —— 否则
+  // s.state 永远卡在 setState(waiting) 那次赋值,前端全靠 pendingFor()
+  // 派生覆盖掩盖,凡是直接读 s.state 原始值的地方都会显示假的"等待批准"。
+  const s = manager.byClaudeId(sessionId);
+  if (s && s.state === 'waiting' && permissions.countFor(sessionId) === 0) {
+    manager.setState(s.localId, s.pendingTurns > 0 ? 'busy' : 'ready');
+  }
   broadcast({ type: 'approval_resolved', toolUseId, decision, reason });
 });
 

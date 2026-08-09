@@ -243,7 +243,9 @@ function onSessionEvent(localId, ev) {
     }
     case 'tool_result': {
       const t = d.timeline.find((x) => x.kind === 'tool' && x.toolUseId === ev.toolUseId);
-      if (t) { t.done = true; t.isError = ev.isError; }
+      // AskUserQuestion 只能靠 deny+reason 回传(spec §5.1),Claude Code 因此
+      // 把它标成 is_error —— 是协议限制,不是真的失败,与后端 sessionManager.ts 同处理。
+      if (t) { t.done = true; t.isError = t.name === 'AskUserQuestion' ? false : ev.isError; }
       if (t?.name === 'Bash') {
         d.commands.push({
           toolUseId: ev.toolUseId, command: t.summary,

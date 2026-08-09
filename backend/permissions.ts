@@ -43,7 +43,12 @@ interface Waiter {
 }
 
 export type ApprovalListener = (approval: PendingApproval) => void;
-export type ResolveListener = (toolUseId: string, decision: Decision, reason: string) => void;
+export type ResolveListener = (
+  toolUseId: string,
+  decision: Decision,
+  reason: string,
+  sessionId: string,
+) => void;
 export type SessionEndListener = (sessionId: string, reason: string) => void;
 
 export class PermissionEngine {
@@ -173,7 +178,7 @@ export class PermissionEngine {
       },
     });
 
-    for (const fn of this.#onResolve) fn(toolUseId, decision, reason);
+    for (const fn of this.#onResolve) fn(toolUseId, decision, reason, waiter.info.sessionId);
     return true;
   }
 

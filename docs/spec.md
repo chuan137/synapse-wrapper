@@ -166,6 +166,14 @@ UI 用它区分同目录并存的会话 —— pane ID 能区分但不解释,标
 
 哪套工具会被实际调用,目前判断依据不明(未观察到与 model/环境变量的明确关联),故两套都要接。两个来源(`s.todos` 全量数组、`s.tasks` 按 taskId 维护的 Map)合并成一份只读视图给前端,`TodoItem` 加一个可选 `id` 字段承载 `taskId`。归约逻辑并入 §2.11 提到的 `reduceEvent`,使其与 `#absorb`/`replayTranscriptTimeline` 两条路径天然共享,不需要单独维护;前端首次拉取详情页后要用 `id` 重建本地的 taskId 索引,否则后续 WS 增量的 `TaskUpdate` 事件找不到条目可改(参照 §2.10 的教训,这也是一处"服务端归约"与"前端增量"必须对齐的分叉点)。
 
+### 2.13 会话退出检测靠 SessionEnd 钩子 + 存活巡检双通道
+
+stream-json 管道没有显式的"本轮/本会话结束"事件可读 —— 转写文件末行只是进程停下时恰好在做的事,不是结束标记(呼应 §2.9)。退出检测因此不能指望从 stdout/转写内容里推断,改挂 `SessionEnd` 钩子:进程退出时 Claude Code 会向钩子 URL 发一次带 `reason` 的 POST,后端在 `permissions.ts` 里识别该事件、直接回调,不进入权限 pending 表。
+
+钩子是快路径,但覆盖不了 `kill -9`、直接关掉承载的 tmux pane 等场景 —— 那些情况下 Claude Code 自己也来不及发钩子。故 `SessionManager` 另起一个 4 秒间隔的存活巡检(`startLivenessWatch`)兜底,双通道都指向同一个 `#markExited`。
+
+`Stop` 事件也一并挂了钩子(见 §3.1),但目前只是占位放行,尚无消费逻辑。
+
 ---
 
 ## 3. 数据协议
@@ -195,12 +203,21 @@ UI 用它区分同目录并存的会话 —— pane ID 能区分但不解释,标
           }
         ]
       }
+    ],
+    "Stop": [
+      { "hooks": [{ "type": "http", "url": "http://127.0.0.1:3000/api/claude-event", "timeout": 300 }] }
+    ],
+    "SessionEnd": [
+      {
+        "matcher": "*",
+        "hooks": [{ "type": "http", "url": "http://127.0.0.1:3000/api/claude-event", "timeout": 300 }]
+      }
     ]
   }
 }
 ```
 
-`matcher` 由 `ENABLE_FULL_APPROVAL` 开关控制,见 §2.3a。
+`PreToolUse` 的 `matcher` 由 `ENABLE_FULL_APPROVAL` 开关控制,见 §2.3a。`Stop`/`SessionEnd` 不参与权限判断,`handleHookRequest` 里非 `PreToolUse` 事件一律立即放行 —— `SessionEnd` 额外触发退出回调(见 §2.13),`Stop` 目前只是占位。
 
 ### 3.2 PreToolUse 钩子载荷(Claude Code → 后端)
 
@@ -321,6 +338,11 @@ Project 分组默认展开,用户手动收起的记入 localStorage(键存收起
 `allow` 会放行工具调用本身去真正执行 —— 但 stream-json 管道没有交互 TTY,`AskUserQuestion` 会挂起等不到任何输入,表现为卡住(即 `pendingToolSince` / 疑似卡住提示要覆盖的场景之一)。
 
 故网页问题卡片走 **deny + reason** 路径:用户选择后,后端对该工具调用发 `deny`,把选中项拼成文本塞进 `permissionDecisionReason`。Claude 会把这段 reason 当作工具失败原因读到,继而在对话里据此继续 —— 这是唯一能让网页选择真正生效的通道。卡片按钮因此不叫「批准/拒绝」,而是「提交回答/跳过」,语义上更贴近这条路径的实际效果。
+
+**deny 路径带来的两处副作用,均已修正:**
+
+- **不算失败。** Claude Code 把这次 `deny` 等同工具失败,`tool_result` 的 `is_error` 为 `true`。但这是协议限制下的正常回传,不是真的出错 —— 归约逻辑(`reduceEvent` 与前端 `onSessionEvent` 的 `tool_result` 分支)对 `AskUserQuestion` 强制把 `isError` 记为 `false`,「N 步」折叠摘要与单步图标因此不会把提交回答/跳过标成失败。
+- **会话状态要收回。** `onApprovalRequested` 触发时会话被标 `waiting`(§4 PermissionEngine),但早期实现只在挂起时置位,没有对应的复位 —— `#settle` 落定决策后无人把 `s.state` 改回去,只能靠前端 `pendingFor()` 派生值动态覆盖显示,凡是直接读 `s.state` 原始字面量的地方都会一直显示"等待批准"。现在 `ResolveListener` 额外带上 `sessionId`,`onApprovalResolved` 里若该会话已无其它待批准项,按 `pendingTurns` 决定收回到 `busy` 还是 `ready`。
 
 ---
 

@@ -294,7 +294,9 @@ function reduceEvent(t: ReplayTarget, ev: SessionEvent, now: () => number): void
       const open = t.openTools.get(ev.toolUseId);
       if (open) {
         open.done = true;
-        open.isError = ev.isError;
+        // AskUserQuestion 唯一的回传通道是 deny+reason(见 spec §5.1),
+        // Claude Code 因此把它标成 is_error —— 那是协议限制,不是真的失败。
+        open.isError = open.name === 'AskUserQuestion' ? false : ev.isError;
         t.openTools.delete(ev.toolUseId);
 
         if (open.name === 'Bash') {
