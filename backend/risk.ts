@@ -117,6 +117,7 @@ export function assessRisk(toolName: string, toolInput: unknown): RiskNote | nul
 export function summarizeInput(toolName: string, toolInput: unknown): string {
   const input = (toolInput ?? {}) as Record<string, unknown>;
   if (toolName === 'Bash' && typeof input.command === 'string') return input.command;
+  if (toolName === 'AskUserQuestion') return summarizeQuestions(input);
   if (typeof input.file_path === 'string') return input.file_path;
   if (typeof input.pattern === 'string') return input.pattern;
   if (typeof input.url === 'string') return input.url;
@@ -125,4 +126,12 @@ export function summarizeInput(toolName: string, toolInput: unknown): string {
   } catch {
     return '';
   }
+}
+
+/** 只显示单行的地方(顶层列表、对话页签)用:第一个问题 + 问题总数。 */
+function summarizeQuestions(input: Record<string, unknown>): string {
+  const questions = Array.isArray(input.questions) ? input.questions : [];
+  const first = questions[0]?.question;
+  if (typeof first !== 'string') return 'AskUserQuestion';
+  return questions.length > 1 ? `${first}(共 ${questions.length} 个问题)` : first;
 }

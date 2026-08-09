@@ -174,6 +174,11 @@ function onSessionEvent(localId, ev) {
 
 function summarize(name, input) {
   if (name === 'Bash' && input?.command) return input.command;
+  if (name === 'AskUserQuestion') {
+    const qs = Array.isArray(input?.questions) ? input.questions : [];
+    const first = qs[0]?.question;
+    if (first) return qs.length > 1 ? `${first}(共 ${qs.length} 个问题)` : first;
+  }
   if (input?.file_path) return input.file_path;
   if (input?.pattern) return input.pattern;
   if (input?.url) return input.url;
@@ -292,13 +297,14 @@ function approvalCard(a, showSession) {
   const s = [...state.sessions.values()].find((x) => x.claudeId === a.sessionId);
   const why = a.risk
     ? `<div class="c-why ${a.risk.level === 'medium' ? 'medium' : ''}">${esc(a.risk.text)}</div>` : '';
+  const body = a.toolName === 'AskUserQuestion' ? renderQuestions(a.toolInput) : `<div class="c-cmd">${renderCmd(a.summary, a.risk)}</div>`;
   return `<div class="card act" data-tuid="${a.toolUseId}">
     <div class="c-top">
       ${showSession ? `<span class="c-repo">${displayName(s)}</span>` : '<span class="c-repo">等待批准</span>'}
       <span class="c-tool">${esc(a.toolName)}</span>
       <span class="c-time">${waited(a.requestedAt)}</span>
     </div>
-    <div class="c-cmd">${renderCmd(a.summary, a.risk)}</div>
+    ${body}
     ${why}
     <div class="c-act">
       <button class="btn pri" data-act="allow">批准</button>
@@ -307,6 +313,32 @@ function approvalCard(a, showSession) {
       <span class="cd" data-deadline="${a.deadlineAt}">${countdown(a.deadlineAt)}</span>
     </div>
   </div>`;
+}
+
+/**
+ * AskUserQuestion 的选项是只读展示,不是实际作答——批准只放行工具调用本身,
+ * 真正的回答仍需在 Claude Code 所在终端里选择(PreToolUse 钩子拿不到工具结果)。
+ */
+function renderQuestions(toolInput) {
+  const questions = Array.isArray(toolInput?.questions) ? toolInput.questions : [];
+  if (!questions.length) return `<div class="c-cmd">${esc(JSON.stringify(toolInput ?? {}))}</div>`;
+
+  return questions.map((q) => {
+    const options = Array.isArray(q.options) ? q.options : [];
+    return `<div class="qblock">
+      <div class="qhead">
+        ${q.header ? `<span class="qtag">${esc(q.header)}</span>` : ''}
+        ${q.multiSelect ? '<span class="qtag multi">多选</span>' : ''}
+      </div>
+      <div class="qtext">${esc(q.question ?? '')}</div>
+      <div class="qopts">
+        ${options.map((o) => `<div class="qopt">
+          <span class="qmark">${q.multiSelect ? '☐' : '○'}</span>
+          <span class="qopt-body"><span class="qlabel">${esc(o.label ?? '')}</span>${o.description ? `<span class="qdesc">${esc(o.description)}</span>` : ''}</span>
+        </div>`).join('')}
+      </div>
+    </div>`;
+  }).join('');
 }
 
 function wireApprovals(root) {
