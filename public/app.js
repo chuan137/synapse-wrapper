@@ -179,10 +179,72 @@ function onSessionEvent(localId, ev) {
     case 'turn_end':
       d.turns++;
       if (ev.costUsd) d.costUsd += ev.costUsd;
+      // 分组边界:标记本轮结束,渲染时据此把过程步骤折叠、只留结论。
+      d.timeline.push({ kind: 'turn_end', at: Date.now() });
       break;
   }
   renderBody();
   renderTabs();
+}
+
+/**
+ * 按 user 消息切分 turn,组内除最后一条 assistant 文本外全部算「过程」
+ * (工具调用 + 中间文本)。已结束的 turn 把过程折叠成一行,默认收起,
+ * 减少两次结论之间的噪音;进行中的 turn 没有「最后一条」的概念,
+ * 只显示过程中最新一步,原地更新而非持续追加。
+ */
+function renderTurns(d) {
+  if (!d.expandedTurns) d.expandedTurns = new Set();
+  const groups = [];
+  let cur = null;
+  for (const t of d.timeline) {
+    if (t.kind === 'user') { cur = { user: t, steps: [], ended: false }; groups.push(cur); continue; }
+    if (!cur) { cur = { user: null, steps: [], ended: false }; groups.push(cur); }
+    if (t.kind === 'turn_end') { cur.ended = true; continue; }
+    cur.steps.push(t);
+  }
+
+  return groups.map((g, i) => {
+    let out = g.user ? `<div class="turn me"><div class="who">你</div><div class="said">${esc(g.user.text)}</div></div>` : '';
+
+    if (!g.steps.length) return out;
+
+    if (!g.ended) {
+      // 进行中:只展示最新一步,旧步骤不追加显示。
+      const last = g.steps[g.steps.length - 1];
+      out += last.kind === 'assistant'
+        ? `<div class="turn"><div class="who">Claude</div><div class="said">${esc(last.text)}</div></div>`
+        : toolLine(last);
+      return out;
+    }
+
+    // 已结束:最后一条 assistant 文本是结论,常显;其余步骤折叠。
+    const lastAssistantIdx = [...g.steps].reverse().findIndex((s) => s.kind === 'assistant');
+    const concludeIdx = lastAssistantIdx === -1 ? -1 : g.steps.length - 1 - lastAssistantIdx;
+    const conclude = concludeIdx === -1 ? null : g.steps[concludeIdx];
+    const process = g.steps.filter((_, idx) => idx !== concludeIdx);
+
+    if (process.length) {
+      const failed = process.some((s) => s.kind === 'tool' && s.isError);
+      const open = d.expandedTurns.has(i);
+      out += `<div class="proc ${open ? 'open' : ''}" data-turn="${i}">
+        <div class="proc-sum">
+          <span class="proc-caret">▸</span>
+          <span>${process.length} 步${failed ? ' · 含出错' : ''}</span>
+        </div>
+        <div class="proc-body">${process.map(toolLine).join('')}</div>
+      </div>`;
+    }
+    if (conclude) out += `<div class="turn"><div class="who">Claude</div><div class="said">${esc(conclude.text)}</div></div>`;
+    return out;
+  }).join('');
+}
+
+function toolLine(t) {
+  if (t.kind === 'assistant') return `<div class="turn"><div class="who">Claude</div><div class="said">${esc(t.text)}</div></div>`;
+  const mark = !t.done ? '<span class="run-mark">running</span>'
+    : t.isError ? '<span class="err-mark">✕</span>' : '<span class="ok-mark">✓</span>';
+  return `<div class="tool-line"><span class="nm">${esc(t.name)}</span><span class="ar">${esc(t.summary)}</span>${mark}</div>`;
 }
 
 function summarize(name, input) {
@@ -429,8 +491,11 @@ function renderDetail() {
   if (!d) { $('body').innerHTML = `<div class="empty">加载中…</div>`; return; }
 
   const pend = pendingFor(d.localId).sort((a, b) => a.requestedAt - b.requestedAt);
-  let html = isStalled(d) ? stallNotice(d) : '';
-  html += pend.map((a) => approvalCard(a, false)).join('');
+  // AskUserQuestion 这类待批准项是当前对话的一部分,留在对话流末尾更符合语境;
+  // 其余页签没有"对话流"概念,沿用置顶,卡住提示同理。
+  const pendCards = pend.map((a) => approvalCard(a, false)).join('');
+  const stall = isStalled(d) ? stallNotice(d) : '';
+  let html = state.tab === 'chat' ? '' : stall + pendCards;
 
   if (state.tab === 'files') {
     if (d.files.length) {
@@ -452,16 +517,11 @@ function renderDetail() {
 
   if (state.tab === 'chat') {
     if (d.timeline.length) {
-      html += d.timeline.map((t) => {
-        if (t.kind === 'user') return `<div class="turn me"><div class="who">你</div><div class="said">${esc(t.text)}</div></div>`;
-        if (t.kind === 'assistant') return `<div class="turn"><div class="who">Claude</div><div class="said">${esc(t.text)}</div></div>`;
-        const mark = !t.done ? '<span class="run-mark">running</span>'
-          : t.isError ? '<span class="err-mark">✕</span>' : '<span class="ok-mark">✓</span>';
-        return `<div class="tool-line"><span class="nm">${esc(t.name)}</span><span class="ar">${esc(t.summary)}</span>${mark}</div>`;
-      }).join('');
+      html += renderTurns(d);
     } else if (!pend.length) {
       html += `<div class="empty">还没有对话。在下方输入框开始。</div>`;
     }
+    html += stall + pendCards;
   }
 
   if (state.tab === 'term') {
@@ -481,7 +541,18 @@ function renderDetail() {
   const wasBottom = $('body').scrollHeight - $('body').scrollTop - $('body').clientHeight < 100;
   $('body').innerHTML = html;
   wireApprovals($('body'));
+  if (state.tab === 'chat') wireProcs($('body'), d);
   if (state.tab === 'chat' && wasBottom) $('body').scrollTop = $('body').scrollHeight;
+}
+
+function wireProcs(root, d) {
+  for (const el of root.querySelectorAll('.proc-sum')) {
+    el.onclick = () => {
+      const i = Number(el.parentElement.dataset.turn);
+      if (d.expandedTurns.has(i)) d.expandedTurns.delete(i); else d.expandedTurns.add(i);
+      renderDetail();
+    };
+  }
 }
 
 function renderBody() {
@@ -503,6 +574,7 @@ async function navigate(id) {
     $('foot').style.display = 'block';
     try {
       state.detail = await api(`/api/sessions/${id}`);
+      if (state.detail) state.detail.expandedTurns = new Set();
     } catch {
       state.detail = null;
     }

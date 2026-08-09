@@ -64,7 +64,10 @@ export interface CommandRun {
 export type TimelineItem =
   | { kind: 'user'; text: string; at: number }
   | { kind: 'assistant'; text: string; at: number }
-  | { kind: 'tool'; toolUseId: string; name: string; summary: string; done: boolean; isError: boolean; at: number };
+  | { kind: 'tool'; toolUseId: string; name: string; summary: string; done: boolean; isError: boolean; at: number }
+  // 轮次分组边界 —— 网页据此把已结束轮次的中间步骤折叠,不落这条会导致
+  // 每次打开会话拉取的历史 timeline 被当成一整个未结束的轮次(见 §2.10)。
+  | { kind: 'turn_end'; at: number };
 
 export interface SessionSummary {
   localId: string;
@@ -391,6 +394,7 @@ export class SessionManager {
         if (ev.costUsd) s.costUsd += ev.costUsd;
         s.state = 'ready';
         s.lastAction = '等待输入';
+        s.timeline.push({ kind: 'turn_end', at: Date.now() });
         break;
 
       case 'status':
