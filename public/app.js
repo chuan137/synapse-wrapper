@@ -62,6 +62,21 @@ function renderMarkdown(src) {
   text = text.replace(/(^|[^*])\*([^*\n]+)\*(?!\*)/g, '$1<em>$2</em>');
   text = text.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
 
+  // 表头行下一行必须是 |---|---| 分隔行才算表格,避免把正文里偶然出现的
+  // "a | b" 误判成表格。分隔行本身不进输出。
+  const splitRow = (row) => row.trim().replace(/^\||\|$/g, '').split('|').map((c) => c.trim());
+  text = text.replace(
+    /(?:^|\n)(\|.+\|)\n(\|[ :|-]+\|)\n((?:\|.+\|\n?)*)/g,
+    (m, head, sep, body) => {
+      if (!/^\|?[ :|-]+\|?$/.test(sep)) return m;
+      const th = splitRow(head).map((c) => `<th>${c}</th>`).join('');
+      const rows = body.trim().split('\n').filter(Boolean)
+        .map((r) => `<tr>${splitRow(r).map((c) => `<td>${c}</td>`).join('')}</tr>`).join('');
+      const i = blocks.push(`<table class="md-table"><thead><tr>${th}</tr></thead><tbody>${rows}</tbody></table>`) - 1;
+      return `\n@@B${i}@@\n`;
+    },
+  );
+
   text = text.replace(/(?:^|\n)((?:[-*] .+(?:\n|$))+)/g, (m, block) =>
     `\n@@UL@@${block.trim().split('\n').map((l) => `<li>${l.replace(/^[-*]\s+/, '')}</li>`).join('')}@@/UL@@`);
   text = text.replace(/(?:^|\n)((?:\d+\. .+(?:\n|$))+)/g, (m, block) =>
@@ -489,11 +504,23 @@ function displayName(s, withName = true) {
  * header 专用:标题只放目录名 + 同名区分标识,不掺 AI title ——
  * title 是自然语言、可能很长,与目录名挤在同一个 <h1> 里会互相截断,
  * 改放第二行(见 renderTopbar),这里只负责"这是哪个会话"。
+ *
+ * tmux 传输时,pane ID 标签本身就是"切到 tmux 窗口"的入口 —— 标签和 ⇱
+ * 合并成一个按钮,而非并排的标识+操作两个元素。非 tmux 传输没有窗口可切,
+ * 标签退回纯展示的 span。
  */
 function headerName(s) {
-  const name = esc(s.name);
-  if (!hasDup(s)) return name;
+  const name = `<span class="h1-name">${esc(s.name)}</span>`;
+  if (!hasDup(s) && s.transport !== 'tmux') return name;
+
   const tag = esc(s.paneId ?? s.localId.slice(0, 4));
+  if (!hasDup(s)) {
+    // 无重名可省标签文字,但 tmux 会话仍需要落点 —— 用图标单独占位。
+    return `${name}<button class="icon-btn" id="focusTmux" title="切到 tmux 窗口">⇱</button>`;
+  }
+  if (s.transport === 'tmux') {
+    return `${name}<button class="s-tag" id="focusTmux" title="切到 tmux 窗口">${tag} ⇱</button>`;
+  }
   return `${name}<span class="s-tag">${tag}</span>`;
 }
 
@@ -589,7 +616,6 @@ function renderTopbar() {
         ${contextChip(s)}
         ${s.costUsd ? `<span class="cost">$${s.costUsd.toFixed(4)}</span>` : ''}
         <span class="chip ${st}">${STATE_LABEL[st]}${s.turns ? ` · 第 ${s.turns} 轮` : ''}</span>
-        ${s.transport === 'tmux' ? `<button class="icon-btn" id="focusTmux" title="切到 tmux 窗口">⇱</button>` : ''}
       </div>
     </div>
     ${s.title

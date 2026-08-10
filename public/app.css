@@ -103,10 +103,14 @@ main { flex: 1; display: flex; flex-direction: column; overflow: hidden; min-wid
   display: flex; flex-direction: column; gap: 2px; flex: none;
 }
 .topbar-main { display: flex; align-items: center; gap: 10px; min-width: 0; }
+/* flex 而非纯文本省略:内部的 ⇱ 按钮需要保留原尺寸不被截断/挤压,
+   只让会话名本身在空间不够时省略号收缩(见下面 h1 > span:first-child)。 */
 .topbar h1 {
   margin: 0; font-size: 15px; font-weight: 600; letter-spacing: -.01em;
-  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0;
+  min-width: 0; display: flex; align-items: center; gap: 5px;
 }
+.topbar h1 .h1-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.topbar h1 .icon-btn, .topbar h1 .s-tag { flex: none; }
 /* 右侧状态工具条:胶囊(状态)与裸文字(模型/费用)统一用同一竖线节奏分隔,
    不再各自套不同的视觉语言 —— 之前 chip 的圆角背景与 ctx-chip 的等宽字体
    并排显得随意。 */
@@ -179,6 +183,10 @@ main { flex: 1; display: flex; flex-direction: column; overflow: hidden; min-wid
   color: var(--ink-3); background: var(--bg); border: 1px solid var(--hair);
   padding: 0 5px; border-radius: 4px; vertical-align: 1px;
 }
+/* tmux 传输下 .s-tag 本身是按钮(点击切窗口),清掉 <button> 的 UA 默认样式
+   使其与纯展示的 <span> 版本视觉一致,hover 态复用 .icon-btn 的强调色。 */
+button.s-tag { cursor: pointer; appearance: none; }
+button.s-tag:hover { background: var(--blue-soft); color: var(--blue); border-color: transparent; }
 /* 标题是自然语言,可能很长,用无边框的常规字体承载并允许截断 */
 .s-tag.ttl {
   font: 12px var(--sans); border: none; background: none; padding: 0;
@@ -324,6 +332,15 @@ main { flex: 1; display: flex; flex-direction: column; overflow: hidden; min-wid
   font: 12.5px/1.5 var(--mono); overflow-x: auto; white-space: pre;
 }
 .said pre.md-code code, .mid-text pre.md-code code { background: none; padding: 0; }
+.said table.md-table, .mid-text table.md-table {
+  margin: 8px 0; border-collapse: collapse; font-size: 13px;
+  max-width: 100%; display: block; overflow-x: auto;
+}
+.said table.md-table th, .said table.md-table td,
+.mid-text table.md-table th, .mid-text table.md-table td {
+  border: 1px solid var(--hair); padding: 4px 10px; text-align: left; white-space: nowrap;
+}
+.said table.md-table th, .mid-text table.md-table th { font-weight: 600; background: var(--hair-soft); }
 .said a, .mid-text a { color: var(--blue); text-decoration: none; }
 .said a:hover, .mid-text a:hover { text-decoration: underline; }
 
