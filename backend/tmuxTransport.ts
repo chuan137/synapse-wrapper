@@ -353,6 +353,11 @@ export class TmuxTransport extends EventEmitterBase implements SessionTransport 
     void exec('tmux', ['send-keys', '-t', this.#target, 'Escape']).catch(() => {});
   }
 
+  /** 切到前台 —— 不带 `-c` 默认作用于最近活跃的 client,单终端场景下就是用户那个。 */
+  async focus(): Promise<void> {
+    await exec('tmux', ['switch-client', '-t', this.#target]).catch(() => {});
+  }
+
   /** 屏幕内容,供网页显示终端镜像。 */
   async capture(): Promise<string> {
     try {

@@ -450,6 +450,14 @@ function pendingFor(localId) {
   return [...state.pending.values()].filter((a) => a.sessionId === s.claudeId);
 }
 
+/** 同目录下是否还有其他会话 —— 决定要不要挂短标识区分。 */
+function hasDup(s) {
+  for (const o of state.sessions.values()) {
+    if (o.localId !== s.localId && o.name === s.name) return true;
+  }
+  return false;
+}
+
 /**
  * 会话显示名(HTML)。
  *
@@ -472,13 +480,20 @@ function displayName(s, withName = true) {
     return `<span class="s-tag">${tag}</span>`;
   }
 
-  let dup = false;
-  for (const o of state.sessions.values()) {
-    if (o.localId !== s.localId && o.name === s.name) { dup = true; break; }
-  }
-
   if (s.title) return `${name}<span class="s-tag ttl">${esc(s.title)}</span>`;
-  if (!dup) return name;
+  if (!hasDup(s)) return name;
+  return `${name}<span class="s-tag">${tag}</span>`;
+}
+
+/**
+ * header 专用:标题只放目录名 + 同名区分标识,不掺 AI title ——
+ * title 是自然语言、可能很长,与目录名挤在同一个 <h1> 里会互相截断,
+ * 改放第二行(见 renderTopbar),这里只负责"这是哪个会话"。
+ */
+function headerName(s) {
+  const name = esc(s.name);
+  if (!hasDup(s)) return name;
+  const tag = esc(s.paneId ?? s.localId.slice(0, 4));
   return `${name}<span class="s-tag">${tag}</span>`;
 }
 
@@ -567,13 +582,25 @@ function renderTopbar() {
   if (!s) return;
   const n = pendingFor(s.localId).length;
   const st = n ? 'waiting' : s.state;
-  $('topbar').innerHTML = `<h1>${displayName(s)}</h1>
-    <span class="chip ${st}">${STATE_LABEL[st]}${s.turns ? ` · 第 ${s.turns} 轮` : ''}</span>
-    ${contextChip(s)}
-    <span class="path">${esc(s.workspace)}</span>
-    <span class="spacer"></span>
-    <span class="cost">${s.costUsd ? '$' + s.costUsd.toFixed(4) : ''}</span>`;
+  $('topbar').innerHTML = `
+    <div class="topbar-main">
+      <h1>${headerName(s)}</h1>
+      <div class="topbar-stats">
+        ${contextChip(s)}
+        ${s.costUsd ? `<span class="cost">$${s.costUsd.toFixed(4)}</span>` : ''}
+        <span class="chip ${st}">${STATE_LABEL[st]}${s.turns ? ` · 第 ${s.turns} 轮` : ''}</span>
+        ${s.transport === 'tmux' ? `<button class="icon-btn" id="focusTmux" title="切到 tmux 窗口">⇱</button>` : ''}
+      </div>
+    </div>
+    ${s.title
+      ? `<span class="path ttl">${esc(s.title)}</span>`
+      : `<span class="path">${esc(s.workspace)}</span>`}`;
   updateComposer(st);
+
+  // 只影响本机 tmux 最近活跃的 client(见 backend/tmuxTransport.ts #focus),
+  // 网页本身无法强制切换终端应用的窗口焦点。
+  const focusBtn = $('focusTmux');
+  if (focusBtn) focusBtn.onclick = () => api(`/api/sessions/${s.localId}/focus`, { method: 'POST' }).catch(() => {});
 }
 
 /**

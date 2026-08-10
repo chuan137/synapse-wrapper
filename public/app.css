@@ -99,26 +99,47 @@ aside {
 main { flex: 1; display: flex; flex-direction: column; overflow: hidden; min-width: 0; }
 .topbar {
   background: rgba(255,255,255,.8); backdrop-filter: saturate(180%) blur(20px);
-  border-bottom: 1px solid var(--hair); padding: 11px 20px;
-  display: flex; align-items: center; gap: 10px; flex: none;
+  border-bottom: 1px solid var(--hair); padding: 10px 20px;
+  display: flex; flex-direction: column; gap: 2px; flex: none;
 }
-.topbar h1 { margin: 0; font-size: 15px; font-weight: 600; letter-spacing: -.01em; }
+.topbar-main { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.topbar h1 {
+  margin: 0; font-size: 15px; font-weight: 600; letter-spacing: -.01em;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0;
+}
+/* 右侧状态工具条:胶囊(状态)与裸文字(模型/费用)统一用同一竖线节奏分隔,
+   不再各自套不同的视觉语言 —— 之前 chip 的圆角背景与 ctx-chip 的等宽字体
+   并排显得随意。 */
+.topbar-stats {
+  margin-left: auto; flex: none; display: flex; align-items: center; gap: 10px;
+  font-size: 12px; color: var(--ink-2);
+}
+.topbar-stats > * + *::before {
+  content: ''; display: inline-block; width: 1px; height: 11px;
+  background: var(--hair); margin-right: 10px; vertical-align: -1px;
+}
 .chip {
   font-size: 11.5px; padding: 2px 8px; border-radius: 20px;
   background: var(--blue-soft); color: var(--blue); font-weight: 500;
+  white-space: nowrap;
 }
 .chip.waiting { background: var(--amber-soft); color: var(--amber); }
 .chip.exited { background: var(--red-soft); color: var(--red); }
 .chip.ready { background: var(--green-soft); color: var(--green); }
-/* 模型名 + 上下文占用,复用 .todo-chip-bar 的迷你进度条语言 */
-.ctx-chip {
-  display: inline-flex; align-items: center; gap: 6px;
-  font: 11px var(--mono); color: var(--ink-2); flex: none;
+.ctx-chip { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
+.ctx-bar { width: 28px; }
+.cost { font-variant-numeric: tabular-nums; }
+.icon-btn {
+  font: 13px var(--sans); line-height: 1; padding: 3px 6px; border-radius: 6px;
+  border: 1px solid var(--hair); background: none; color: var(--ink-2); cursor: pointer;
 }
-.ctx-bar { width: 32px; }
-.path { font: 11.5px var(--mono); color: var(--ink-3); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.spacer { margin-left: auto; }
-.cost { font-size: 12px; color: var(--ink-2); }
+.icon-btn:hover { background: var(--blue-soft); color: var(--blue); border-color: transparent; }
+.path {
+  font: 11.5px var(--mono); color: var(--ink-3);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+/* AI 标题是自然语言,不该用等宽字体承载(与 .s-tag.ttl 同一考虑) */
+.path.ttl { font: 12px var(--sans); color: var(--ink-2); }
 .summary { margin-left: auto; font-size: 12.5px; color: var(--ink-2); display: flex; gap: 16px; }
 .summary b { font-weight: 600; }
 .s-wait b { color: var(--amber); }

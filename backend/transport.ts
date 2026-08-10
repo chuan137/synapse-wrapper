@@ -56,6 +56,14 @@ export interface SessionTransport {
    */
   alive?(): Promise<boolean>;
 
+  /**
+   * 把承载的终端切到前台。
+   *
+   * 仅 tmux 需要:stream-json 没有可供切换的终端窗口。只影响当前 attach 的
+   * client(`tmux switch-client`),网页本身无法强制操作系统切换终端应用的窗口焦点。
+   */
+  focus?(): Promise<void>;
+
   /** 订阅事件流。返回取消订阅的函数。 */
   onEvent(handler: SessionEventHandler): () => void;
 }

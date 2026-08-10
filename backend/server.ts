@@ -166,6 +166,22 @@ app.get('/api/sessions/:id', async (req, res) => {
   });
 });
 
+/** 把会话对应的 tmux pane 切到前台;stream-json 会话没有终端窗口可切。 */
+app.post('/api/sessions/:id/focus', async (req, res) => {
+  if (!checkOrigin(req, res)) return;
+  const s = manager.get(String(req.params.id));
+  if (!s) {
+    res.status(404).json({ error: '会话不存在' });
+    return;
+  }
+  if (!s.transport.focus) {
+    res.status(400).json({ error: '该会话没有可切换的终端窗口' });
+    return;
+  }
+  await s.transport.focus();
+  res.json({ ok: true });
+});
+
 app.delete('/api/sessions/:id', async (req, res) => {
   if (!checkOrigin(req, res)) return;
   const s = manager.get(String(req.params.id));
