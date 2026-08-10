@@ -1170,6 +1170,36 @@ $('input').onkeydown = (e) => {
   if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); send(); }
 };
 
+/**
+ * 拖文件进输入框时接管,不让浏览器默认导航打开文件 —— 但浏览器不会把
+ * 本地绝对路径交给网页(File 对象只有文件名,没有目录),所以插入的是
+ * 「待补全占位符 + 文件名」,占位符预选中方便用户直接输入替换成真实路径。
+ */
+const PATH_PLACEHOLDER = '<补全路径>';
+// 拖拽落在输入框以外的空白处时,不挡住会让浏览器整页跳去打开文件 ——
+// textarea 自己的 drop 监听只处理落在它内部的情况,这里兜底页面其余区域。
+document.addEventListener('dragover', (e) => e.preventDefault());
+document.addEventListener('drop', (e) => { if (e.target !== $('input')) e.preventDefault(); });
+$('input').addEventListener('dragover', (e) => {
+  e.preventDefault();
+  e.dataTransfer.dropEffect = 'copy';
+});
+$('input').addEventListener('drop', (e) => {
+  e.preventDefault();
+  const names = [...(e.dataTransfer.files ?? [])].map((f) => f.name);
+  if (!names.length) return;
+  const el = $('input');
+  const inserted = names.map((n) => `${PATH_PLACEHOLDER}/${n}`).join('\n');
+  const start = el.selectionStart ?? el.value.length;
+  const end = el.selectionEnd ?? el.value.length;
+  el.value = el.value.slice(0, start) + inserted + el.value.slice(end);
+  el.focus();
+  // 只选中第一个占位符 —— 多文件时其余占位符留给用户依次 Tab/点击手动改。
+  const firstStart = start;
+  const firstEnd = start + PATH_PLACEHOLDER.length;
+  el.setSelectionRange(firstStart, firstEnd);
+});
+
 // ── 倒计时:每秒刷新,不重绘整页 ─────────────────────────────
 setInterval(() => {
   for (const el of document.querySelectorAll('[data-deadline]')) {
