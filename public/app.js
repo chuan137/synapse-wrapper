@@ -379,6 +379,28 @@ function todoChip(progress) {
   </span>`;
 }
 
+/** 已知模型 id 的短名 —— header 空间有限,不认识的原样显示。 */
+const MODEL_SHORT_NAME = {
+  'claude-opus-5': 'Opus 5',
+  'claude-sonnet-5': 'Sonnet 5',
+  'claude-haiku-4-5-20251001': 'Haiku 4.5',
+};
+
+/** header 用:模型名 + 上下文占用迷你进度条,两个数据源都缺时不占位。 */
+function contextChip(s) {
+  const modelLabel = s.model ? (MODEL_SHORT_NAME[s.model] ?? s.model) : '';
+  if (!s.contextTokens || !s.contextWindow) {
+    return modelLabel ? `<span class="ctx-chip">${esc(modelLabel)}</span>` : '';
+  }
+  const pct = Math.min(100, Math.round((s.contextTokens / s.contextWindow) * 100));
+  const fmt = (n) => (n >= 1000 ? `${Math.round(n / 1000)}K` : String(n));
+  return `<span class="ctx-chip" title="上下文占用 ${fmt(s.contextTokens)}/${fmt(s.contextWindow)}">
+    ${esc(modelLabel)}
+    <span class="todo-chip-bar ctx-bar"><span style="width:${pct}%"></span></span>
+    ${pct}%
+  </span>`;
+}
+
 /**
  * 常驻任务清单面板 —— 不放进 renderTurns 的折叠逻辑里:
  * 进行中的轮次只展示最新一步(见 renderTurns 顶部注释),TodoWrite 之后
@@ -547,6 +569,7 @@ function renderTopbar() {
   const st = n ? 'waiting' : s.state;
   $('topbar').innerHTML = `<h1>${displayName(s)}</h1>
     <span class="chip ${st}">${STATE_LABEL[st]}${s.turns ? ` · 第 ${s.turns} 轮` : ''}</span>
+    ${contextChip(s)}
     <span class="path">${esc(s.workspace)}</span>
     <span class="spacer"></span>
     <span class="cost">${s.costUsd ? '$' + s.costUsd.toFixed(4) : ''}</span>`;

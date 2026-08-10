@@ -87,6 +87,9 @@ export class StreamJsonTransport extends EventEmitterBase implements SessionTran
           this.#sessionId = msg.session_id;
           this.emit({ kind: 'session', sessionId: msg.session_id });
         }
+        if (msg.subtype === 'init' && typeof msg.model === 'string') {
+          this.emit({ kind: 'model', model: msg.model });
+        }
         break;
       }
 
@@ -112,6 +115,16 @@ export class StreamJsonTransport extends EventEmitterBase implements SessionTran
             });
           }
         }
+        // usage 反映的是这条消息送出前的 prompt 总量,是当前上下文占用
+        // 最新近的信号 —— 比等到 result 消息(每轮只有一条)更新得勤。
+        const usage = msg.message?.usage;
+        if (usage) {
+          const inputTokens =
+            (usage.input_tokens ?? 0) +
+            (usage.cache_read_input_tokens ?? 0) +
+            (usage.cache_creation_input_tokens ?? 0);
+          this.emit({ kind: 'usage', inputTokens });
+        }
         break;
       }
 
@@ -131,6 +144,11 @@ export class StreamJsonTransport extends EventEmitterBase implements SessionTran
       }
 
       case 'result': {
+        // contextWindow 只在这里(每轮一条)给出,不在逐条 assistant.usage 里。
+        for (const [model, mu] of Object.entries(msg.modelUsage ?? {})) {
+          const window = (mu as Record<string, unknown>)?.contextWindow;
+          if (typeof window === 'number') this.emit({ kind: 'context_window', model, window });
+        }
         this.emit({
           kind: 'turn_end',
           result: typeof msg.result === 'string' ? msg.result : '',

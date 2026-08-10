@@ -23,6 +23,17 @@ export function transcriptPathFor(workspace: string, claudeId: string): string {
 }
 
 /**
+ * 模型 -> 上下文窗口总量。stream-json 的 result.modelUsage 会给出这个值,
+ * 但转写文件里没有对应字段(那条消息只在 `-p` 进程的 stdout 上出现,不落盘)——
+ * tmux 路径只能维护这张表(实测值,见 docs/spec.md)。
+ */
+const MODEL_CONTEXT_WINDOW: Record<string, number> = {
+  'claude-opus-5': 1_000_000,
+  'claude-sonnet-5': 1_000_000,
+  'claude-haiku-4-5-20251001': 200_000,
+};
+
+/**
  * 单行 jsonl -> 事件数组(assistant 消息可含多个内容块,故不是单值)。
  * 白名单解析:转写里还有 mode / permission-mode / file-history-snapshot /
  * attachment 等控制行,不应进入 UI。
@@ -45,6 +56,20 @@ export function parseTranscriptLineMulti(
 
   if (d.type === 'assistant') {
     const events: SessionEvent[] = [];
+    const model = d.message?.model;
+    if (typeof model === 'string') {
+      events.push({ kind: 'model', model });
+      const window = MODEL_CONTEXT_WINDOW[model];
+      if (window) events.push({ kind: 'context_window', model, window });
+    }
+    const usage = d.message?.usage;
+    if (usage) {
+      const inputTokens =
+        (usage.input_tokens ?? 0) +
+        (usage.cache_read_input_tokens ?? 0) +
+        (usage.cache_creation_input_tokens ?? 0);
+      events.push({ kind: 'usage', inputTokens });
+    }
     for (const b of d.message?.content ?? []) {
       if (b.type === 'text' && b.text?.trim()) {
         events.push({ kind: 'assistant_text', text: b.text });

@@ -17,6 +17,15 @@ export type SessionEvent =
   | { kind: 'tool_use'; toolUseId: string; name: string; input: unknown }
   | { kind: 'tool_result'; toolUseId: string; content: unknown; isError: boolean }
   | { kind: 'title'; title: string }
+  | { kind: 'model'; model: string }
+  /**
+   * 每条 assistant 消息自带的用量。窗口总量不在这里 —— 协议只在 result
+   * 消息的 modelUsage 里给,故 tokens 与 window 分两个事件独立更新,
+   * header 合并展示时各自取最新值即可(参照 §2.9 归约思路:宁可拆细,
+   * 不强凑一个两边都不一定凑得齐的复合事件)。
+   */
+  | { kind: 'usage'; inputTokens: number }
+  | { kind: 'context_window'; model: string; window: number }
   | { kind: 'turn_end'; result: string; costUsd?: number }
   | { kind: 'status'; state: 'starting' | 'ready' | 'busy' | 'exited'; detail?: string }
   | { kind: 'error'; message: string };

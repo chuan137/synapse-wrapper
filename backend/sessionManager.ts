@@ -104,6 +104,9 @@ export interface SessionSummary {
   paneId: string | null;
   turns: number;
   costUsd: number;
+  model: string | null;
+  contextTokens: number | null;
+  contextWindow: number | null;
   fileCount: number;
   additions: number;
   deletions: number;
@@ -154,6 +157,12 @@ export interface Session {
   settingsPath: string;
   turns: number;
   costUsd: number;
+  /** 实际生效的模型 id,来自 stream-json system.init 或转写行,启动初期为 null。 */
+  model: string | null;
+  /** 最新一条 assistant 消息的 prompt token 总量(含 cache),header 用它算占用百分比。 */
+  contextTokens: number | null;
+  /** 当前 model 对应的窗口总量,只在 result 消息里给出,同一模型内保持不变。 */
+  contextWindow: number | null;
   files: Map<string, FileChange>;
   commands: CommandRun[];
   timeline: TimelineItem[];
@@ -433,6 +442,9 @@ export class SessionManager {
         settingsPath: join(p.workspace, '.claude', 'settings.local.json'),
         turns: p.turns,
         costUsd: p.costUsd,
+        model: null,
+        contextTokens: null,
+        contextWindow: null,
         files: new Map(),
         commands: [],
         timeline: [],
@@ -520,6 +532,9 @@ export class SessionManager {
       paneId: s.paneId,
       turns: s.turns,
       costUsd: s.costUsd,
+      model: s.model,
+      contextTokens: s.contextTokens,
+      contextWindow: s.contextWindow,
       fileCount: s.files.size,
       additions,
       deletions,
@@ -614,6 +629,10 @@ export class SessionManager {
       settingsPath,
       turns: 0,
       costUsd: 0,
+      // opts.model 指定时結果已确定,不必等 system.init 回填,减少 header 空窗期。
+      model: opts.model ?? null,
+      contextTokens: null,
+      contextWindow: null,
       files: new Map(),
       commands: [],
       timeline: [],
@@ -670,6 +689,20 @@ export class SessionManager {
       case 'title':
         // 与 name 并存而非覆盖 —— name(目录名)仍用于分组与路径识别
         s.title = ev.title;
+        break;
+
+      case 'model':
+        s.model = ev.model;
+        break;
+
+      // 运行时展示态,不进 reduceEvent/ReplayTarget —— exited 会话重放
+      // transcript 时重新计算「当前上下文占用」没有意义,那是活跃进程才有的状态。
+      case 'usage':
+        s.contextTokens = ev.inputTokens;
+        break;
+
+      case 'context_window':
+        if (ev.model === s.model) s.contextWindow = ev.window;
         break;
 
       // timeline/files/commands/todos 的实际写入统一交给下面的 reduceEvent()
