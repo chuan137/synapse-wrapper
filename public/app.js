@@ -434,10 +434,21 @@ function pendingFor(localId) {
  * 同一目录可并存多个会话,此时目录名必然相同,需要额外信息区分。
  * 优先用 claude 自己起的标题(说明这个会话在做什么);标题要首轮对话后
  * 才有,在此之前退回 pane —— 它能区分但不解释,只是过渡。
+ *
+ * `withName` 控制是否带上 s.name:侧栏按 workspace 分组后 proj-h 已经
+ * 报过一次目录名,组内每条再重复就是同一个词连续出现两遍,故传 false 省略。
  */
-function displayName(s) {
+function displayName(s, withName = true) {
   if (!s) return '未知会话';
   const name = esc(s.name);
+  const tag = esc(s.paneId ?? s.localId.slice(0, 4));
+
+  if (!withName) {
+    // 分组内 proj-h 已报过一次目录名,这里只需要能区分/说明该会话的部分;
+    // 标题最优先,没标题时退回短标识而非留空 —— 组内每行都要有可点的内容。
+    if (s.title) return `<span class="s-tag ttl">${esc(s.title)}</span>`;
+    return `<span class="s-tag">${tag}</span>`;
+  }
 
   let dup = false;
   for (const o of state.sessions.values()) {
@@ -446,7 +457,7 @@ function displayName(s) {
 
   if (s.title) return `${name}<span class="s-tag ttl">${esc(s.title)}</span>`;
   if (!dup) return name;
-  return `${name}<span class="s-tag">${esc(s.paneId ?? s.localId.slice(0, 4))}</span>`;
+  return `${name}<span class="s-tag">${tag}</span>`;
 }
 
 /** 会话的排序权重:需要你 > 进行中 > 静默,用于组内排序与判断组是否需要提醒。 */
@@ -462,7 +473,7 @@ function renderNav() {
     const st = n ? 'waiting' : s.state;
     return `<div class="nav-item ${state.view === s.localId ? 'on' : ''}" data-id="${s.localId}">
       <span class="pip ${st}"></span>
-      <span class="nav-name">${displayName(s)}</span>
+      <span class="nav-name">${displayName(s, false)}</span>
       ${todoChip(s.todoProgress)}
       ${n ? `<span class="nav-badge">${n}</span>` : ''}
     </div>`;
@@ -849,12 +860,32 @@ async function navigate(id) {
 
 // ── 新建会话 ────────────────────────────────────────────────
 $('add').onclick = () => {
+  // 用过的 workspace 去重,按最近活跃排前 —— 常规操作不用每次手打全路径。
+  const seen = new Map();
+  for (const s of state.sessions.values()) {
+    const prev = seen.get(s.workspace);
+    if (!prev || s.lastActivity > prev) seen.set(s.workspace, s.lastActivity);
+  }
+  const known = [...seen.entries()].sort((a, b) => b[1] - a[1]).map(([ws]) => ws);
+
   const bg = document.createElement('div');
   bg.className = 'modal-bg';
   bg.innerHTML = `<div class="modal">
     <h3>新建会话</h3>
-    <p>填写工作目录的绝对路径。该目录下的 .claude/settings.local.json 会被合并写入钩子配置。</p>
-    <input id="wsp" placeholder="/Users/you/projects/my-repo" spellcheck="false">
+    <p>选择或填写工作目录的绝对路径。该目录下的 .claude/settings.local.json 会被合并写入钩子配置。</p>
+    ${known.length ? `<select id="wsSel">
+      ${known.map((w) => `<option value="${esc(w)}">${esc(w)}</option>`).join('')}
+      <option value="__other__">其他路径…</option>
+    </select>` : ''}
+    <input id="wsp" placeholder="/Users/you/projects/my-repo" spellcheck="false"
+      style="${known.length ? 'display:none' : ''}">
+    <label for="wModel">模型</label>
+    <select id="wModel">
+      <option value="">默认(跟随 CLI / settings.json)</option>
+      <option value="claude-opus-5">Opus 5</option>
+      <option value="claude-sonnet-5">Sonnet 5</option>
+      <option value="claude-haiku-4-5-20251001">Haiku 4.5</option>
+    </select>
     <div class="err" id="mErr" style="display:none"></div>
     <div class="modal-act">
       <button class="btn" id="mCancel">取消</button>
@@ -862,22 +893,32 @@ $('add').onclick = () => {
     </div>
   </div>`;
   document.body.append(bg);
+  const sel = bg.querySelector('#wsSel');
   const inp = bg.querySelector('#wsp');
-  inp.focus();
+  (sel ?? inp).focus();
+
+  if (sel) {
+    sel.onchange = () => {
+      const other = sel.value === '__other__';
+      inp.style.display = other ? '' : 'none';
+      if (other) inp.focus(); else inp.value = '';
+    };
+  }
 
   const close = () => bg.remove();
   bg.querySelector('#mCancel').onclick = close;
   bg.onclick = (e) => { if (e.target === bg) close(); };
 
   const submit = async () => {
-    const workspace = inp.value.trim();
+    const workspace = (sel && sel.value !== '__other__' ? sel.value : inp.value).trim();
     if (!workspace) return;
+    const model = bg.querySelector('#wModel').value;
     const err = bg.querySelector('#mErr');
     const ok = bg.querySelector('#mOk');
     ok.disabled = true;
     try {
       const { localId } = await api('/api/sessions', {
-        method: 'POST', body: JSON.stringify({ workspace }),
+        method: 'POST', body: JSON.stringify({ workspace, model: model || undefined }),
       });
       close();
       navigate(localId);
@@ -888,7 +929,9 @@ $('add').onclick = () => {
     }
   };
   bg.querySelector('#mOk').onclick = submit;
-  inp.onkeydown = (e) => { if (e.key === 'Enter' && !e.isComposing) submit(); };
+  const onEnter = (e) => { if (e.key === 'Enter' && !e.isComposing) submit(); };
+  inp.onkeydown = onEnter;
+  if (sel) sel.onkeydown = onEnter;
 };
 
 // ── 发送 ────────────────────────────────────────────────────

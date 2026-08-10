@@ -69,10 +69,14 @@ aside {
 .nav-item {
   display: flex; align-items: center; gap: 8px; padding: 7px 8px;
   border-radius: 7px; cursor: pointer; font-size: 13.5px; margin-bottom: 1px;
+  transition: background-color .15s ease, box-shadow .15s ease, color .15s ease;
 }
 .nav-item:hover { background: rgba(0,0,0,.04); }
-.nav-item.on { background: var(--blue); color: #fff; }
-.nav-item.on .pip { background: #fff !important; }
+/* 选中态靠淡底浮起 + 蓝字提示,不用边条也不反白 —— 阴影给出「浮在列表上」的层次感 */
+.nav-item.on {
+  background: var(--blue-soft); color: var(--blue); font-weight: 600;
+  box-shadow: 0 1px 2px rgba(0,113,227,.16), 0 0 0 1px rgba(0,113,227,.08);
+}
 .pip { width: 7px; height: 7px; border-radius: 50%; flex: none; background: var(--ink-3); }
 .pip.busy, .pip.starting { background: var(--blue); animation: pulse 1.3s infinite; }
 .pip.waiting { background: var(--amber); animation: pulse 1.3s infinite; }
@@ -224,13 +228,10 @@ main { flex: 1; display: flex; flex-direction: column; overflow: hidden; min-wid
   display: inline-flex; align-items: center; gap: 5px;
   font: 11px var(--mono); color: var(--ink-3);
 }
-.nav-item.on .todo-chip { color: rgba(255,255,255,.8); }
 .todo-chip-bar {
   width: 28px; height: 4px; border-radius: 2px; background: var(--hair); overflow: hidden;
 }
 .todo-chip-bar span { display: block; height: 100%; background: var(--blue); }
-.nav-item.on .todo-chip-bar { background: rgba(255,255,255,.3); }
-.nav-item.on .todo-chip-bar span { background: #fff; }
 .empty { padding: 40px 20px; text-align: center; color: var(--ink-3); font-size: 13px; }
 
 /* ── 改动文件 ── */
@@ -405,10 +406,11 @@ textarea:focus { outline: 2px solid var(--blue); outline-offset: -1px; backgroun
 }
 .modal h3 { margin: 0 0 4px; font-size: 15px; }
 .modal p { margin: 0 0 14px; font-size: 12.5px; color: var(--ink-2); }
-.modal input {
+.modal input, .modal select {
   width: 100%; padding: 8px 11px; border-radius: 8px; border: 1px solid var(--hair);
   font: 13px var(--mono); background: var(--bg); color: var(--ink); margin-bottom: 12px;
 }
-.modal input:focus { outline: 2px solid var(--blue); outline-offset: -1px; }
+.modal input:focus, .modal select:focus { outline: 2px solid var(--blue); outline-offset: -1px; }
+.modal label { display: block; font-size: 12px; color: var(--ink-2); margin-bottom: 4px; }
 .modal-act { display: flex; gap: 8px; justify-content: flex-end; }
 .modal .err { color: var(--red); font-size: 12.5px; margin-bottom: 10px; }
