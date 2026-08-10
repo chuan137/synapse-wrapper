@@ -138,12 +138,15 @@ main { flex: 1; display: flex; flex-direction: column; overflow: hidden; min-wid
   border: 1px solid var(--hair); background: none; color: var(--ink-2); cursor: pointer;
 }
 .icon-btn:hover { background: var(--blue-soft); color: var(--blue); border-color: transparent; }
+.topbar-sub { display: flex; align-items: center; gap: 10px; min-width: 0; }
 .path {
+  flex: 1; min-width: 0;
   font: 11.5px var(--mono); color: var(--ink-3);
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 /* AI 标题是自然语言,不该用等宽字体承载(与 .s-tag.ttl 同一考虑) */
 .path.ttl { font: 12px var(--sans); color: var(--ink-2); }
+.topbar-sub .ctx-chip { flex: none; font-size: 11.5px; color: var(--ink-2); gap: 8px; }
 .summary { margin-left: auto; font-size: 12.5px; color: var(--ink-2); display: flex; gap: 16px; }
 .summary b { font-weight: 600; }
 .s-wait b { color: var(--amber); }
@@ -310,6 +313,14 @@ button.s-tag:hover { background: var(--blue-soft); color: var(--blue); border-co
   white-space: pre-wrap; word-wrap: break-word;
 }
 .turn.me .said { background: var(--blue-soft); border-color: #cfe4fb; color: #0a2f57; }
+/* 待发草稿:还没真的发出去,用 amber 跟已发消息的蓝色区分开。 */
+.turn.me.draft .said { background: var(--amber-soft); border-color: #f0dcae; color: #5c4008; }
+.turn.me.draft .who { color: var(--amber); }
+.draft-del {
+  border: none; background: none; cursor: pointer; color: inherit; opacity: .6;
+  font-size: 11px; line-height: 1; padding: 2px 4px; border-radius: 4px; margin-left: 4px;
+}
+.draft-del:hover { opacity: 1; background: var(--hair-soft); }
 
 /* 纯工具调用轮次的兜底文案 —— 弱化显示,跟真正的结论文字区分开,
    避免看起来像是 Claude 真的说了"无文字回复"这四个字。 */
@@ -438,21 +449,6 @@ button.s-tag:hover { background: var(--blue-soft); color: var(--blue); border-co
 
 /* ── 输入框 ── */
 footer { border-top: 1px solid var(--hair); background: var(--surface); padding: 10px 20px; flex: none; }
-.draft-queue { display: flex; flex-direction: column; gap: 4px; margin-bottom: 8px; }
-.draft-item {
-  display: flex; align-items: center; gap: 8px; padding: 6px 10px;
-  border-radius: 7px; background: var(--amber-soft); font-size: 12.5px;
-}
-.draft-n {
-  flex: none; width: 16px; height: 16px; border-radius: 50%; background: var(--amber);
-  color: #fff; font-size: 10px; font-weight: 600; display: flex; align-items: center; justify-content: center;
-}
-.draft-text { flex: 1; color: var(--ink-2); white-space: pre-wrap; word-break: break-all; }
-.draft-del {
-  flex: none; border: none; background: none; cursor: pointer; color: var(--ink-3);
-  font-size: 12px; line-height: 1; padding: 2px 4px; border-radius: 4px;
-}
-.draft-del:hover { background: var(--hair-soft); color: var(--ink); }
 .composer { display: flex; gap: 8px; align-items: flex-end; }
 textarea {
   flex: 1; resize: none; font: inherit; font-size: 13.5px; padding: 9px 12px;

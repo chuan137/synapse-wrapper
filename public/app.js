@@ -619,14 +619,16 @@ function renderTopbar() {
     <div class="topbar-main">
       <h1>${headerName(s)}</h1>
       <div class="topbar-stats">
-        ${contextChip(s)}
         ${s.costUsd ? `<span class="cost">$${s.costUsd.toFixed(4)}</span>` : ''}
         <span class="chip ${st}">${STATE_LABEL[st]}${s.turns ? ` · 第 ${s.turns} 轮` : ''}</span>
       </div>
     </div>
-    ${s.title
-      ? `<span class="path ttl">${esc(s.title)}</span>`
-      : `<span class="path">${esc(s.workspace)}</span>`}`;
+    <div class="topbar-sub">
+      ${s.title
+        ? `<span class="path ttl">${esc(s.title)}</span>`
+        : `<span class="path">${esc(s.workspace)}</span>`}
+      ${contextChip(s)}
+    </div>`;
   updateComposer(st);
 
   // 只影响本机 tmux 最近活跃的 client(见 backend/tmuxTransport.ts #focus),
@@ -643,24 +645,31 @@ function renderTopbar() {
 function updateComposer(st) {
   $('send').textContent = st === 'ready' ? '发送' : '加入队列';
   $('send').title = st === 'ready' ? '' : '会话尚未就绪,已加入队列,轮到时自动发送';
-  renderDraftQueue();
+  if (state.tab === 'chat') renderBody();
 }
 
-function renderDraftQueue() {
-  const el = $('draftQueue');
-  const q = state.draftQueue.get(state.view) ?? [];
-  if (!q.length) { el.style.display = 'none'; el.innerHTML = ''; return; }
-  el.style.display = 'flex';
-  el.innerHTML = q.map((text, i) => `<div class="draft-item" data-i="${i}">
-    <span class="draft-n">${i + 1}</span>
-    <span class="draft-text">${esc(text)}</span>
-    <button class="draft-del" data-i="${i}" title="从队列移除">✕</button>
+/**
+ * 待发草稿接在对话流末尾、跟已发消息同一条时间线渲染(而非浮在输入框
+ * 上方的独立面板)—— 用户攒的下一句本来就是对话的一部分,应该跟历史
+ * 消息挨在一起看,视觉上用 amber 而非蓝色区分"还没真的发出去"。
+ */
+function renderDraftQueueInline(localId) {
+  const q = state.draftQueue.get(localId);
+  if (!q?.length) return '';
+  return q.map((text, i) => `<div class="turn me draft" data-i="${i}">
+    <div class="who">你 · 待发送 #${i + 1}<button class="draft-del" data-i="${i}" title="从队列移除">✕</button></div>
+    <div class="said">${esc(text)}</div>
   </div>`).join('');
-  for (const btn of el.querySelectorAll('.draft-del')) {
+}
+
+function wireDraftQueue(root) {
+  for (const btn of root.querySelectorAll('.draft-del')) {
     btn.onclick = () => {
+      const q = state.draftQueue.get(state.view);
+      if (!q) return;
       q.splice(Number(btn.dataset.i), 1);
       if (q.length) state.draftQueue.set(state.view, q); else state.draftQueue.delete(state.view);
-      renderDraftQueue();
+      renderBody();
     };
   }
 }
@@ -676,7 +685,7 @@ function flushDraftQueue(localId) {
   state.draftQueue.delete(localId);
   const text = q.join('\n\n');
   ws.send(JSON.stringify({ type: 'prompt', localId, text }));
-  if (state.view === localId) renderDraftQueue();
+  if (state.view === localId && state.tab === 'chat') renderBody();
 }
 
 // ── 渲染:页签 ──────────────────────────────────────────────
@@ -925,12 +934,13 @@ function renderDetail() {
   }
 
   if (state.tab === 'chat') {
+    const draftHtml = renderDraftQueueInline(d.localId);
     if (d.timeline.length) {
       html += renderTurns(d);
-    } else if (!pend.length) {
+    } else if (!pend.length && !draftHtml) {
       html += `<div class="empty">还没有对话。在下方输入框开始。</div>`;
     }
-    html += stall + pendCards;
+    html += stall + pendCards + draftHtml;
   }
 
   if (state.tab === 'term') {
@@ -950,7 +960,7 @@ function renderDetail() {
   const wasBottom = $('body').scrollHeight - $('body').scrollTop - $('body').clientHeight < 100;
   $('body').innerHTML = html;
   wireApprovals($('body'));
-  if (state.tab === 'chat') wireProcs($('body'), d);
+  if (state.tab === 'chat') { wireProcs($('body'), d); wireDraftQueue($('body')); }
   if (state.tab === 'chat' && wasBottom) $('body').scrollTop = $('body').scrollHeight;
 }
 
@@ -1093,7 +1103,7 @@ function send() {
     const q = state.draftQueue.get(state.view) ?? [];
     q.push(text);
     state.draftQueue.set(state.view, q);
-    renderDraftQueue();
+    if (state.tab === 'chat') renderBody();
   }
   $('input').value = '';
 }
