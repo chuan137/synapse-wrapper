@@ -225,6 +225,13 @@ button.s-tag:hover { background: var(--blue-soft); color: var(--blue); border-co
 .qopt-body { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
 .qlabel { font-size: 13px; font-weight: 500; }
 .qdesc { font-size: 12px; color: var(--ink-2); }
+.qopt-other { cursor: text; }
+.qother-input {
+  margin-top: 3px; border: 1px solid var(--hair); border-radius: 6px;
+  padding: 4px 8px; font: 12.5px var(--sans); background: var(--surface);
+  color: var(--ink); width: 100%;
+}
+.qother-input:focus { outline: none; border-color: var(--blue); }
 .c-act { padding: 11px 14px; display: flex; gap: 8px; align-items: center; border-top: 1px solid var(--hair-soft); }
 /* c-top 紧邻 c-act 时(无命令内容的静默卡片)会叠出空荡双线,去掉一条 */
 .c-top + .c-act { border-top: 0; padding-top: 8px; }

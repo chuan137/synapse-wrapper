@@ -705,44 +705,74 @@ function renderQuestions(toolInput) {
           <span class="qmark">${q.multiSelect ? '☐' : '○'}</span>
           <span class="qopt-body"><span class="qlabel">${esc(o.label ?? '')}</span>${o.description ? `<span class="qdesc">${esc(o.description)}</span>` : ''}</span>
         </div>`).join('')}
+        <div class="qopt qopt-other" data-oi="other">
+          <span class="qmark">${q.multiSelect ? '☐' : '○'}</span>
+          <span class="qopt-body">
+            <span class="qlabel">其他</span>
+            <input class="qother-input" type="text" placeholder="输入你自己的答案" />
+          </span>
+        </div>
       </div>
     </div>`;
   }).join('');
 }
 
-/** 选中态存在 DOM(data-selected)上,提交时直接读取,不额外维护 state。 */
+/**
+ * 选中态存在 DOM(data-selected)上,提交时直接读取,不额外维护 state。
+ *
+ * "其他"是自由输入行,选中态跟着输入框内容走而非点击态 —— 有文字才算
+ * 选中,清空即取消,不需要用户额外点一下"取消选择"。
+ */
 function wireQuestionPicker(card) {
   const submit = card.querySelector('[data-act="answer"]');
   const anySelected = () => card.querySelector('.qopt[data-selected]') != null;
 
   for (const block of card.querySelectorAll('.qblock')) {
     const multi = block.dataset.multi === '1';
+    const selectOpt = (opt, on) => {
+      if (on) opt.dataset.selected = '1'; else delete opt.dataset.selected;
+      opt.querySelector('.qmark').textContent = multi ? (on ? '☑' : '☐') : (on ? '●' : '○');
+    };
+
     for (const opt of block.querySelectorAll('.qopt')) {
+      const isOther = opt.classList.contains('qopt-other');
+      const input = isOther ? opt.querySelector('.qother-input') : null;
+
       opt.onclick = () => {
+        if (isOther) { input.focus(); return; } // 选中态由输入框内容驱动,见下方 input 监听
         if (!multi) {
-          for (const sib of block.querySelectorAll('.qopt')) {
-            delete sib.dataset.selected;
-            sib.querySelector('.qmark').textContent = '○';
-          }
-          opt.dataset.selected = '1';
-          opt.querySelector('.qmark').textContent = '●';
-        } else {
-          const on = opt.dataset.selected == null;
-          if (on) opt.dataset.selected = '1'; else delete opt.dataset.selected;
-          opt.querySelector('.qmark').textContent = on ? '☑' : '☐';
+          for (const sib of block.querySelectorAll('.qopt')) selectOpt(sib, false);
+          const otherInput = block.querySelector('.qother-input');
+          if (otherInput) otherInput.value = '';
         }
+        selectOpt(opt, multi ? opt.dataset.selected == null : true);
         if (submit) submit.disabled = !anySelected();
       };
+
+      if (input) {
+        input.onclick = (e) => e.stopPropagation();
+        input.oninput = () => {
+          const has = input.value.trim().length > 0;
+          if (has && !multi) {
+            for (const sib of block.querySelectorAll('.qopt')) {
+              if (sib !== opt) selectOpt(sib, false);
+            }
+          }
+          selectOpt(opt, has);
+          if (submit) submit.disabled = !anySelected();
+        };
+      }
     }
   }
 }
 
-/** 把各 qblock 里选中的项拼成模型能读的回答文本。 */
+/** 把各 qblock 里选中的项拼成模型能读的回答文本,"其他"取输入框文字而非 label。 */
 function collectAnswer(card) {
   const parts = [];
   for (const block of card.querySelectorAll('.qblock')) {
     const question = block.querySelector('.qtext')?.textContent ?? '';
-    const labels = [...block.querySelectorAll('.qopt[data-selected]')].map((o) => o.dataset.label);
+    const labels = [...block.querySelectorAll('.qopt[data-selected]')].map((o) =>
+      o.classList.contains('qopt-other') ? o.querySelector('.qother-input').value.trim() : o.dataset.label);
     if (labels.length) parts.push(`${question}: ${labels.join(', ')}`);
   }
   return parts.join('\n');
