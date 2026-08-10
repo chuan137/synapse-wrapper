@@ -7,7 +7,7 @@
     "wrapper": "./bin/wrapper"
   },
   "scripts": {
-    "dev": "tsx watch backend/server.ts",
+    "dev": "PORT=47190 tsx watch backend/server.ts",
     "start": "tsx backend/server.ts",
     "typecheck": "tsc --noEmit"
   },

@@ -10,8 +10,10 @@
  * 同一个生产 daemon,但测试环境指定另一个端口时不能读到/污染生产的状态文件。
  * 显式指定端口时不允许递增(见 server.ts),故「请求端口」与「实际监听端口」
  * 精确相等,目录名可预测。默认端口仍走原有递增容错,此时两者也相等 ——
- * 只有在默认端口已被非本工具的其他服务占用时才会有出入,这属于已知的
- * 陈旧健康检查边界(见 checkHealth 的 token 校验)。
+ * 只有在默认端口已被其他服务占用时才会有出入,那种情况下写回的状态文件
+ * 会把后续 wrapper 调用指向递增后的端口。本仓库自己的手动调试(`npm run
+ * dev`)因此固定用了另一个显式端口(见 package.json),避免它抢占默认端口
+ * 触发递增、悄悄覆盖生产 daemon 的状态文件。
  *
  * 健康检查必须 PID 与 HTTP 双过:PID 可能被系统回收后分配给无关进程,
  * 单看 PID 会把陌生进程误认成后端;而端口可能被别的程序占着,
@@ -48,6 +50,17 @@ export function stateDir(requestedPort: number): string {
 
 /** 后端就绪后调用,把连接信息交给 CLI。requestedPort 决定落盘目录,见文件头注释。 */
 export function writeState(requestedPort: number, state: DaemonState): void {
+  if (state.port !== requestedPort) {
+    // 请求端口被占用触发递增(见 server.ts listenWithRetry)—— 写回状态文件
+    // 会让后续所有 wrapper 调用改道到这个递增后的实例。这本该只在默认端口
+    // 撞上无关外部服务时发生;若撞上的是本仓库自己的另一个实例(比如忘了
+    // 关的手动开发进程),不吭声地写回会悄悄劫持生产 daemon 的连接信息,
+    // 且难以察觉 —— 所以在这里明确报出来,而不是任其静默发生。
+    console.error(
+      `[daemon] 端口 ${requestedPort} 被占用,已改用 ${state.port} —— 状态文件仍会指向 ${state.port},` +
+      `确认占用方不是本仓库遗留的旧实例(如 npm run dev)。`,
+    );
+  }
   const dir = stateDir(requestedPort);
   mkdirSync(dir, { recursive: true, mode: 0o700 });
   writeFileSync(join(dir, 'daemon.pid'), String(state.pid), { mode: 0o600 });
