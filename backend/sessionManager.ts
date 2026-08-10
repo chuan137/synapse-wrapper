@@ -44,6 +44,8 @@ export interface CreateOptions {
   paneId?: string;
   /** 仅 tmux:调用方以 `claude --session-id` 指定的会话 ID。 */
   sessionId?: string;
+  /** 仅 stream-json:透传 `--model`,省略则用 CLI/settings 的默认值。 */
+  model?: string;
 }
 
 /** 会话内累积的一次文件改动。 */
@@ -592,7 +594,11 @@ export class SessionManager {
             paneId: opts.paneId,
             sessionId: opts.sessionId,
           })
-        : new StreamJsonTransport({ cwd: workspace, settingsPath });
+        : new StreamJsonTransport({
+            cwd: workspace,
+            settingsPath,
+            extraArgs: opts.model ? ['--model', opts.model] : undefined,
+          });
 
     const session: Session = {
       localId,

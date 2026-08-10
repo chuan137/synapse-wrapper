@@ -109,6 +109,7 @@ app.post('/api/sessions', async (req, res) => {
       tmuxName: typeof req.body?.tmuxName === 'string' ? req.body.tmuxName : undefined,
       paneId: typeof req.body?.paneId === 'string' ? req.body.paneId : undefined,
       sessionId: typeof req.body?.sessionId === 'string' ? req.body.sessionId : undefined,
+      model: typeof req.body?.model === 'string' && req.body.model.trim() ? req.body.model.trim() : undefined,
     });
     res.json({ localId: s.localId, tmuxName: s.tmuxName, settingsPath: s.settingsPath });
   } catch (err) {
