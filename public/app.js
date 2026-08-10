@@ -30,6 +30,7 @@ const state = {
   connected: false,
   collapsedProjects: loadCollapsed(),
   draftQueue: new Map(), // localId -> string[],会话忙碌时攒的待发 prompt(纯前端,不持久化)
+  pinBottom: false,      // 下次 renderDetail 是否无条件贴底(切会话/切页签/刚发消息)
 };
 
 // ── 工具函数 ────────────────────────────────────────────────
@@ -210,6 +211,8 @@ function connect() {
       case 'user_message':
         if (state.detail?.localId === m.localId) {
           state.detail.timeline.push({ kind: 'user', text: m.text, at: Date.now() });
+          // 自己刚发的消息,不管发送前滚到哪都跳回底部去看它。
+          if (state.view === m.localId) state.pinBottom = true;
           if (state.tab === 'chat') renderBody();
         }
         break;
@@ -702,7 +705,7 @@ function renderTabs() {
     `<button class="tab ${state.tab === k ? 'on' : ''}" data-t="${k}">${label}${n ? `<span class="n">${n}</span>` : ''}</button>`
   ).join('');
   for (const t of $('tabs').querySelectorAll('.tab')) {
-    t.onclick = () => { state.tab = t.dataset.t; renderTabs(); renderBody(); };
+    t.onclick = () => { state.tab = t.dataset.t; state.pinBottom = true; renderTabs(); renderBody(); };
   }
 }
 
@@ -957,7 +960,12 @@ function renderDetail() {
     }
   }
 
-  const wasBottom = $('body').scrollHeight - $('body').scrollTop - $('body').clientHeight < 100;
+  // 首次切进这个会话(或切换页签)时旧 DOM 的滚动位置跟这次要不要贴底
+  // 无关,强制贴底一次;之后的增量重绘才用"渲染前是否已在底部"这个
+  // 启发式,让用户主动往上翻看历史时不被拉回底部。
+  const forceBottom = state.pinBottom;
+  state.pinBottom = false;
+  const wasBottom = forceBottom || $('body').scrollHeight - $('body').scrollTop - $('body').clientHeight < 100;
   $('body').innerHTML = html;
   wireApprovals($('body'));
   if (state.tab === 'chat') { wireProcs($('body'), d); wireDraftQueue($('body')); }
@@ -988,6 +996,7 @@ function renderAll() {
 // ── 导航 ────────────────────────────────────────────────────
 async function navigate(id) {
   state.view = id;
+  state.pinBottom = true;
   if (id === 'overview') {
     state.detail = null;
     $('foot').style.display = 'none';
@@ -1103,6 +1112,7 @@ function send() {
     const q = state.draftQueue.get(state.view) ?? [];
     q.push(text);
     state.draftQueue.set(state.view, q);
+    state.pinBottom = true;
     if (state.tab === 'chat') renderBody();
   }
   $('input').value = '';
