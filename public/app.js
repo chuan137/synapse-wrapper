@@ -29,6 +29,7 @@ const state = {
   detail: null,          // 当前打开会话的详情
   connected: false,
   collapsedProjects: loadCollapsed(),
+  draftQueue: new Map(), // localId -> string[],会话忙碌时攒的待发 prompt(纯前端,不持久化)
 };
 
 // ── 工具函数 ────────────────────────────────────────────────
@@ -186,6 +187,7 @@ function connect() {
           ...state.sessions.get(m.session.localId),
           ...m.session,
         });
+        if (m.session.state === 'ready') flushDraftQueue(m.session.localId);
         renderNav();
         if (state.view === 'overview') renderOverview();
         else if (state.view === m.session.localId) renderTopbar();
@@ -465,6 +467,11 @@ function pendingFor(localId) {
   return [...state.pending.values()].filter((a) => a.sessionId === s.claudeId);
 }
 
+/** 会话的显示态:有待批准项时优先显示 waiting,覆盖 s.state 原始值。 */
+function displayState(s) {
+  return pendingFor(s.localId).length ? 'waiting' : s.state;
+}
+
 /** 同目录下是否还有其他会话 —— 决定要不要挂短标识区分。 */
 function hasDup(s) {
   for (const o of state.sessions.values()) {
@@ -607,8 +614,7 @@ function renderTopbar() {
 
   const s = state.sessions.get(state.view);
   if (!s) return;
-  const n = pendingFor(s.localId).length;
-  const st = n ? 'waiting' : s.state;
+  const st = displayState(s);
   $('topbar').innerHTML = `
     <div class="topbar-main">
       <h1>${headerName(s)}</h1>
@@ -630,14 +636,47 @@ function renderTopbar() {
 }
 
 /**
- * 会话不是 ready 时(忙碌/待批准/启动中/已退出)禁用发送按钮 —— 但不禁用
- * 输入框本身,用户仍可以先把下一条想法打好、攒着,等轮到自己时再点发送。
- * 这是 pendingTurns 那次修复的补充:从源头减少叠加发送的场景,而不是
- * 只在后端把状态修正回来。
+ * 会话不是 ready 时(忙碌/待批准/启动中/已退出)发送按钮不再禁用 ——
+ * 改为把 prompt 存进本地 draftQueue,等 turn_end 收到 ready 后自动弹出
+ * 队首真正发送。这样用户不用盯着状态等按钮变亮,打完就能提交。
  */
 function updateComposer(st) {
-  $('send').disabled = st !== 'ready';
-  $('send').title = st !== 'ready' ? '会话尚未就绪,等当前轮次结束后再发送' : '';
+  $('send').textContent = st === 'ready' ? '发送' : '加入队列';
+  $('send').title = st === 'ready' ? '' : '会话尚未就绪,已加入队列,轮到时自动发送';
+  renderDraftQueue();
+}
+
+function renderDraftQueue() {
+  const el = $('draftQueue');
+  const q = state.draftQueue.get(state.view) ?? [];
+  if (!q.length) { el.style.display = 'none'; el.innerHTML = ''; return; }
+  el.style.display = 'flex';
+  el.innerHTML = q.map((text, i) => `<div class="draft-item" data-i="${i}">
+    <span class="draft-n">${i + 1}</span>
+    <span class="draft-text">${esc(text)}</span>
+    <button class="draft-del" data-i="${i}" title="从队列移除">✕</button>
+  </div>`).join('');
+  for (const btn of el.querySelectorAll('.draft-del')) {
+    btn.onclick = () => {
+      q.splice(Number(btn.dataset.i), 1);
+      if (q.length) state.draftQueue.set(state.view, q); else state.draftQueue.delete(state.view);
+      renderDraftQueue();
+    };
+  }
+}
+
+/**
+ * 会话回到 ready 时把队列里攒的所有 prompt 合并成一条发送,而不是逐条
+ * 排队消耗多个轮次 —— 用户攒的是"这一轮该做的几件事",不是想让 CLI
+ * 分好几轮串行处理。
+ */
+function flushDraftQueue(localId) {
+  const q = state.draftQueue.get(localId);
+  if (!q?.length) return;
+  state.draftQueue.delete(localId);
+  const text = q.join('\n\n');
+  ws.send(JSON.stringify({ type: 'prompt', localId, text }));
+  if (state.view === localId) renderDraftQueue();
 }
 
 // ── 渲染:页签 ──────────────────────────────────────────────
@@ -1043,10 +1082,19 @@ $('add').onclick = () => {
 // ── 发送 ────────────────────────────────────────────────────
 function send() {
   const text = $('input').value.trim();
-  // 按钮 disabled 挡不住 Enter 键路径,这里兜底同一条判断 —— 不清空
-  // 输入框,内容留着等就绪了再发。
-  if (!text || state.view === 'overview' || !state.connected || $('send').disabled) return;
-  ws.send(JSON.stringify({ type: 'prompt', localId: state.view, text }));
+  if (!text || state.view === 'overview' || !state.connected) return;
+  const s = state.sessions.get(state.view);
+  const ready = s && !pendingFor(s.localId).length && s.state === 'ready';
+  if (ready) {
+    ws.send(JSON.stringify({ type: 'prompt', localId: state.view, text }));
+  } else {
+    // 会话忙碌/待批准/启动中时先攒进本地队列,turn_end 回到 ready 后
+    // flushDraftQueue 自动弹出队首发送 —— 不用用户盯着状态手动重试。
+    const q = state.draftQueue.get(state.view) ?? [];
+    q.push(text);
+    state.draftQueue.set(state.view, q);
+    renderDraftQueue();
+  }
   $('input').value = '';
 }
 $('send').onclick = send;

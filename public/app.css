@@ -438,6 +438,21 @@ button.s-tag:hover { background: var(--blue-soft); color: var(--blue); border-co
 
 /* ── 输入框 ── */
 footer { border-top: 1px solid var(--hair); background: var(--surface); padding: 10px 20px; flex: none; }
+.draft-queue { display: flex; flex-direction: column; gap: 4px; margin-bottom: 8px; }
+.draft-item {
+  display: flex; align-items: center; gap: 8px; padding: 6px 10px;
+  border-radius: 7px; background: var(--amber-soft); font-size: 12.5px;
+}
+.draft-n {
+  flex: none; width: 16px; height: 16px; border-radius: 50%; background: var(--amber);
+  color: #fff; font-size: 10px; font-weight: 600; display: flex; align-items: center; justify-content: center;
+}
+.draft-text { flex: 1; color: var(--ink-2); white-space: pre-wrap; word-break: break-all; }
+.draft-del {
+  flex: none; border: none; background: none; cursor: pointer; color: var(--ink-3);
+  font-size: 12px; line-height: 1; padding: 2px 4px; border-radius: 4px;
+}
+.draft-del:hover { background: var(--hair-soft); color: var(--ink); }
 .composer { display: flex; gap: 8px; align-items: flex-end; }
 textarea {
   flex: 1; resize: none; font: inherit; font-size: 13.5px; padding: 9px 12px;
