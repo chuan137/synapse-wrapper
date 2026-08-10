@@ -731,6 +731,21 @@ export class SessionManager {
           s.lastAction = '进程已退出';
         }
         break;
+
+      // transport.send() 对应的注入本身失败(如 tmux 注入超时、stdin 不可写)——
+      // 这次尝试不会再有 turn_end 来配对,pendingTurns 若不在此收回,会永久
+      // 卡在 >0,turn_end 分支的 === 0 判断再也不成立,会话就此再也回不到
+      // ready(除了这条错误路径,没有别处会让 pendingTurns 减少)。
+      case 'error':
+        console.error(`[session ${s.localId}] transport error: ${ev.message}`);
+        if (s.pendingTurns > 0) {
+          s.pendingTurns--;
+          if (s.pendingTurns === 0 && s.state !== 'exited') {
+            s.state = 'ready';
+            s.lastAction = '等待输入';
+          }
+        }
+        break;
     }
     reduceEvent(s, ev, Date.now);
 
@@ -748,6 +763,23 @@ export class SessionManager {
     s.pendingTurns++;
     s.transport.send(text);
     return true;
+  }
+
+  /**
+   * 用户主动中断当前轮次 —— 视为「这轮不算了」,不再等 transcript 里
+   * 可能不会再来的 turn_end。若不在这里清空 pendingTurns,中断信号
+   * 发给 CLI 后 state 仍停在 busy,composer 会继续把新消息堆进草稿
+   * 队列,用户看着"已中断"却还是发不出下一条消息。
+   */
+  interrupt(localId: string): void {
+    const s = this.#sessions.get(localId);
+    if (!s || s.state === 'exited') return;
+    s.transport.interrupt();
+    s.pendingTurns = 0;
+    s.state = 'ready';
+    s.lastAction = '已中断,等待输入';
+    this.#emit({ type: 'session_updated', session: this.#summarize(s) });
+    this.#store.scheduleSave();
   }
 
   /** 用户在网页上主动删除会话 —— 记录本身也从持久化里摘除,不留痕迹。 */

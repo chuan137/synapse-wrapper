@@ -242,7 +242,7 @@ wss.on('connection', (ws) => {
         break;
 
       case 'interrupt':
-        manager.get(String(msg.localId))?.transport.interrupt();
+        manager.interrupt(String(msg.localId));
         break;
     }
   });

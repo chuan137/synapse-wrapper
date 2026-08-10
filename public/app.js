@@ -131,8 +131,9 @@ const STATE_LABEL = {
 // 网页看不到这类阻塞。超过此时长仍无结果回填,视为疑似卡住。
 const STALL_THRESHOLD_MS = 20_000;
 const isStalled = (s) => s.pendingToolSince != null && Date.now() - s.pendingToolSince > STALL_THRESHOLD_MS;
-const stallNotice = (s) => `<div class="c-why" style="border-radius:8px;margin-bottom:8px">
-  ⚠️ 工具调用已发出但${waited(s.pendingToolSince)}未返回结果,可能卡在本地终端的权限确认 —— 请去 tmux/终端查看该会话。
+const stallNotice = (s) => `<div class="c-why stall" style="border-radius:8px;margin-bottom:8px">
+  <span>⚠️ 工具调用已发出但${waited(s.pendingToolSince)}未返回结果,可能卡在本地终端的权限确认。</span>
+  <button class="stall-interrupt" data-interrupt="${s.localId}" title="向该会话发送 Escape,尝试打断当前卡住的操作">中断</button>
 </div>`;
 
 /** 把风险规则命中的片段标红。 */
@@ -294,6 +295,12 @@ function onSessionEvent(localId, ev) {
       // 分组边界:标记本轮结束,渲染时据此把过程步骤折叠、只留结论。
       d.timeline.push({ kind: 'turn_end', at: Date.now() });
       break;
+    case 'error':
+      // 后端已经把泄漏的 pendingTurns 收回、state 改回 ready(见
+      // sessionManager.ts #absorb 的 case 'error' 注释),这里只负责
+      // 让用户看到"刚才那次发送其实没成功",不必再去 tmux 才发现。
+      d.timeline.push({ kind: 'error', text: ev.message, at: Date.now() });
+      break;
   }
   // renderTodoPanel 只读 d.todos,Task* 分支只改了 d.tasks Map,
   // 每次事件后都要重新合并 —— 与后端 sessionManager.ts 的 mergedTodos 同逻辑。
@@ -321,14 +328,18 @@ function renderTurns(d) {
   const groups = [];
   let cur = null;
   for (const t of d.timeline) {
-    if (t.kind === 'user') { cur = { user: t, steps: [], ended: false }; groups.push(cur); continue; }
-    if (!cur) { cur = { user: null, steps: [], ended: false }; groups.push(cur); }
+    if (t.kind === 'user') { cur = { user: t, steps: [], ended: false, error: null }; groups.push(cur); continue; }
+    if (!cur) { cur = { user: null, steps: [], ended: false, error: null }; groups.push(cur); }
     if (t.kind === 'turn_end') { cur.ended = true; continue; }
+    // 不进 steps/toolLine —— 那条渲染管线是为工具调用步骤设计的,错误
+    // 提示单独用一块红色条挂在这一轮末尾。
+    if (t.kind === 'error') { cur.error = t.text; continue; }
     cur.steps.push(t);
   }
 
   return groups.map((g, i) => {
     let out = g.user ? `<div class="turn me"><div class="who">你</div><div class="said">${esc(g.user.text)}</div></div>` : '';
+    if (g.error) out += `<div class="c-why">⚠️ 发送失败:${esc(g.error)}</div>`;
 
     if (!g.steps.length) return out;
 
@@ -648,6 +659,9 @@ function renderTopbar() {
 function updateComposer(st) {
   $('send').textContent = st === 'ready' ? '发送' : '加入队列';
   $('send').title = st === 'ready' ? '' : '会话尚未就绪,已加入队列,轮到时自动发送';
+  // 中断信号有时对卡住的 CLI 不生效,state 迟迟回不到 ready 时用户
+  // 需要一条能立刻把消息送出去的路径,不必再干等 turn_end。
+  $('sendForce').style.display = st === 'ready' ? 'none' : '';
   if (state.tab === 'chat') renderBody();
 }
 
@@ -848,6 +862,15 @@ function wireApprovals(root) {
   }
 }
 
+function wireStallNotice(root) {
+  for (const btn of root.querySelectorAll('[data-interrupt]')) {
+    btn.onclick = () => {
+      btn.disabled = true;
+      ws.send(JSON.stringify({ type: 'interrupt', localId: btn.dataset.interrupt }));
+    };
+  }
+}
+
 // ── 渲染:主体 ──────────────────────────────────────────────
 function renderOverview() {
   const pend = [...state.pending.values()].sort((a, b) => a.requestedAt - b.requestedAt);
@@ -901,6 +924,7 @@ function renderOverview() {
 
   $('body').innerHTML = html;
   wireApprovals($('body'));
+  wireStallNotice($('body'));
   for (const b of $('body').querySelectorAll('[data-open]')) {
     b.onclick = () => navigate(b.dataset.open);
   }
@@ -968,6 +992,7 @@ function renderDetail() {
   const wasBottom = forceBottom || $('body').scrollHeight - $('body').scrollTop - $('body').clientHeight < 100;
   $('body').innerHTML = html;
   wireApprovals($('body'));
+  wireStallNotice($('body'));
   if (state.tab === 'chat') { wireProcs($('body'), d); wireDraftQueue($('body')); }
   if (state.tab === 'chat' && wasBottom) $('body').scrollTop = $('body').scrollHeight;
 }
@@ -1118,6 +1143,27 @@ function send() {
   $('input').value = '';
 }
 $('send').onclick = send;
+
+/**
+ * 中断当前轮次并把输入框内容(连同已攒的草稿队列)立即发出去 ——
+ * interrupt 通常会让后端把 state 收回 ready(见 sessionManager.ts
+ * #interrupt),但网页不必等那趟往返再让用户重新点一次发送。
+ */
+$('sendForce').onclick = () => {
+  const text = $('input').value.trim();
+  if (state.view === 'overview' || !state.connected) return;
+  const localId = state.view;
+  const q = state.draftQueue.get(localId) ?? [];
+  if (text) q.push(text);
+  if (!q.length) return;
+  state.draftQueue.delete(localId);
+  ws.send(JSON.stringify({ type: 'interrupt', localId }));
+  ws.send(JSON.stringify({ type: 'prompt', localId, text: q.join('\n\n') }));
+  $('input').value = '';
+  state.pinBottom = true;
+  if (state.tab === 'chat') renderBody();
+};
+
 $('input').onkeydown = (e) => {
   // isComposing 排除中文输入法候选词确认的回车 —— 否则拼音上屏会被
   // 误判成发送,把还没选完的内容连着输入法自己的回车一起提交出去。
