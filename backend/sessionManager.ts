@@ -13,7 +13,7 @@ import { randomUUID } from 'node:crypto';
 import { writeFileSync, mkdirSync, readFileSync, existsSync } from 'node:fs';
 import { join, basename } from 'node:path';
 import { StreamJsonTransport } from './streamJson.ts';
-import { TmuxTransport, paneExists, findClaimedPanes } from './tmuxTransport.ts';
+import { TmuxTransport, findClaimedPanes } from './tmuxTransport.ts';
 import { HOOK_TIMEOUT_S } from './permissions.ts';
 import { summarizeInput } from './risk.ts';
 import { transcriptPathFor, replayTranscript } from './transcript.ts';
@@ -459,13 +459,20 @@ export class SessionManager {
    */
   async #reclaimTmuxSessions(): Promise<void> {
     const all = [...this.#sessions.values()].filter((s) => s.fromDisk && s.transportKind === 'tmux');
-    const missing = all.filter((s) => !s.paneId && s.claudeId);
-    if (missing.length) {
-      const claimed = await findClaimedPanes();
-      for (const s of missing) {
-        const pane = claimed.get(s.claudeId!);
-        if (pane) s.paneId = pane;
-      }
+    if (!all.length) return;
+
+    // 全局反查一次,同时喂给下面两处用途:paneId 缺失的补全,以及
+    // paneId 已知的仍要核实 —— pane 容器还在不代表里面还是这个会话的 claude
+    // 进程(用户可能已在 pane 内退出 claude 回到 shell,paneExists 单看
+    // pane 容器会误判"还活着",#waitReady 又只认屏幕上的 ❯ 提示符,connect
+    // 到 shell 提示符同样会被判定就绪 —— 见 daemon restart 后 exited 会话
+    // 显示成 ready 的问题)。
+    const claimed = await findClaimedPanes();
+    for (const s of all) {
+      if (!s.claudeId) continue;
+      const pane = claimed.get(s.claudeId);
+      if (!s.paneId) { if (pane) s.paneId = pane; continue; }
+      if (pane !== s.paneId) s.paneId = null;  // pane 已不再跑这个会话,交回 exited
     }
 
     const candidates = all.filter((s) => s.paneId);
@@ -473,8 +480,6 @@ export class SessionManager {
 
     await Promise.all(
       candidates.map(async (s) => {
-        if (!(await paneExists(s.paneId!))) return;  // 真退出了,#loadPersisted 的判断保留
-
         const transport = new TmuxTransport({
           cwd: s.workspace,
           settingsPath: s.settingsPath,
