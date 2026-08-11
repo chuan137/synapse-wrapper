@@ -381,7 +381,7 @@ export class TmuxTransport extends EventEmitterBase implements SessionTransport 
       this.#buf = lines.pop() ?? '';  // 末行可能截断
 
       for (const line of lines) {
-        if (line.trim()) this.#handleLine(line);
+        if (line.trim()) await this.#handleLine(line);
       }
     } catch {
       // 短暂不可读,下个 tick 重试
@@ -391,7 +391,7 @@ export class TmuxTransport extends EventEmitterBase implements SessionTransport 
   }
 
   /** 解析规则见 backend/transcript.ts(与历史重放共用);这里只管跨行去重与事件下发。 */
-  #handleLine(line: string): void {
+  async #handleLine(line: string): Promise<void> {
     let d: Record<string, any>;
     try {
       d = JSON.parse(line);
@@ -411,7 +411,13 @@ export class TmuxTransport extends EventEmitterBase implements SessionTransport 
         if (i !== -1) { this.#pendingEchoes.splice(i, 1); continue; }  // send() 自己的回显,调用方已经记过一次
       }
       this.emit(ev);
-      if (ev.kind === 'turn_end') this.emit({ kind: 'status', state: 'ready' });
+      // stop_reason 落盘只说明模型这一轮说完了,不代表 TUI 已经把内容
+      // 渲染完、光标回到提示符 —— 转写与屏幕是两条独立时间线,直接标
+      // ready 会让网页在 CLI 仍在刷屏时抢先显示就绪。
+      if (ev.kind === 'turn_end') {
+        await this.#waitReady();
+        this.emit({ kind: 'status', state: 'ready' });
+      }
     }
   }
 
