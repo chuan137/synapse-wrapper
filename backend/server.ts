@@ -9,13 +9,12 @@
 import express from 'express';
 import { WebSocketServer, type WebSocket } from 'ws';
 import { createServer } from 'node:http';
-import { randomUUID } from 'node:crypto';
 import { resolve } from 'node:path';
 import { existsSync, statSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { SessionManager, replayTranscriptTimeline, mergedTodos, type ManagerEvent } from './sessionManager.ts';
 import { PermissionEngine, HOOK_TIMEOUT_S, type PendingApproval } from './permissions.ts';
-import { writeState, clearState, DEFAULT_PORT, MAX_PORT_TRIES } from './daemon.ts';
+import { writeState, clearState, readOrCreateToken, DEFAULT_PORT, MAX_PORT_TRIES } from './daemon.ts';
 
 const HOST = '127.0.0.1';
 /** 显式通过 PORT 环境变量指定过端口,还是用的默认值 —— 决定要不要允许递增重试。 */
@@ -23,8 +22,13 @@ const PORT_EXPLICIT = process.env.PORT != null;
 const PORT = Number(process.env.PORT ?? DEFAULT_PORT);
 const ROOT = resolve(fileURLToPath(new URL('..', import.meta.url)));
 
-/** 保护浏览器侧接口的会话令牌,每次启动重新生成。 */
-const AUTH_TOKEN = randomUUID();
+/**
+ * 保护浏览器侧接口的会话令牌。同端口有残留 token(daemon.ts clearState 不删它,
+ * 只清 pid/port)就复用,让 `wrapper daemon restart` 之后旧链接继续有效 ——
+ * 用户的浏览器书签、终端历史里存的都是这个 URL,链接跟着重启变会很烦人。
+ * 全新安装或首次启动(没有残留文件)才随机生成。
+ */
+const AUTH_TOKEN = readOrCreateToken(PORT);
 
 /**
  * 实际监听端口 —— 默认端口占用时会递增(见 listenWithRetry)。

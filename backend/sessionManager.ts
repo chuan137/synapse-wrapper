@@ -13,7 +13,7 @@ import { randomUUID } from 'node:crypto';
 import { writeFileSync, mkdirSync, readFileSync, existsSync } from 'node:fs';
 import { join, basename } from 'node:path';
 import { StreamJsonTransport } from './streamJson.ts';
-import { TmuxTransport } from './tmuxTransport.ts';
+import { TmuxTransport, paneExists, findClaimedPanes } from './tmuxTransport.ts';
 import { HOOK_TIMEOUT_S } from './permissions.ts';
 import { summarizeInput } from './risk.ts';
 import { transcriptPathFor, replayTranscript } from './transcript.ts';
@@ -110,6 +110,9 @@ export interface SessionSummary {
   fileCount: number;
   additions: number;
   deletions: number;
+  /** 会话创建时刻,固定不变 —— 左栏按它排序,不像 lastActivity 那样随每次
+   *  事件跳动(见 spec §2.17)。 */
+  createdAt: number;
   lastActivity: number;
   lastAction: string;
   /** 最早一个未返回结果的工具调用发起时间;无挂起时为 null。
@@ -133,9 +136,16 @@ export interface PersistedSession {
   workspace: string;
   transportKind: TransportKind;
   tmuxName: string | null;
+  /**
+   * 接管模式下承载会话的 pane。tmux 会话本身活在 daemon 之外(见 §2.5),
+   * 重启后如果这个 pane 还在,应该重新接回 TmuxTransport 而非直接判 exited ——
+   * 不落这个字段就无从判断,只能一律标 exited(哪怕 claude 进程其实还活着)。
+   */
+  paneId: string | null;
   turns: number;
   costUsd: number;
   fileCount: number;
+  createdAt: number;
   lastActivity: number;
   lastAction: string;
   /** 会话进程已不在(总是如此 —— 只有重启后失去进程的会话才落这份快照)。 */
@@ -166,6 +176,7 @@ export interface Session {
   files: Map<string, FileChange>;
   commands: CommandRun[];
   timeline: TimelineItem[];
+  createdAt: number;
   lastActivity: number;
   lastAction: string;
   /** 未结束的工具调用,用于把结果回填到时间线。 */
@@ -244,6 +255,12 @@ interface ReplayTarget {
  */
 function reduceEvent(t: ReplayTarget, ev: SessionEvent, now: () => number): void {
   switch (ev.kind) {
+    // 网页发送的消息由 sessionManager.send() 直接 push,不走这里;这条
+    // case 只服务转写文件观测到的终端直接输入(见 transcript.ts)。
+    case 'user':
+      t.timeline.push({ kind: 'user', text: ev.text, at: now() });
+      break;
+
     case 'assistant_text':
       t.timeline.push({ kind: 'assistant', text: ev.text, at: now() });
       break;
@@ -422,6 +439,61 @@ export class SessionManager {
     this.#port = port;
     this.#store = new SessionStore(requestedPort, () => this.#persistedAll());
     this.#loadPersisted(requestedPort);
+    // 构造函数不能是 async,先同步把全部历史记录标 exited 让 SessionManager
+    // 立刻可用,tmux 接管会话的重新探活异步补上(见 #reclaimTmuxSessions)。
+    // 空窗期内这些会话在网页上短暂显示"已退出" —— 存活巡检对 exited 会话
+    // 直接跳过(#sweep 的 continue 条件),不会跟这里的异步重建产生竞态。
+    void this.#reclaimTmuxSessions();
+  }
+
+  /**
+   * 后端重启后,tmux 接管模式的会话可能其实还活着 —— pane 独立于 daemon
+   * 存活(见 §2.5)。#loadPersisted 无从判断,一律先标 exited;这里逐个
+   * 探测 pane 是否还在,还在就重建 TmuxTransport 接回去,状态交给 start()
+   * 的正常流程(#waitReady 探到 TUI 已就绪会很快返回,不是从头等首屏)。
+   *
+   * paneId 缺失时先反查一次(见 §2.16):PersistedSession.paneId 是后加的
+   * 字段,旧数据落盘时它还不存在,磁盘记录本身补不全 —— 必须从操作系统当前
+   * 状态倒推。查到就顺手补回 s.paneId,让接下来 #persistedAll() 落盘时
+   * 一并写回磁盘,不必每次重启都重新反查。
+   */
+  async #reclaimTmuxSessions(): Promise<void> {
+    const all = [...this.#sessions.values()].filter((s) => s.fromDisk && s.transportKind === 'tmux');
+    const missing = all.filter((s) => !s.paneId && s.claudeId);
+    if (missing.length) {
+      const claimed = await findClaimedPanes();
+      for (const s of missing) {
+        const pane = claimed.get(s.claudeId!);
+        if (pane) s.paneId = pane;
+      }
+    }
+
+    const candidates = all.filter((s) => s.paneId);
+    if (!candidates.length) return;
+
+    await Promise.all(
+      candidates.map(async (s) => {
+        if (!(await paneExists(s.paneId!))) return;  // 真退出了,#loadPersisted 的判断保留
+
+        const transport = new TmuxTransport({
+          cwd: s.workspace,
+          settingsPath: s.settingsPath,
+          paneId: s.paneId!,
+          sessionId: s.claudeId ?? undefined,
+        });
+        s.transport = transport;
+        s.fromDisk = false;
+        transport.onEvent((ev) => this.#absorb(s, ev));
+
+        try {
+          await transport.start();
+        } catch (err) {
+          console.error(`[session ${s.localId}] 重新接管 pane ${s.paneId} 失败:`, err);
+          this.#markExited(s, '重新接管失败');
+        }
+      }),
+    );
+    this.#store.scheduleSave();  // paneId 反查补全的结果落盘,下次重启不必再猜
   }
 
   /** 启动时把历史记录接回内存,标 exited(进程已经不在,只是记录还在)。 */
@@ -438,7 +510,7 @@ export class SessionManager {
         transport: new NullTransport(),
         transportKind: p.transportKind,
         tmuxName: p.tmuxName,
-        paneId: null,
+        paneId: p.paneId,
         settingsPath: join(p.workspace, '.claude', 'settings.local.json'),
         turns: p.turns,
         costUsd: p.costUsd,
@@ -448,6 +520,9 @@ export class SessionManager {
         files: new Map(),
         commands: [],
         timeline: [],
+        // 旧数据没有 createdAt(字段是后加的),拿 lastActivity 顶替 —— 不精确
+        // 但好过完全没有排序依据;新记录从 create() 起就一直有准确值。
+        createdAt: p.createdAt ?? p.lastActivity,
         lastActivity: p.lastActivity,
         lastAction: p.lastAction,
         openTools: new Map(),
@@ -472,9 +547,11 @@ export class SessionManager {
       workspace: s.workspace,
       transportKind: s.transportKind,
       tmuxName: s.tmuxName,
+      paneId: s.paneId,
       turns: s.turns,
       costUsd: s.costUsd,
       fileCount: s.files.size,
+      createdAt: s.createdAt,
       lastActivity: s.lastActivity,
       lastAction: s.lastAction,
       transcriptPath: s.transcriptPath,
@@ -538,6 +615,7 @@ export class SessionManager {
       fileCount: s.files.size,
       additions,
       deletions,
+      createdAt: s.createdAt,
       lastActivity: s.lastActivity,
       lastAction: s.lastAction,
       pendingToolSince,
@@ -636,6 +714,7 @@ export class SessionManager {
       files: new Map(),
       commands: [],
       timeline: [],
+      createdAt: Date.now(),
       lastActivity: Date.now(),
       lastAction: '正在启动',
       openTools: new Map(),
@@ -719,7 +798,9 @@ export class SessionManager {
         s.pendingTurns = Math.max(0, s.pendingTurns - 1);
         if (s.pendingTurns === 0) {
           s.state = 'ready';
-          s.lastAction = '等待输入';
+          // 与 interrupt() 里网页发起中断的文案保持一致 —— 用户在终端
+          // 直接按 Escape 时走的是这条路径,而非那个方法。
+          s.lastAction = ev.interrupted ? '已中断,等待输入' : '等待输入';
         }
         break;
 

@@ -227,6 +227,12 @@ function onSessionEvent(localId, ev) {
   if (!d || d.localId !== localId) return;
 
   switch (ev.kind) {
+    // 网页自己发的消息走独立的 user_message 通知(见上面的 case),这里
+    // 只处理终端里绕开网页直接敲的下一轮 prompt —— 不接的话新一轮内容
+    // 会被 renderTurns 并入上一轮,读起来像是两轮混在一起。
+    case 'user':
+      d.timeline.push({ kind: 'user', text: ev.text, at: Date.now() });
+      break;
     case 'assistant_text':
       d.timeline.push({ kind: 'assistant', text: ev.text, at: Date.now() });
       break;
@@ -565,9 +571,13 @@ function renderNav() {
   };
 
   // 按 workspace 分组(而非目录名 name)—— 绝对路径全局唯一,不会把同名的
-  // 不同目录混进一组。组内保留原「需要你/进行中/静默」的排序权重。
+  // 不同目录混进一组。
   // exited 的会话不在左栏出现 —— 进程已经不在了,不算 active;仍能在
   // 「全部会话」总览页的「静默」分组里找到,不是彻底消失。
+  //
+  // project 与 session 均固定排序(字母序 / 创建时间),不受 rank(需要你/
+  // 进行中/静默)影响位置 —— rank 只驱动 attn 高亮与 pip 颜色这类视觉提示。
+  // 早期实现拿 rank 参与排序,状态一变位置就跳,找一个常用会话变成"眼疾手快"。
   const byWorkspace = new Map();
   for (const s of state.sessions.values()) {
     if (s.state === 'exited') continue;
@@ -575,10 +585,10 @@ function renderNav() {
     byWorkspace.get(s.workspace).push(s);
   }
   const projects = [...byWorkspace.entries()].map(([workspace, sessions]) => {
-    sessions.sort((a, b) => sessionRank(a) - sessionRank(b) || b.lastActivity - a.lastActivity);
+    sessions.sort((a, b) => a.createdAt - b.createdAt);
     return { workspace, name: sessions[0].name, sessions, rank: Math.min(...sessions.map(sessionRank)) };
   });
-  projects.sort((a, b) => a.rank - b.rank || a.name.localeCompare(b.name));
+  projects.sort((a, b) => a.name.localeCompare(b.name));
 
   let html = `<div class="nav-item ${state.view === 'overview' ? 'on' : ''}" data-id="overview">
     <span class="nav-name" style="font-weight:500">全部会话</span>

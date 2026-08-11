@@ -91,6 +91,16 @@ export function parseTranscriptLineMulti(
   if (d.type === 'user') {
     // 用户输入是字符串,工具结果是数组
     const c = d.message?.content;
+
+    // 终端里绕开网页直接敲下一轮 prompt 时,只有转写文件能感知到这轮开始了。
+    // 不产出这个事件的话,前端 renderTurns 靠 kind:'user' 开新分组的逻辑
+    // 找不到边界,新一轮的所有内容会被并入上一轮,读起来像是"混在一起"。
+    // isMeta 排除会话摘要/跨会话通知/queue 提醒等合成消息 —— 那些不是
+    // 真正开启新一轮的用户输入;<bash-*> 是 CLI 内置 !command 的转写,同理排除。
+    if (typeof c === 'string' && !d.isMeta && !c.startsWith('<bash-')) {
+      return [{ kind: 'user', text: c }];
+    }
+
     if (Array.isArray(c)) {
       const events: SessionEvent[] = [];
       for (const b of c) {
@@ -101,6 +111,14 @@ export function parseTranscriptLineMulti(
             content: b.content,
             isError: Boolean(b.is_error),
           });
+        }
+        // 终端里直接按 Escape 中断(而非经网页 interrupt())时,CLI 把这条
+        // 固定文本当作一条 user 消息写进转写,后面不会再有 assistant 消息
+        // 收尾、也就没有 stop_reason 触发的 turn_end —— 网页会永远停在
+        // busy。这条文本本身不是助手说的话,不当 assistant_text 展示,
+        // 只借它补一个 turn_end 把状态收回。
+        else if (b.type === 'text' && /^\[Request interrupted by user/.test(b.text ?? '')) {
+          events.push({ kind: 'turn_end', result: '', interrupted: true });
         }
       }
       return events;

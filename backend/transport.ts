@@ -12,6 +12,13 @@
 /** 传输层向上广播的事件。UI 只认这些,不关心底层是管道还是 tmux。 */
 export type SessionEvent =
   | { kind: 'session'; sessionId: string }
+  /**
+   * 用户输入被转写文件观测到(tmux 场景:用户绕开网页、直接在终端敲下一轮
+   * prompt)。网页自己发送的消息走独立的 user_message WS 通知,不产生
+   * 这个事件 —— 两条路径写的是同一个 TimelineItem 形状,但触发时机不同,
+   * 见 backend/transcript.ts 的说明。
+   */
+  | { kind: 'user'; text: string }
   | { kind: 'assistant_text'; text: string }
   | { kind: 'assistant_delta'; text: string }
   | { kind: 'tool_use'; toolUseId: string; name: string; input: unknown }
@@ -26,7 +33,7 @@ export type SessionEvent =
    */
   | { kind: 'usage'; inputTokens: number }
   | { kind: 'context_window'; model: string; window: number }
-  | { kind: 'turn_end'; result: string; costUsd?: number }
+  | { kind: 'turn_end'; result: string; costUsd?: number; interrupted?: boolean }
   | { kind: 'status'; state: 'starting' | 'ready' | 'busy' | 'exited'; detail?: string }
   | { kind: 'error'; message: string };
 

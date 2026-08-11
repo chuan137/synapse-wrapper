@@ -17,6 +17,80 @@ import { parseTranscriptLineMulti, encodeProjectDir } from './transcript.ts';
 const exec = promisify(execFile);
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
+/**
+ * 网页 textarea 的 Shift+Enter 换行是 `\n`,claude TUI 收到粘贴内容后
+ * 落盘到转写文件时把内部换行写成了 `\r`(实测,见 spec §2.18)—— 回显比对
+ * 前先归一化,否则精确字符串匹配因换行符不同而永远不命中。
+ */
+function normalizeNewlines(text: string): string {
+  return text.replace(/\r\n?/g, '\n');
+}
+
+/**
+ * 指定 pane 是否还在 tmux 里。独立于任何 TmuxTransport 实例 —— 后端重启后
+ * 重新加载持久化会话时,要先判断值不值得重建 TmuxTransport,此时实例还不存在。
+ */
+export async function paneExists(paneId: string): Promise<boolean> {
+  try {
+    const { stdout } = await exec('tmux', ['list-panes', '-a', '-F', '#{pane_id}']);
+    return stdout.split('\n').includes(paneId);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * 反查每个 pane 里正在跑的 claude 进程,取其 --session-id。
+ *
+ * 兜底手段:PersistedSession.paneId 字段是后加的(见 spec §2.16),旧数据落盘
+ * 时该字段还不存在,读出来是 undefined。#loadPersisted 光靠磁盘记录补不全
+ * 这批历史数据,只能反过来从操作系统当前状态推算 —— pane 的第一层子进程
+ * 未必是 claude(wrapper 会先起一层 node 壳再 spawn claude),故用 sessionId
+ * 全局定位 claude 进程,再沿 ppid 链向上爬,看落在哪个 pane 的 pane_pid 下。
+ */
+export async function findClaimedPanes(): Promise<Map<string, string>> {
+  const result = new Map<string, string>();
+  try {
+    const [{ stdout: psOut }, { stdout: paneOut }] = await Promise.all([
+      exec('ps', ['-eo', 'pid,ppid,command']),
+      exec('tmux', ['list-panes', '-a', '-F', '#{pane_id} #{pane_pid}']),
+    ]);
+
+    const panePids = new Map<number, string>();  // pane_pid -> pane_id
+    for (const line of paneOut.trim().split('\n')) {
+      const [paneId, pidStr] = line.trim().split(/\s+/);
+      const pid = Number(pidStr);
+      if (paneId && Number.isInteger(pid)) panePids.set(pid, paneId);
+    }
+
+    const ppidOf = new Map<number, number>();
+    const claudePids: { pid: number; sessionId: string }[] = [];
+    for (const line of psOut.trim().split('\n').slice(1)) {  // 首行是表头
+      const m = line.trim().match(/^(\d+)\s+(\d+)\s+(.*)$/);
+      if (!m) continue;
+      const pid = Number(m[1]);
+      const ppid = Number(m[2]);
+      ppidOf.set(pid, ppid);
+      const sidMatch = m[3]!.match(/^claude\b.*--session-id[ =](\S+)/);
+      if (sidMatch?.[1]) claudePids.push({ pid, sessionId: sidMatch[1] });
+    }
+
+    for (const { pid, sessionId } of claudePids) {
+      let cur = pid;
+      for (let hops = 0; hops < 20; hops++) {  // 防止 ppid 链异常成环
+        const pane = panePids.get(cur);
+        if (pane) { result.set(sessionId, pane); break; }
+        const next = ppidOf.get(cur);
+        if (!next || next === cur) break;
+        cur = next;
+      }
+    }
+  } catch {
+    // ps/tmux 不可用时返回空表,调用方按"查不到"处理,不影响 #loadPersisted 的默认行为
+  }
+  return result;
+}
+
 export interface TmuxOptions {
   cwd: string;
   settingsPath: string;
@@ -57,6 +131,19 @@ export class TmuxTransport extends EventEmitterBase implements SessionTransport 
   #seenUuids = new Set<string>();
   #title: string | null = null;
   #stopped = false;
+  /**
+   * send() 注入的文本迟早会作为普通 user 行出现在转写文件里 —— 在 tmux
+   * 层面它和用户手动敲键盘完全等价,没有字段能区分来源。不去重的话,
+   * 网页发的每条消息都会被 #handleLine 当作"终端直接输入"再入一次账,
+   * 时间线里同一条消息出现两遍。FIFO 按注入顺序消费,足够应付网页消息
+   * 不会乱序抵达转写文件这一前提。
+   *
+   * 存归一化后的换行(见 #normalizeNewlines):网页 textarea 的 Shift+Enter
+   * 换行是 `\n`,但 claude TUI 收到粘贴内容后落盘到转写文件时把内部换行
+   * 写成了 `\r`(实测,见 spec §2.18)—— 原样存 `\n` 版本,#handleLine 里
+   * 精确 indexOf 比对永远不命中,回显消不掉,网页因此看到重复的两条。
+   */
+  #pendingEchoes: string[] = [];
 
   constructor(opts: TmuxOptions) {
     super();
@@ -192,12 +279,7 @@ export class TmuxTransport extends EventEmitterBase implements SessionTransport 
   async alive(): Promise<boolean> {
     const pane = this.#opts.paneId;
     if (!pane) return this.#sessionExists();
-    try {
-      const { stdout } = await exec('tmux', ['list-panes', '-a', '-F', '#{pane_id}']);
-      return stdout.split('\n').includes(pane);
-    } catch {
-      return false;
-    }
+    return paneExists(pane);
   }
 
   /**
@@ -315,12 +397,17 @@ export class TmuxTransport extends EventEmitterBase implements SessionTransport 
 
     for (const ev of parseTranscriptLineMulti(line, this.#title)) {
       if (ev.kind === 'title') this.#title = ev.title;
+      if (ev.kind === 'user') {
+        const i = this.#pendingEchoes.indexOf(normalizeNewlines(ev.text));
+        if (i !== -1) { this.#pendingEchoes.splice(i, 1); continue; }  // send() 自己的回显,调用方已经记过一次
+      }
       this.emit(ev);
       if (ev.kind === 'turn_end') this.emit({ kind: 'status', state: 'ready' });
     }
   }
 
   send(text: string): void {
+    this.#pendingEchoes.push(normalizeNewlines(text));
     void this.#inject(text);
   }
 
@@ -337,7 +424,12 @@ export class TmuxTransport extends EventEmitterBase implements SessionTransport 
 
       await writeFile(tmp, text, { mode: 0o600 });  // 提示词可能含敏感内容
       await exec('tmux', ['load-buffer', '-b', bufName, tmp]);
-      await exec('tmux', ['paste-buffer', '-b', bufName, '-t', this.#target]);
+      // -p(bracketed paste):不加时 tmux 把 buffer 里的 LF 换成 CR 发给 pane
+      // (tmux(1) paste-buffer 的默认行为),claude TUI 把 CR 当提交键处理 ——
+      // 多行消息因此被拆成好几轮独立对话,转写文件里多出 queue-operation。
+      // -p 告诉已请求 bracketed paste 的应用"这是一次粘贴",内部换行保留
+      // 原样,不再触发提交(实测确认,见 spec §2.18)。
+      await exec('tmux', ['paste-buffer', '-p', '-b', bufName, '-t', this.#target]);
       await sleep(300);
       await keys('Enter');  // 必须与 paste 分开,合并调用不可靠
       this.emit({ kind: 'status', state: 'busy' });

@@ -24,6 +24,7 @@ import { mkdirSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
+import { randomUUID } from 'node:crypto';
 
 const SYNAPSE_DIR = join(homedir(), '.synapse');
 
@@ -84,11 +85,33 @@ export function readState(requestedPort: number): DaemonState | null {
   }
 }
 
+/**
+ * 不删 token —— 那是「这个端口的固定身份」,daemon.pid/port 才是「进程是否
+ * 还活着」的判定依据。restart 场景下旧进程退出时会调这个函数清场,不留
+ * token 的话下次启动只能重新生成,用户手里的链接(书签、浏览器历史)全部
+ * 失效。见 readOrCreateToken() —— 新进程启动时优先复用这份残留。
+ */
 export function clearState(requestedPort: number): void {
   const dir = stateDir(requestedPort);
-  for (const f of ['daemon.pid', 'port', 'token']) {
+  for (const f of ['daemon.pid', 'port']) {
     rmSync(join(dir, f), { force: true });
   }
+}
+
+/** 供 server.ts 启动时调用:同端口有残留 token 就复用,没有才新生成。 */
+export function readOrCreateToken(requestedPort: number): string {
+  const dir = stateDir(requestedPort);
+  const path = join(dir, 'token');
+  try {
+    const existing = readFileSync(path, 'utf8').trim();
+    if (existing) return existing;
+  } catch {
+    // 没有残留,走下面的新生成分支
+  }
+  const token = randomUUID();
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  writeFileSync(path, token, { mode: 0o600 });
+  return token;
 }
 
 /** signal 0 只做存在性检查,不投递信号。EPERM(进程存在但不归当前用户)同样算不健康。 */
@@ -175,6 +198,32 @@ async function waitForDaemon(port: number, waitMs: number): Promise<DaemonState>
   throw new Error(
     `后端启动超时(${waitMs / 1000}s)。手动排查:PORT=${port} node ${SERVER_ENTRY}`,
   );
+}
+
+/**
+ * 优雅终止:发 SIGTERM 走 server.ts 的 shutdown()(落盘会话状态、drain 挂起的
+ * 批准请求),而非直接 kill -9 —— 那会跳过 stopAll() 的收尾,sessions.json
+ * 里的运行时字段可能停在终止前一刻的脏值。
+ *
+ * 只停 daemon 本身,不碰它旁路观察的 tmux pane —— pane 里的 claude 进程
+ * 独立于 daemon 存活(见 tmuxTransport.ts stop() 的接管模式说明),
+ * 这正是「重启网页后端不影响正在进行的终端会话」的前提。
+ */
+export async function stopDaemon(port: number, waitMs = 10_000): Promise<'stopped' | 'not-running'> {
+  const state = readState(port);
+  if (!state || !pidAlive(state.pid)) {
+    if (state) clearState(port);
+    return 'not-running';
+  }
+
+  process.kill(state.pid, 'SIGTERM');
+
+  const deadline = Date.now() + waitMs;
+  while (Date.now() < deadline) {
+    if (!pidAlive(state.pid)) return 'stopped';
+    await new Promise((r) => setTimeout(r, 200));
+  }
+  throw new Error(`进程 ${state.pid} 在 ${waitMs / 1000}s 内未退出,可能卡在收尾逻辑里`);
 }
 
 export function urlFor(state: DaemonState): string {

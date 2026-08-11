@@ -124,7 +124,9 @@ claude 会给会话起一个语义化标题(即 `/resume` 列表里显示的那�
 { "type": "ai-title", "aiTitle": "查找login.js中硬编码密码的风险", "sessionId": "…" }
 ```
 
-实测:首轮对话后不久出现(样本中位于第 8 行 / 共 38 行),**同一标题会重复写入多次**且该行**没有 `uuid`**,躲不过按 uuid 的去重,需自行比对上次值。样本中标题在会话内未变化过。
+实测:首轮对话后不久出现(样本中位于第 8 行 / 共 38 行),**同一标题会重复写入多次**且该行**没有 `uuid`**,躲不过按 uuid 的去重,需自行比对上次值。
+
+**标题几乎不会随话题变化更新。** 大范围扫描本地转写文件(435 个有多次 `ai-title` 写入的会话)发现:约 98%(426/435)的标题内容自始至终未变,即使反复写入多次;仅有的 9 个真正换过标题的样本,每一个的第二次标题都伴随新出现的 `agent-name` 行 —— 即标题变化只发生在会话被 `Task` 工具(子代理)接管的场景,不是主话题内部自然漂移出新标题。`s.title = ev.title`(见 `sessionManager.ts` `#absorb` 的 `case 'title'`)本身能正确处理"标题变了"的情况,只是触发条件在实践中极少满足 —— 这是上游行为,不是本项目的解析缺陷,遇到"标题一直不变"不必怀疑传递链路。
 
 UI 用它区分同目录并存的会话 —— pane ID 能区分但不解释,标题才说明「这个会话在做什么」。标题与 `name`(目录名)并存而非覆盖,后者仍用于分组。
 
@@ -173,6 +175,62 @@ stream-json 管道没有显式的"本轮/本会话结束"事件可读 —— 转
 钩子是快路径,但覆盖不了 `kill -9`、直接关掉承载的 tmux pane 等场景 —— 那些情况下 Claude Code 自己也来不及发钩子。故 `SessionManager` 另起一个 4 秒间隔的存活巡检(`startLivenessWatch`)兜底,双通道都指向同一个 `#markExited`。
 
 `Stop` 事件也一并挂了钩子(见 §3.1),但目前只是占位放行,尚无消费逻辑。
+
+### 2.14 终端里直接按 Escape 中断,转写文件有痕迹但需专门识别
+
+`interrupt(localId)`(见 §4 SessionManager)处理的是网页发起的中断。tmux 接管模式下用户完全可以绕过网页、直接在承载的 pane 里按 Escape——这个动作不经过后端任何入口,只能靠转写文件事后感知。
+
+实测:CLI 会把中断写成一条 `type: "user"` 消息,`content` 是纯文本块而非 `tool_result`:
+
+```json
+{ "type": "user", "message": { "role": "user", "content": [{ "type": "text", "text": "[Request interrupted by user]" }] } }
+```
+
+工具调用中途被中断则是变体 `"[Request interrupted by user for tool use]"`。
+
+`parseTranscriptLineMulti` 原先的 `user` 分支只认数组里的 `tool_result` 块,这类纯文本块会被静默丢弃 —— 之后也不会再有 assistant 消息带来 `stop_reason` 触发的 `turn_end`(见 §2.9),会话因此永久卡在 `busy`。现改为识别这段固定前缀,直接产出 `{ kind: 'turn_end', interrupted: true }` 收尾;`sessionManager.ts` 据此把 `lastAction` 设为「已中断,等待输入」,与网页发起中断的文案统一。`interrupted` 标记只影响 `#absorb`(在线路径)的 `lastAction`,不进 `reduceEvent`/`ReplayTarget` 的 timeline —— 折叠渲染只需要轮次边界,中断与正常结束在这一层是同一件事(呼应 §2.11 对运行时态与可派生历史的区分)。
+
+StreamJsonTransport 无终端可供直接按键,中断只能经网页调用 `interrupt()`,不受此路径影响 —— 这条修复只对 `TmuxTransport` 的实时 tail 与历史重放生效,两者共用同一份 `parseTranscriptLineMulti`(见 §2.9)。
+
+### 2.15 终端里直接发下一轮 prompt,同样只能靠转写文件补分组边界
+
+与 §2.14 同一类问题的另一面:用户在 tmux pane 里不经网页、直接敲下一轮对话。`send()`(网页发送)会主动 `s.timeline.push({ kind: 'user', ... })`,但终端直接输入完全绕开这条代码路径,后端唯一能感知它的地方仍是转写文件。
+
+实测:正常用户输入的 `type: "user"` 行,`content` 是**纯字符串**,不是数组 —— `parseTranscriptLineMulti` 原先只在 `Array.isArray(c)` 分支产出事件,字符串分支直接落空 `return []`,连一个开新分组的信号都没有。后果:`renderTurns`(前端)靠 `kind: 'user'` 的 timeline 条目切分轮次,没有这个边界,新一轮的 assistant 文本与工具调用全部并入上一轮 —— 也就是这轮"结论"读起来混进了上一轮的过程里,除非手动滚动细看,否则界面上分不出两轮已经切换。
+
+字符串 `content` 并非都是真人敲的新一轮:同一路径也会承载会话摘要(`isCompactSummary`)、跨会话消息通知、queue 提醒等合成消息(`isMeta: true`),以及 CLI 内置 `!command` 的转写(`<bash-input>...</bash-input>` / `<bash-stdout>...`)。这些都不代表"新一轮对话开始",错误识别会把无关内容当结论插进时间线。故只在 `!d.isMeta && !c.startsWith('<bash-')` 时才产出 `{ kind: 'user', text: c }`。
+
+**自我回显的去重。** `TmuxTransport.send()` 本质是把文本粘贴进 pane 再回车,与用户手动敲键盘在 tmux 层面完全等价 —— 转写文件里产生的行没有任何字段能区分"这是网页注入的"还是"用户自己敲的"。不去重的话,网页发的每条消息会被识别两次:一次是 `send()` 主动 push,一次是 tail 读到转写文件里的回显、又经 `parseTranscriptLineMulti` 产出一次。`TmuxTransport` 因此维护一个 `#pendingEchoes` FIFO,`send()` 注入前记一笔,`#handleLine` 解析出 `user` 事件时先查这个队列、命中则消费掉不下发。
+
+`SessionEvent` 新增的 `user` kind 只服务这一条转写观测路径,`#absorb` 的运行时态 switch 没有对应 case(不需要,新一轮开始不改 `lastAction`/`state`,那些交给后续的 assistant/tool_use/turn_end 事件自然更新),但 `reduceEvent`(见 §2.10/2.11)与前端 `onSessionEvent` 都要接住它写入各自的 timeline —— 仍是两条归约路径必须对齐的老问题。
+
+### 2.16 后端重启后,tmux 接管会话默认全部判 exited —— 需要重新探活,且 paneId 本身可能缺失
+
+`#loadPersisted`(见 §2.11)早期实现无条件把所有历史记录标 `exited` 并挂 `NullTransport`,不检查对应的 tmux pane 是否其实还活着。`wrapper daemon restart`(见 §4 守护进程)让这个盲区第一次被实际触发到:重启纯粹是为了加载新代码,并不代表这些会话真的死了,但网页刷新后全部显示"已退出",体验上等同于"重启一次弄丢所有进行中的会话"。
+
+**修复分两层。** 运行时状态:`#reclaimTmuxSessions()` 在构造函数末尾异步跑,对 `transportKind === 'tmux'` 且有 `paneId` 的历史记录逐个 `paneExists()` 探测,还在就重建 `TmuxTransport`(带上已知 `sessionId`,定位转写文件不必猜)接回去,状态交给 `start()` 的正常流程 ——`#waitReady()` 探到 TUI 已就绪会很快返回,不是从头等首屏。构造函数本身不能是 `async`,故先同步把历史记录标 `exited` 让 `SessionManager` 立刻可用,这批会话的真实状态在随后几秒内异步纠正;存活巡检(`#sweep`)对 `state === 'exited'` 的会话直接跳过,不会跟这段异步重建产生竞态。
+
+**数据缺口:`paneId` 是后加的字段。** `PersistedSession` 起初没有 `paneId`(§2.11 落盘设计成型时,持久化只关心元数据统计,没考虑过要重新接管 pane)。补上字段后,新产生的记录会正确落盘,但**旧数据补不回来** —— 磁盘上已有的记录里这个字段就是不存在,`#loadPersisted` 读出来是 `undefined`,`#reclaimTmuxSessions` 因为没有 `paneId` 可用而直接跳过这些会话,继续显示 `exited`。
+
+手动改 `sessions.json` 补这个字段是条死路:只要还有一个跑着旧内存状态(没有 `paneId`)的进程,它下一次触发 `stopAll()`(`shutdown()` 收尾)或任何 `scheduleSave()`,就会用自己内存里的（缺字段的）快照同步覆盖磁盘,把手动补丁冲掉 —— 实测踩过,连续两次手动补丁都被冲掉,因为每次补完还得再重启一次才能让新数据被读到,而这次重启本身又会经过一次旧进程的 `stopAll`。
+
+**因此补全逻辑必须在代码里自己完成,不能依赖磁盘曾经存过这个字段。** `findClaimedPanes()`(`tmuxTransport.ts`)反查当前操作系统状态:`ps -eo pid,ppid,command` 全量扫描,用 `--session-id <uuid>` 定位每个 claude 进程,再沿 `ppid` 链向上爬直到匹配某个 tmux pane 的 `pane_pid`(claude 不是 pane 的直接子进程 ——`wrapper` 会先起一层 node 壳、``execClaude`` 再 spawn claude,中间隔着至少一层),建立 `sessionId -> paneId` 的映射。`#reclaimTmuxSessions()` 对 `paneId` 缺失但有 `claudeId` 的候选记录,先用这份映射补一次,查到就顺手写回 `s.paneId`,随后 `scheduleSave()` 落盘 —— 只需要反查这一次,之后的重启直接读磁盘上已经补全的数据,不必每次都重新扫描进程表。
+
+### 2.17 左栏排序固定,不随会话状态跳动
+
+早期实现里 project 与 session 的排序都掺了 `sessionRank`(需要你/进行中/静默):project 按 `min(rank)` 排,组内 session 按 `rank` 再按 `lastActivity` 倒序排。代价是顺序随时间不断改变 —— 一个会话变 busy、来一条批准请求、或者单纯有了新动态,所在的 project 与 session 位置就会跳,常用会话在列表里"眼疾手快"才找得到。
+
+改为固定排序:project 纯字母序(`localeCompare`),session 按 `createdAt`(创建时间,旧到新)排序,两者都不再受 `rank` 影响位置。`rank` 仍然保留,只用于 `attn` class(project header 高亮)与 `pip` 颜色这类纯视觉提示,不参与排序比较函数。
+
+`createdAt` 是本次新增字段,贯穿 `Session`/`SessionSummary`/`PersistedSession` 三层。旧数据(升级前落盘的记录)没有这个字段,`#loadPersisted` 用 `p.createdAt ?? p.lastActivity` 兜底顶替 —— 不精确(旧会话的"创建时间"实际是它最后一次活动的时间),但保证有排序依据而不是 `undefined` 参与比较导致顺序不确定。新建的会话从 `create()` 起就有准确的 `createdAt`,不受此影响。
+
+### 2.18 网页发消息与终端回显对不上换行符,导致重复消息
+
+`TmuxTransport.send()` 用 `#pendingEchoes` FIFO 消化自己的回显(见 §2.15),精确字符串匹配比对注入文本与转写文件里读回的文本。多行消息(网页 textarea 用 Shift+Enter 换行)会命中一个换行符不一致的坑:
+
+实测转写文件:`claude` 收到粘贴内容后,把消息内部的换行符**落盘成 `\r`**(如 `"...状态\r从 Manila API..."`),而网页 `<textarea>` 的 `value` 里 Shift+Enter 产生的是标准 `\n`。`send()` 传入 `#pendingEchoes` 的是原始 `\n` 版本,`#handleLine` 从转写文件解析出的 `ev.text` 是 `\r` 版本,`indexOf` 精确匹配永远不命中 —— 回显消不掉,`emit(ev)` 照常发出,叠加前端自己已经通过 `user_message` 展示的那条,网页上同一条多行消息显示两遍。单行消息不受影响(没有换行符可比对,天然一致)。
+
+修复:比对前对两侧都过一遍 `normalizeNewlines()`(`\r\n?` 统一换成 `\n`)。`#inject()` 实际写入 tmux 的仍是原始 `text` —— 归一化只用于回显比对这一步,不改动真正注入的字节内容。
 
 ---
 
@@ -287,6 +345,20 @@ stream-json 管道没有显式的"本轮/本会话结束"事件可读 —— 转
 状态目录按**请求端口**(调用方想要的目标端口,不是最终实际监听到的端口)分区。这是 Project List 落地后才有的需求:不同 workspace 下开 `wrapper` 不传 `--port` 时,都落在同一默认值上,天然复用同一个生产 daemon(`ensureDaemon()` 的健康检查通过就直接复用)—— Project List 能跨 workspace 聚合会话,前提正是这些会话本就活在同一个后端实例里。测试环境传入不同端口,则状态目录、daemon 实例、`sessions.json` 三者都完全隔离,不会读到/污染生产状态。
 
 显式指定端口时**不允许递增重试**,占用即报错退出;只有默认端口才走原有的递增容错(`MAX_PORT_TRIES`)。这不是随意选择 —— 状态目录用「请求端口」命名的前提是它必须等于「实际监听端口」,否则下次启动按请求端口去读状态目录,读到的 `port` 字段会跟真实监听地址对不上,健康检查看着像活的,实际连不上。默认端口允许偏移是因为此时没人会显式记住"我要的是哪个端口",复用逻辑本就是"矬子里拔将军"——先看有没有活的,没有就在默认值附近另起一个。
+
+**`wrapper daemon <status|restart|stop>` 子命令。** 改完后端代码想让它生效,原先只能手动 `kill` 旧进程再随便跑一次 `wrapper` 触发 `ensureDaemon()` 的自愈——容易漏步骤(比如忘了确认旧进程真退出就拉新的,或者 kill -9 跳过收尾)。三个子命令都基于既有的 `readState`/`checkHealth`/`ensureDaemon`,不是另起一套逻辑:
+
+- `status` — 读状态文件 + 健康检查,报告运行中/陈旧/未运行
+- `stop` — 发 `SIGTERM`(而非 `SIGKILL`)给 daemon 进程,轮询 PID 消失确认退出。`SIGTERM` 触发 `server.ts` 的 `shutdown()`,走 `stopAll()` 收尾(会话状态落盘、drain 挂起的批准请求),direct kill -9 会跳过这些
+- `restart` = `stop` 后接 `ensureDaemon()`
+
+**重启 daemon 不影响正在跑的 claude 会话。** daemon 只是 tmux pane 的旁路观察者(见 §2.5「接管模式下 `stop()` 无论如何都不销毁 pane」),`wrapper daemon restart` 只终止/拉起后端进程本身,不碰任何 pane 或其中的 claude 进程。网页 WebSocket 连接会短暂断开(daemon 重启期间),刷新页面后重新连上;这段空窗期内若 claude 恰好发起需要批准的工具调用,钩子请求会打空 —— 按 §2.3 是 fail-open,工具照常执行,不算安全风险(重启是本机操作者主动发起的)。
+
+**token 跨 restart 复用,不必换链接。** `AUTH_TOKEN` 原先每次进程启动都 `randomUUID()`(§6 的安全设计:token 不因绑定本机而形同虚设),但这让 `wrapper daemon restart` ——一个纯粹为了加载新代码、不代表用户想切身份的操作——也附带地址失效的副作用,浏览器书签、终端历史里存的链接全部作废。改为 `daemon.ts` 的 `readOrCreateToken()`:同请求端口的状态目录下若已有 `token` 文件就复用,没有才新生成;`clearState()` 相应地只删 `daemon.pid`/`port`,不再删 `token`(那两个字段才是「进程是否存活」的判定依据,token 只是凭据值,没有这层语义)。`shutdown()` 里的 `clearState(PORT)` 因此不会带走 token,新进程启动时能读到旧值。
+
+只有两种情况 token 仍会变:全新状态目录(首次启动,没有残留文件)、或磁盘 token 文件被手动删过。`wrapper daemon restart` 的输出因此从「token 已刷新」改为中性的「网页链接」,仍然打印出来兜底,而不是承诺"一定不变"。
+
+实测(独立测试端口,不碰生产实例):`status` 对陈旧状态文件(PID 已死)正确报告「陈旧」而非「未运行」;`restart` 对陈旧状态走 `not-running` 分支直接拉新,对健康实例先打印「已停止旧进程」再拉新,新旧 PID 确认不同,token 前后一致;`stop` 幂等,重复调用不报错。
 
 ### SessionTransport(抽象)
 

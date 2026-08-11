@@ -15,7 +15,9 @@ import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { existsSync, statSync, realpathSync } from 'node:fs';
 import { resolve, basename } from 'node:path';
-import { ensureDaemon, urlFor, HOST, DEFAULT_PORT } from '../backend/daemon.ts';
+import {
+  ensureDaemon, stopDaemon, readState, checkHealth, urlFor, HOST, DEFAULT_PORT,
+} from '../backend/daemon.ts';
 import { TmuxTransport } from '../backend/tmuxTransport.ts';
 
 const c = {
@@ -100,6 +102,7 @@ export async function main(argv: string[]): Promise<void> {
   if (argv[0] === '-h' || argv[0] === '--help') {
     console.log(`
 用法: wrapper [目录] [--port <端口>]
+      wrapper daemon <status|restart|stop> [--port <端口>]
 
   在当前 tmux pane 里启动 claude,同时接入网页端监管。
   目录默认为当前目录;后端未运行时自动以守护进程拉起。
@@ -110,7 +113,16 @@ export async function main(argv: string[]): Promise<void> {
   传一个不同的端口即可,两边状态完全隔离。
 
   需在 tmux 会话中运行 —— 后端通过 pane 观察与注入。
+
+  daemon status   查看后端是否在跑、PID/端口
+  daemon restart  优雅重启(改完代码后用这个加载新版本,不影响已在跑的 claude 会话)
+  daemon stop     只停止,不重新拉起
 `);
+    return;
+  }
+
+  if (argv[0] === 'daemon') {
+    await daemonCmd(argv.slice(1));
     return;
   }
 
@@ -167,6 +179,47 @@ export async function main(argv: string[]): Promise<void> {
 
   // 交棒:用 claude 替换本进程,用户拿到的就是原生 TUI,退出即退出
   execClaude(dir, settingsPath, sessionId);
+}
+
+/**
+ * daemon 子命令 —— 独立于「拉起 claude」的主流程,只管后端本身的生命周期。
+ * restart 不影响已在跑的 tmux 会话:daemon 只是旁路观察者,pane 里的 claude
+ * 进程独立于它存活(见 tmuxTransport.ts stop() 的接管模式说明)。改完后端
+ * 代码后用它加载新版本,比手动 kill + 重新执行 wrapper 更不容易漏步骤。
+ */
+async function daemonCmd(argv: string[]): Promise<void> {
+  // parseArgv 把非 --port 的位置参数当「目录」摘出来,子命令名恰好落在同一个槽位。
+  const { dir: sub, port } = parseArgv(argv);
+
+  if (sub === 'status') {
+    const state = readState(port);
+    if (!state) { console.log(`${c.dim('○')} 端口 ${port}: 未运行`); return; }
+    const healthy = await checkHealth(state);
+    const mark = healthy ? c.blue('●') : c.red('✗');
+    const label = healthy ? '运行中' : '陈旧(PID 或 HTTP 探活未过)';
+    console.log(`${mark} 端口 ${state.port}: ${label} (PID ${state.pid})`);
+    if (healthy) console.log(c.dim(urlFor(state)));
+    return;
+  }
+
+  if (sub === 'stop') {
+    const result = await stopDaemon(port).catch((err) => die(String(err?.message ?? err)));
+    console.log(result === 'stopped' ? `${c.blue('●')} 已停止` : `${c.dim('○')} 本就没在跑`);
+    return;
+  }
+
+  if (sub === 'restart') {
+    const before = await stopDaemon(port).catch((err) => die(String(err?.message ?? err)));
+    if (before === 'stopped') console.log(`${c.dim('…')} 已停止旧进程,正在拉起新的`);
+    const state = await ensureDaemon(port).catch((err) => die(String(err?.message ?? err)));
+    // token 通常跟前一次相同(daemon.ts readOrCreateToken 复用磁盘残留),
+    // 但仍打印链接兜底 —— 全新状态目录、或磁盘 token 文件被手动清过时会拿到新值。
+    console.log(`${c.blue('●')} 端口 ${state.port} 已就绪 (PID ${state.pid})`);
+    console.log(`${c.dim('网页链接:')}\n${urlFor(state)}`);
+    return;
+  }
+
+  die(`未知子命令: ${sub ?? '(缺失)'} —— 可用: status / restart / stop`);
 }
 
 /**
