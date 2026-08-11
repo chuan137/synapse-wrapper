@@ -31,6 +31,11 @@ const state = {
   collapsedProjects: loadCollapsed(),
   draftQueue: new Map(), // localId -> string[],会话忙碌时攒的待发 prompt(纯前端,不持久化)
   pinBottom: false,      // 下次 renderDetail 是否无条件贴底(切会话/切页签/刚发消息)
+  // toolUseId -> { [qi]: { oi: Set<number|'other'>, other: string } }
+  // 卡住超过 20s 后每 5s 的检测重绘会整体重建 DOM(见 renderDetail),
+  // AskUserQuestion 的选中项/"其他"输入原本只存在 DOM 属性上,重绘就丢。
+  // 提到 state 里,渲染时回填,交互时同步写回。
+  pendingAnswers: new Map(),
 };
 
 // ── 工具函数 ────────────────────────────────────────────────
@@ -206,6 +211,7 @@ function connect() {
 
       case 'approval_resolved':
         state.pending.delete(m.toolUseId);
+        state.pendingAnswers.delete(m.toolUseId);
         renderAll();
         break;
 
@@ -739,7 +745,7 @@ function approvalCard(a, showSession) {
   const why = a.risk
     ? `<div class="c-why ${a.risk.level === 'medium' ? 'medium' : ''}">${esc(a.risk.text)}</div>` : '';
   const isQuestion = a.toolName === 'AskUserQuestion';
-  const body = isQuestion ? renderQuestions(a.toolInput) : `<div class="c-cmd">${renderCmd(a.summary, a.risk)}</div>`;
+  const body = isQuestion ? renderQuestions(a.toolInput, a.toolUseId) : `<div class="c-cmd">${renderCmd(a.summary, a.risk)}</div>`;
   // AskUserQuestion 没有「批准/拒绝」这个执行层面的选择,钩子协议也不支持带着
   // 结构化答案放行工具调用 —— 提交答案的唯一路径是 deny + reason(见 server.ts)。
   const actions = isQuestion
@@ -763,12 +769,16 @@ function approvalCard(a, showSession) {
   </div>`;
 }
 
-function renderQuestions(toolInput) {
+function renderQuestions(toolInput, toolUseId) {
   const questions = Array.isArray(toolInput?.questions) ? toolInput.questions : [];
   if (!questions.length) return `<div class="c-cmd">${esc(JSON.stringify(toolInput ?? {}))}</div>`;
 
+  const saved = state.pendingAnswers.get(toolUseId);
+
   return questions.map((q, qi) => {
     const options = Array.isArray(q.options) ? q.options : [];
+    const sel = saved?.[qi]?.oi ?? new Set();
+    const otherText = saved?.[qi]?.other ?? '';
     return `<div class="qblock" data-qi="${qi}" data-multi="${q.multiSelect ? '1' : ''}">
       <div class="qhead">
         ${q.header ? `<span class="qtag">${esc(q.header)}</span>` : ''}
@@ -776,15 +786,15 @@ function renderQuestions(toolInput) {
       </div>
       <div class="qtext">${esc(q.question ?? '')}</div>
       <div class="qopts">
-        ${options.map((o, oi) => `<div class="qopt" data-oi="${oi}" data-label="${esc(o.label ?? '')}">
-          <span class="qmark">${q.multiSelect ? '☐' : '○'}</span>
+        ${options.map((o, oi) => `<div class="qopt" data-oi="${oi}" data-label="${esc(o.label ?? '')}" ${sel.has(oi) ? 'data-selected="1"' : ''}>
+          <span class="qmark">${q.multiSelect ? (sel.has(oi) ? '☑' : '☐') : (sel.has(oi) ? '●' : '○')}</span>
           <span class="qopt-body"><span class="qlabel">${esc(o.label ?? '')}</span>${o.description ? `<span class="qdesc">${esc(o.description)}</span>` : ''}</span>
         </div>`).join('')}
-        <div class="qopt qopt-other" data-oi="other">
-          <span class="qmark">${q.multiSelect ? '☐' : '○'}</span>
+        <div class="qopt qopt-other" data-oi="other" ${sel.has('other') ? 'data-selected="1"' : ''}>
+          <span class="qmark">${q.multiSelect ? (sel.has('other') ? '☑' : '☐') : (sel.has('other') ? '●' : '○')}</span>
           <span class="qopt-body">
             <span class="qlabel">其他</span>
-            <input class="qother-input" type="text" placeholder="输入你自己的答案" />
+            <input class="qother-input" type="text" placeholder="输入你自己的答案" value="${esc(otherText)}" />
           </span>
         </div>
       </div>
@@ -793,14 +803,27 @@ function renderQuestions(toolInput) {
 }
 
 /**
- * 选中态存在 DOM(data-selected)上,提交时直接读取,不额外维护 state。
+ * 选中态存在 DOM(data-selected)上,提交时直接读取;同时镜像一份进
+ * state.pendingAnswers —— 卡住检测每 5s 可能触发 renderDetail 整体重建
+ * DOM(见 state.pendingAnswers 声明处注释),没有这份镜像重建后就白填。
  *
  * "其他"是自由输入行,选中态跟着输入框内容走而非点击态 —— 有文字才算
  * 选中,清空即取消,不需要用户额外点一下"取消选择"。
  */
 function wireQuestionPicker(card) {
+  const tuid = card.dataset.tuid;
   const submit = card.querySelector('[data-act="answer"]');
   const anySelected = () => card.querySelector('.qopt[data-selected]') != null;
+
+  const syncBlock = (block) => {
+    const qi = Number(block.dataset.qi);
+    const oi = new Set([...block.querySelectorAll('.qopt[data-selected]')]
+      .map((o) => (o.dataset.oi === 'other' ? 'other' : Number(o.dataset.oi))));
+    const other = block.querySelector('.qother-input')?.value ?? '';
+    const answers = state.pendingAnswers.get(tuid) ?? {};
+    answers[qi] = { oi, other };
+    state.pendingAnswers.set(tuid, answers);
+  };
 
   for (const block of card.querySelectorAll('.qblock')) {
     const multi = block.dataset.multi === '1';
@@ -822,6 +845,7 @@ function wireQuestionPicker(card) {
         }
         selectOpt(opt, multi ? opt.dataset.selected == null : true);
         if (submit) submit.disabled = !anySelected();
+        syncBlock(block);
       };
 
       if (input) {
@@ -835,6 +859,7 @@ function wireQuestionPicker(card) {
           }
           selectOpt(opt, has);
           if (submit) submit.disabled = !anySelected();
+          syncBlock(block);
         };
       }
     }
