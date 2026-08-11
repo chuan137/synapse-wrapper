@@ -7,3 +7,4 @@ node_modules/
 !bin/
 bin/*
 !bin/wrapper.ts
+!bin/wrapper
