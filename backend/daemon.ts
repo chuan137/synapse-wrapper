@@ -20,7 +20,7 @@
  * 单看 HTTP 又会把非本工具的服务当成自己人。
  */
 import { spawn } from 'node:child_process';
-import { mkdirSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdirSync, readFileSync, writeFileSync, rmSync, openSync, statSync, renameSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
@@ -169,18 +169,44 @@ export async function ensureDaemon(port = DEFAULT_PORT, waitMs = 20_000): Promis
   return waitForDaemon(port, waitMs);
 }
 
+const LOG_ROTATE_BYTES = 5 * 1024 * 1024;
+
 /**
- * 后台拉起后端。detached + stdio ignore + unref 三者缺一不可:
- * 少了任何一个,CLI 退出(或它 attach 的 tmux 结束)都会带走后端。
+ * daemon.log 不随 clearState 清空(见其注释,restart 要留痕以便事后排查),
+ * 长期挂着跑会无限增长 —— 超过阈值就滚一份 .old,旧的 .old 直接覆盖,
+ * 不需要更复杂的多代保留。
+ */
+function rotateLogIfLarge(path: string): void {
+  try {
+    if (statSync(path).size > LOG_ROTATE_BYTES) renameSync(path, `${path}.old`);
+  } catch {
+    // 文件不存在(首次启动)—— 无需处理
+  }
+}
+
+/**
+ * 后台拉起后端。detached + unref 缺一不可:少了任何一个,CLI 退出
+ * (或它 attach 的 tmux 结束)都会带走后端。stdio 曾经是 'ignore',
+ * 但 daemon 模式下这样会让所有 console.error/log 静默消失 ——
+ * 排查 TUI 启动超时这类问题时无从下手。改成落盘到状态目录同级的
+ * daemon.log,复用 stateDir 的按端口隔离(测试端口不污染生产日志)。
  */
 function spawnDaemon(port: number): void {
+  const dir = stateDir(port);
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  const logPath = join(dir, 'daemon.log');
+  rotateLogIfLarge(logPath);
+  // 启动横幅会把 token 明文拼进 URL 打印(见 server.ts)—— 日志文件
+  // 因此等价于存了一份凭据副本,权限必须跟 token/sessions.json 一样收紧。
+  const logFd = openSync(logPath, 'a', 0o600);
+
   const child = spawn(
     process.execPath,
     ['--disable-warning=ExperimentalWarning', SERVER_ENTRY],
     {
       cwd: ROOT,
       detached: true,
-      stdio: 'ignore',
+      stdio: ['ignore', logFd, logFd],
       env: { ...process.env, SYNAPSE_DAEMON: '1', PORT: String(port) },
     },
   );
