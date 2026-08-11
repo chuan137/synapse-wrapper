@@ -224,9 +224,12 @@ export class TmuxTransport extends EventEmitterBase implements SessionTransport 
   async #waitReady(timeoutMs = 45_000): Promise<void> {
     const deadline = Date.now() + timeoutMs;
     let nudged = 0;
+    let last: Awaited<ReturnType<typeof this.capture>> = { ok: true, screen: '' };
 
     while (Date.now() < deadline) {
-      const screen = await this.capture();
+      last = await this.capture();
+      if (!last.ok) { await sleep(1000); continue; }
+      const screen = last.screen;
 
       // 信任对话框的选项前也带 ❯,必须在就绪判断之前识别,
       // 否则提示词会被粘进对话框而丢失。
@@ -246,7 +249,13 @@ export class TmuxTransport extends EventEmitterBase implements SessionTransport 
       await sleep(1000);
     }
 
-    this.emit({ kind: 'error', message: 'TUI 启动超时 —— 可能需手动处理(登录或信任提示)' });
+    // 带上最后一次实际抓到的现场(哪怕是空屏或抓屏失败原因),
+    // 否则复现时只有一句笼统提示,无从判断是卡在哪种屏幕状态。
+    const evidence = last.ok
+      ? `末次屏幕内容:${JSON.stringify(last.screen.slice(0, 500))}`
+      : `末次抓屏失败:${last.error}`;
+    console.error(`[tmux] #waitReady 超时(target=${this.#target})。${evidence}`);
+    this.emit({ kind: 'error', message: `TUI 启动超时 —— 可能需手动处理(登录或信任提示)` });
   }
 
   /** 状态栏标明身份与退出方式,否则 attach 进来看不出这是什么会话。 */
@@ -451,12 +460,17 @@ export class TmuxTransport extends EventEmitterBase implements SessionTransport 
   }
 
   /** 屏幕内容,供网页显示终端镜像。 */
-  async capture(): Promise<string> {
+  /**
+   * 抓屏失败(target 已消失、tmux 未就绪等)与"屏幕内容为空"必须能区分 ——
+   * 混为一谈时 #waitReady 会拿着假的空屏幕死等到超时,报错信息也无从
+   * 说明真实原因。调用方按 ok 分支处理,不靠字符串是否为空判断。
+   */
+  async capture(): Promise<{ ok: true; screen: string } | { ok: false; error: string }> {
     try {
       const { stdout } = await exec('tmux', ['capture-pane', '-t', this.#target, '-p']);
-      return stdout;
-    } catch {
-      return '';
+      return { ok: true, screen: stdout };
+    } catch (err) {
+      return { ok: false, error: err instanceof Error ? err.message : String(err) };
     }
   }
 
