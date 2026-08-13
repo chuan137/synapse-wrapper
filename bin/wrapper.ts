@@ -98,10 +98,27 @@ function parseArgv(argv: string[]): { dir: string | undefined; port: number } {
   return { dir: rest[0], port };
 }
 
+/**
+ * wrapper 总是自带 --session-id(会话归属必须由调用方指定,见 §2.6),
+ * 但 claude CLI 规定 --session-id 与 --continue/--resume 同时出现时
+ * 必须再加 --fork-session,否则直接报错拒绝启动。
+ *
+ * 不能省略 --session-id 来避让这条限制:那样 claude 会继续写回旧会话的
+ * 转写文件,而后端已经用新生成的 UUID 注册了这个会话 —— 转写路径对不上,
+ * 批准请求无处路由。故自动补 --fork-session,让 resume 的历史被复制到
+ * 新会话里延续,新内容仍落在 wrapper 注册的那个 UUID 下。
+ */
+function withForkSession(claudeArgs: string[]): string[] {
+  const wantsResume = claudeArgs.some((a) =>
+    a === '-c' || a === '--continue' || a === '-r' || a === '--resume' || a.startsWith('--resume='));
+  if (!wantsResume || claudeArgs.includes('--fork-session')) return claudeArgs;
+  return [...claudeArgs, '--fork-session'];
+}
+
 export async function main(argv: string[]): Promise<void> {
   if (argv[0] === '-h' || argv[0] === '--help') {
     console.log(`
-用法: wrapper [目录] [--port <端口>]
+用法: wrapper [目录] [--port <端口>] [-- <claude 参数...>]
       wrapper daemon <status|restart|stop> [--port <端口>]
 
   在当前 tmux pane 里启动 claude,同时接入网页端监管。
@@ -111,6 +128,12 @@ export async function main(argv: string[]): Promise<void> {
   不同 workspace 下不传 --port 会连到同一个后端 —— 这是 Project List 能跨
   workspace 聚合会话的前提。测试环境想避免和日常使用的实例混在一起,
   传一个不同的端口即可,两边状态完全隔离。
+
+  -- 之后的参数原样透传给 claude CLI(如 --model、--mcp-config 等),
+  wrapper 自身不解析;--settings 与 --session-id 已由 wrapper 管理,重复传入会被
+  claude 自己的参数解析覆盖或报错。传入 --continue/-c 或 --resume/-r 时
+  wrapper 会自动补上 --fork-session(claude 的强制要求),历史对话会被复制到
+  新会话延续,而不是接着写回旧会话的转写文件。
 
   需在 tmux 会话中运行 —— 后端通过 pane 观察与注入。
 
@@ -126,7 +149,11 @@ export async function main(argv: string[]): Promise<void> {
     return;
   }
 
-  const { dir: dirArg, port } = parseArgv(argv);
+  const sepIdx = argv.indexOf('--');
+  const ownArgv = sepIdx === -1 ? argv : argv.slice(0, sepIdx);
+  const claudeArgs = sepIdx === -1 ? [] : withForkSession(argv.slice(sepIdx + 1));
+
+  const { dir: dirArg, port } = parseArgv(ownArgv);
   const given = resolve(dirArg ?? process.cwd());
   if (!existsSync(given) || !statSync(given).isDirectory()) die(`目录不存在: ${given}`);
 
@@ -178,7 +205,7 @@ export async function main(argv: string[]): Promise<void> {
   console.log(`${c.blue('●')} ${c.bold(basename(dir))} · 网页端 ${c.dim(urlFor(state))}\n`);
 
   // 交棒:用 claude 替换本进程,用户拿到的就是原生 TUI,退出即退出
-  execClaude(dir, settingsPath, sessionId);
+  execClaude(dir, settingsPath, sessionId, claudeArgs);
 }
 
 /**
@@ -229,11 +256,12 @@ async function daemonCmd(argv: string[]): Promise<void> {
  * 否则 claude 退出后用户会莫名回到 wrapper 而不是 shell。
  * Node 没有 execve,用 spawn + stdio inherit 后透传退出码是最接近的等价物。
  */
-function execClaude(cwd: string, settingsPath: string, sessionId: string): void {
-  const child = spawn('claude', ['--settings', settingsPath, '--session-id', sessionId], {
-    cwd,
-    stdio: 'inherit',
-  });
+function execClaude(cwd: string, settingsPath: string, sessionId: string, extraArgs: string[]): void {
+  const child = spawn(
+    'claude',
+    ['--settings', settingsPath, '--session-id', sessionId, ...extraArgs],
+    { cwd, stdio: 'inherit' },
+  );
 
   child.on('error', (err) => {
     die(`无法启动 claude: ${err.message}`);
