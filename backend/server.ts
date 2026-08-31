@@ -14,7 +14,10 @@ import { existsSync, statSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { SessionManager, replayTranscriptTimeline, mergedTodos, type ManagerEvent } from './sessionManager.ts';
 import { PermissionEngine, HOOK_TIMEOUT_S, type PendingApproval } from './permissions.ts';
-import { writeState, clearState, readOrCreateToken, DEFAULT_PORT, MAX_PORT_TRIES } from './daemon.ts';
+import {
+  writeState, clearState, readOrCreateToken, writeHookSettings, hookSettingsPath,
+  DEFAULT_PORT, MAX_PORT_TRIES,
+} from './daemon.ts';
 
 const HOST = '127.0.0.1';
 /** 显式通过 PORT 环境变量指定过端口,还是用的默认值 —— 决定要不要允许递增重试。 */
@@ -39,7 +42,9 @@ const AUTH_TOKEN = readOrCreateToken(PORT);
  */
 let activePort = PORT;
 
-const manager = new SessionManager(HOST, () => activePort, PORT);
+// hook 配置文件路径可提前推导(仅依赖请求端口),文件本身在 listenWithRetry
+// 里等实际监听端口确定后才写。会话启动都在监听成功之后,读到的一定是新版本。
+const manager = new SessionManager(PORT, hookSettingsPath(PORT));
 const permissions = new PermissionEngine();
 const stopLivenessWatch = manager.startLivenessWatch();
 
@@ -315,6 +320,9 @@ function listenWithRetry(port: number, triesLeft: number): void {
     activePort = port;
 
     writeState(PORT, { pid: process.pid, port, token: AUTH_TOKEN });
+    // 钩子 URL 必须用实际监听端口(port),不是请求端口(PORT)——
+    // 默认端口被占用递增后二者不等,写错等同 fail-open(见 §2.3/§6)。
+    writeHookSettings(PORT, port);
 
     console.log(`\n  Synapse Wrapper`);
     console.log(`  钩子超时: ${HOOK_TIMEOUT_S}s(后端 fail-closed 兜底更短)`);

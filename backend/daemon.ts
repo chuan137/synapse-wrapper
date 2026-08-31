@@ -25,6 +25,7 @@ import { join, resolve } from 'node:path';
 import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
+import { HOOK_TIMEOUT_S } from './permissions.ts';
 
 const SYNAPSE_DIR = join(homedir(), '.synapse');
 
@@ -47,6 +48,52 @@ export interface DaemonState {
 /** 导出供 store.ts 用 —— 会话持久化跟着 daemon 实例走,同一状态目录同一份数据。 */
 export function stateDir(requestedPort: number): string {
   return join(SYNAPSE_DIR, String(requestedPort));
+}
+
+/**
+ * PreToolUse hook 的拦截范围。`*` 会连读操作也拦下网页审批,且拦截发生在
+ * Claude Code 内置权限判断之前(实测:hook 无条件触发)。默认收窄到
+ * AskUserQuestion —— 主动提问上网页,其余工具交回内置权限系统。
+ * 需要恢复全量监管时改回 '*'。
+ */
+const ENABLE_FULL_APPROVAL = false;
+const APPROVAL_MATCHER = ENABLE_FULL_APPROVAL ? '*' : 'AskUserQuestion';
+
+/**
+ * daemon 级的 hook 配置文件路径。所有会话共用一份 —— 内容只是后端 URL 与
+ * 固定 matcher,唯一的变量是端口,而端口本就是状态目录的分区键。
+ * claude 的 --settings 是叠加而非覆盖(实测 + 官方文档):此文件只贡献
+ * hooks,与各 workspace 自己的 .claude/settings*.json 按事件名 + matcher
+ * 求并集,故不必把用户的 model/permissions 拷进来,也不碰用户的仓库文件。
+ */
+export function hookSettingsPath(requestedPort: number): string {
+  return join(stateDir(requestedPort), 'hooks.settings.json');
+}
+
+/**
+ * 写入 daemon 级 hook 配置。必须在 server.ts 确定「实际监听端口」之后调用 ——
+ * 钩子 URL 里的端口写错等同 fail-open(见 §2.3/§6),所有工具无审批执行。
+ * daemon 每次启动都重写一遍(幂等),顺带处理默认端口偶尔因占用而偏移的情况。
+ */
+export function writeHookSettings(requestedPort: number, actualPort: number): string {
+  const path = hookSettingsPath(requestedPort);
+  const hookEntry = {
+    type: 'http' as const,
+    url: `http://${HOST}:${actualPort}/api/claude-event`,
+    // 显式设短于默认 600s。真正的兜底在 permissions.ts:
+    // 钩子自然超时 = 放行(实测),绝不能依赖它。
+    timeout: HOOK_TIMEOUT_S,
+  };
+  const settings = {
+    hooks: {
+      PreToolUse: [{ matcher: APPROVAL_MATCHER, hooks: [hookEntry] }],
+      Stop: [{ hooks: [hookEntry] }],
+      SessionEnd: [{ matcher: '*', hooks: [hookEntry] }],
+    },
+  };
+  mkdirSync(stateDir(requestedPort), { recursive: true, mode: 0o700 });
+  writeFileSync(path, JSON.stringify(settings, null, 2), { mode: 0o600 });
+  return path;
 }
 
 /** 后端就绪后调用,把连接信息交给 CLI。requestedPort 决定落盘目录,见文件头注释。 */

@@ -1,7 +1,8 @@
 /**
  * SessionManager —— 管理多个工作区会话。
  *
- * 每个会话:一个 SessionTransport 实例 + 独立的 settings 文件 + 累积的活动记录。
+ * 每个会话:一个 SessionTransport 实例 + 累积的活动记录。hook 配置不再逐会话
+ * 写入工作区,改由 daemon.ts 写一份 daemon 级文件,各会话经 --settings 共用。
  * 按 Claude Code 分配的 session_id 建索引,供权限引擎与 WebSocket 路由使用。
  *
  * 注意会话 ID 有两个:
@@ -10,25 +11,16 @@
  * 钩子到达时只有 claudeId,故需维护 claudeId -> localId 的映射。
  */
 import { randomUUID } from 'node:crypto';
-import { writeFileSync, mkdirSync, readFileSync, existsSync } from 'node:fs';
-import { join, basename } from 'node:path';
+import { basename } from 'node:path';
 import { StreamJsonTransport } from './streamJson.ts';
 import { TmuxTransport, findClaimedPanes } from './tmuxTransport.ts';
-import { HOOK_TIMEOUT_S } from './permissions.ts';
 import { summarizeInput } from './risk.ts';
 import { transcriptPathFor, replayTranscript } from './transcript.ts';
 import { loadSessions, SessionStore } from './store.ts';
 import type { SessionEvent, SessionTransport } from './transport.ts';
 
-/**
- * PreToolUse hook 的拦截范围。`*` 会连读操作也拦下网页审批,
- * 且拦截发生在 Claude Code 内置权限判断之前,内置 allow 规则/权限模式全部失效
- * (实测确认:hook 无条件触发,不是内置引擎判断"需要询问"后才转发)。
- * 默认收窄到 AskUserQuestion —— 保留主动提问上网页,把其余工具还给内置权限系统。
- * 需要恢复全量监管时改回 '*' 即可。
- */
-const ENABLE_FULL_APPROVAL = false;
-const APPROVAL_MATCHER = ENABLE_FULL_APPROVAL ? '*' : 'AskUserQuestion';
+// hook 配置(matcher / 拦截范围 / 后端 URL)现由 daemon.ts 统一写一份
+// daemon 级文件,所有会话经 --settings 共用 —— 见 daemon.ts writeHookSettings。
 
 export type SessionState = 'starting' | 'ready' | 'busy' | 'waiting' | 'exited';
 
@@ -163,7 +155,7 @@ export interface Session {
   transportKind: TransportKind;
   tmuxName: string | null;
   paneId: string | null;
-  /** 注入了钩子的 settings 文件,CLI 启动 claude 时要用 --settings 指向它。 */
+  /** daemon 级 hook 配置文件,CLI / transport 启动 claude 时用 --settings 指向它。 */
   settingsPath: string;
   turns: number;
   costUsd: number;
@@ -424,19 +416,19 @@ export class SessionManager {
   #sessions = new Map<string, Session>();
   #byClaudeId = new Map<string, string>();
   #listeners: ((e: ManagerEvent) => void)[] = [];
-  #port: () => number;
-  #host: string;
+  #hookSettingsPath: string;
   #store: SessionStore;
 
   /**
-   * port 是取函数而非定值 —— 监听时可能因占用递增,钩子 URL 必须用最终值。
-   * requestedPort 与之不同:它是持久化目录的 key(见 daemon.ts stateDir),
-   * 必须用「请求端口」而非「实际监听端口」,否则默认端口偶尔因占用而偏移时,
-   * 上次启动写的 sessions.json 会因为目录名对不上而读不到。
+   * requestedPort 是持久化目录的 key(见 daemon.ts stateDir),必须用「请求
+   * 端口」而非「实际监听端口」,否则默认端口偶尔因占用而偏移时,上次启动写的
+   * sessions.json 会因为目录名对不上而读不到。
+   *
+   * hookSettingsPath 指向 daemon 级 hook 配置文件,所有会话经 --settings 共用 ——
+   * 文件内容(含实际监听端口)由 daemon.ts 在监听成功后写,这里只需要路径。
    */
-  constructor(host: string, port: () => number, requestedPort: number) {
-    this.#host = host;
-    this.#port = port;
+  constructor(requestedPort: number, hookSettingsPath: string) {
+    this.#hookSettingsPath = hookSettingsPath;
     this.#store = new SessionStore(requestedPort, () => this.#persistedAll());
     this.#loadPersisted(requestedPort);
     // 构造函数不能是 async,先同步把全部历史记录标 exited 让 SessionManager
@@ -516,7 +508,10 @@ export class SessionManager {
         transportKind: p.transportKind,
         tmuxName: p.tmuxName,
         paneId: p.paneId,
-        settingsPath: join(p.workspace, '.claude', 'settings.local.json'),
+        // 重启后仅用于 #reclaimTmuxSessions 重建 TmuxTransport;此时 pane 里的
+        // claude 早已带着启动时的 hook 配置在跑,--settings 只在启动读一次,
+        // 这个值实际不影响已恢复的会话。指向当前 daemon 的 hook 文件即可。
+        settingsPath: this.#hookSettingsPath,
         turns: p.turns,
         costUsd: p.costUsd,
         model: null,
@@ -680,7 +675,7 @@ export class SessionManager {
 
   async create(workspace: string, opts: CreateOptions = {}): Promise<Session> {
     const localId = randomUUID();
-    const settingsPath = this.#writeSettings(workspace);
+    const settingsPath = this.#hookSettingsPath;
     const kind = opts.transport ?? 'stream-json';
 
     const transport =
@@ -893,55 +888,5 @@ export class SessionManager {
       }),
     );
     this.#store.saveNow();
-  }
-
-  /**
-   * 写入 settings —— 合并而非覆盖。
-   * 该文件常已被用户占用(model / permissions / 插件 / statusLine),
-   * 直接赋值会静默毁掉用户配置与已有钩子。
-   */
-  #writeSettings(workspace: string): string {
-    const dir = join(workspace, '.claude');
-    mkdirSync(dir, { recursive: true });
-    const path = join(dir, 'settings.local.json');
-
-    let existing: Record<string, any> = {};
-    if (existsSync(path)) {
-      try {
-        existing = JSON.parse(readFileSync(path, 'utf8'));
-      } catch {
-        console.warn(`[settings] ${path} 解析失败,以空配置为基础`);
-      }
-    }
-
-    const hookEntry = {
-      type: 'http' as const,
-      url: `http://${this.#host}:${this.#port()}/api/claude-event`,
-      // 显式设短于默认 600s。真正的兜底在 permissions.ts:
-      // 钩子自然超时 = 放行(实测),绝不能依赖它。
-      timeout: HOOK_TIMEOUT_S,
-    };
-
-    const isOurs = (h: any) =>
-      h?.type === 'http' && typeof h.url === 'string' && h.url.includes('/api/claude-event');
-    const appendHook = (groups: any[] | undefined, matcher?: string) => {
-      const kept = (groups ?? [])
-        .map((g) => ({ ...g, hooks: (g.hooks ?? []).filter((h: any) => !isOurs(h)) }))
-        .filter((g: any) => g.hooks.length > 0);
-      return [...kept, matcher ? { matcher, hooks: [hookEntry] } : { hooks: [hookEntry] }];
-    };
-
-    const merged = {
-      ...existing,
-      hooks: {
-        ...(existing.hooks ?? {}),
-        PreToolUse: appendHook(existing.hooks?.PreToolUse, APPROVAL_MATCHER),
-        Stop: appendHook(existing.hooks?.Stop),
-        SessionEnd: appendHook(existing.hooks?.SessionEnd, '*'),
-      },
-    };
-
-    writeFileSync(path, JSON.stringify(merged, null, 2), { mode: 0o600 });
-    return path;
   }
 }
