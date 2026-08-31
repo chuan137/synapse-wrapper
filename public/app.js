@@ -1,13 +1,18 @@
 /**
- * 两层界面:
- *   view = 'overview'  顶层优先级流,跨会话
- *   view = <localId>   单会话详情,四个页签
+ * 界面有两个模式(左上角切换):
+ *   mode = 'tasks'     项目 / 任务 / 任务详情 三栏(Phase 1)
+ *   mode = 'sessions'  原有的两层会话界面:
+ *     view = 'overview'  顶层优先级流,跨会话
+ *     view = <localId>   单会话详情,四个页签
  *
  * 状态全部由服务端事件驱动,本地只缓存渲染所需的数据。
  */
 
 const token = new URLSearchParams(location.search).get('token');
 const $ = (id) => document.getElementById(id);
+
+// 上次用的模式,刷新后保留(纯 UI 偏好,服务端不关心)。
+const MODE_KEY = 'synapse.mode';
 
 // 手动收起的 project(key = workspace 绝对路径)。记录「收起」而非「展开」,
 // 使新 workspace 默认展开 —— 新建会话应该立刻在左栏可见,不用用户再点一次。
@@ -22,6 +27,7 @@ function saveCollapsed(set) {
 }
 
 const state = {
+  mode: (() => { try { return localStorage.getItem(MODE_KEY) === 'sessions' ? 'sessions' : 'tasks'; } catch { return 'tasks'; } })(),
   view: 'overview',
   tab: 'chat',
   sessions: new Map(),   // localId -> summary
@@ -29,6 +35,12 @@ const state = {
   detail: null,          // 当前打开会话的详情
   connected: false,
   collapsedProjects: loadCollapsed(),
+  // ── 任务视图 ──
+  projects: [],          // GET /api/projects 的结果
+  taskProjectId: null,   // 当前选中的 project
+  taskList: [],          // 当前 project 的任务列表(带聚合)
+  taskId: null,          // 当前打开的任务
+  taskDetail: null,      // GET /api/tasks/:id
   draftQueue: new Map(), // localId -> string[],会话忙碌时攒的待发 prompt(纯前端,不持久化)
   pinBottom: false,      // 下次 renderDetail 是否无条件贴底(切会话/切页签/刚发消息)
   // toolUseId -> { [qi]: { oi: Set<number|'other'>, other: string } }
@@ -196,8 +208,10 @@ function connect() {
         });
         if (m.session.state === 'ready') flushDraftQueue(m.session.localId);
         renderNav();
-        if (state.view === 'overview') renderOverview();
-        else if (state.view === m.session.localId) renderTopbar();
+        if (state.mode === 'sessions' && state.view === 'overview') renderOverview();
+        else if (state.mode === 'sessions' && state.view === m.session.localId) renderTopbar();
+        // 会话状态变化会影响任务视图里 agent 卡片的 state/context/cost。
+        if (state.mode === 'tasks') { renderTaskList(); renderTaskDetail(); }
         break;
 
       case 'session_event':
@@ -221,6 +235,21 @@ function connect() {
           // 自己刚发的消息,不管发送前滚到哪都跳回底部去看它。
           if (state.view === m.localId) state.pinBottom = true;
           if (state.tab === 'chat') renderBody();
+        }
+        break;
+
+      case 'task_event':
+        // 服务端派生的任务流事件(见 server.ts emitTaskEvent)。当前正看这个
+        // 任务就把事件增量追加进任务流;否则只刷新列表角标。参照 spec §2.10:
+        // 首次拉取(HTTP)与增量(WS)必须落同一套渲染结构 —— 这里 push 进
+        // taskDetail.events,与 GET /api/tasks/:id 返回的 events 同形。
+        if (state.mode === 'tasks') {
+          if (state.taskId === m.taskId && state.taskDetail) {
+            state.taskDetail.events.push(m.event);
+            renderTaskDetail();
+          }
+          loadProjects();
+          if (state.taskProjectId) loadTasks(state.taskProjectId);
         }
         break;
     }
@@ -565,6 +594,12 @@ function sessionRank(s) {
 }
 
 function renderNav() {
+  if (state.mode === 'tasks') { renderProjectNav(); return; }
+  renderSessionNav();
+}
+
+/** 会话模式的左栏:按 workspace 分组的会话列表(原有实现)。 */
+function renderSessionNav() {
   const item = (s) => {
     const n = pendingFor(s.localId).length;
     const st = n ? 'waiting' : s.state;
@@ -1050,7 +1085,353 @@ function renderBody() {
 }
 
 function renderAll() {
-  renderNav(); renderTopbar(); renderTabs(); renderBody();
+  applyMode();
+  renderNav();
+  if (state.mode === 'sessions') { renderTopbar(); renderTabs(); renderBody(); }
+  else { renderTaskList(); renderTaskDetail(); }
+}
+
+/** 切换两个视图容器的可见性,并把「+ 新建会话」按钮限定在会话模式。 */
+function applyMode() {
+  $('sessionView').hidden = state.mode !== 'sessions';
+  $('taskView').hidden = state.mode !== 'tasks';
+  $('foot').style.display = state.mode === 'sessions' && state.view !== 'overview' ? 'block' : 'none';
+  $('add').style.display = state.mode === 'sessions' ? '' : 'none';
+  for (const b of $('modeSwitch').querySelectorAll('button')) {
+    b.classList.toggle('on', b.dataset.mode === state.mode);
+  }
+}
+
+// ══ 任务视图 ═══════════════════════════════════════════════════
+
+async function loadProjects() {
+  try {
+    const { projects } = await api('/api/projects');
+    // 项目按 name localeCompare 固定排序,不随运行中/待批准跳动(呼应 spec §2.17)。
+    projects.sort((a, b) => a.name.localeCompare(b.name));
+    state.projects = projects;
+    // 首次进入或选中的 project 没了 → 落到第一个。
+    if (!state.taskProjectId || !projects.some((p) => p.id === state.taskProjectId)) {
+      state.taskProjectId = projects[0]?.id ?? null;
+    }
+    renderProjectNav();
+    if (state.taskProjectId) await loadTasks(state.taskProjectId);
+    else { state.taskList = []; renderTaskList(); renderTaskDetail(); }
+  } catch { /* 拉不到就维持现状 */ }
+}
+
+async function loadTasks(projectId) {
+  try {
+    const { tasks } = await api(`/api/projects/${projectId}/tasks`);
+    // 任务按 createdAt 固定排序(旧到新),状态变化不改变位置。
+    tasks.sort((a, b) => a.createdAt - b.createdAt);
+    state.taskList = tasks;
+    if (state.taskId && !tasks.some((t) => t.id === state.taskId)) {
+      state.taskId = null;
+      state.taskDetail = null;
+    }
+    renderTaskList();
+    renderTaskDetail();
+  } catch { /* keep */ }
+}
+
+async function loadTaskDetail(taskId) {
+  try {
+    state.taskDetail = await api(`/api/tasks/${taskId}`);
+  } catch {
+    state.taskDetail = null;
+  }
+  renderTaskDetail();
+}
+
+function selectProject(id) {
+  if (state.taskProjectId === id) return;
+  state.taskProjectId = id;
+  state.taskId = null;
+  state.taskDetail = null;
+  renderProjectNav();
+  loadTasks(id);
+}
+
+function selectTask(id) {
+  state.taskId = id;
+  state.taskDetail = null;
+  renderTaskList();
+  loadTaskDetail(id);
+}
+
+const TASK_STATUS_LABEL = {
+  todo: '待办', running: '进行中', waiting: '等待', blocked: '受阻', done: '完成', archived: '归档',
+};
+const TASK_STATUS_DOT = {
+  todo: 'idle', running: 'run', waiting: 'wait', blocked: 'wait', done: 'done', archived: 'idle',
+};
+
+function renderProjectNav() {
+  if (state.mode !== 'tasks') return;
+  const rows = state.projects.map((p) => {
+    const on = p.id === state.taskProjectId;
+    const badges = [];
+    if (p.runningAgents) badges.push(`<span class="pj-b run">${p.runningAgents}</span>`);
+    if (p.pendingApprovals) badges.push(`<span class="pj-b wait">${p.pendingApprovals}</span>`);
+    return `<div class="proj-row ${on ? 'on' : ''}" data-id="${p.id}">
+      <span class="proj-row-name">${esc(p.name)}</span>
+      <span class="proj-row-meta">${p.taskCount} 任务${badges.length ? ' ' + badges.join('') : ''}</span>
+    </div>`;
+  }).join('');
+  $('nav').innerHTML = `<div class="nav-sect">项目</div>${rows ||
+    '<div class="nav-empty">还没有项目。用 <code>wrapper</code> 在某个目录起一个会话,或从会话视图新建。</div>'}`;
+  for (const el of $('nav').querySelectorAll('.proj-row')) {
+    el.onclick = () => selectProject(el.dataset.id);
+  }
+}
+
+function renderTaskList() {
+  if (state.mode !== 'tasks') return;
+  const proj = state.projects.find((p) => p.id === state.taskProjectId);
+  const head = `<div class="tl-head">
+    <div class="tl-title">${proj ? esc(proj.name) : '任务'}</div>
+    ${proj ? `<button class="btn pri" id="newTask">+ 新建任务</button>` : ''}
+  </div>`;
+
+  let list;
+  if (!proj) {
+    list = `<div class="nav-empty">选择一个项目。</div>`;
+  } else if (!state.taskList.length) {
+    list = `<div class="nav-empty">这个项目还没有任务。点「新建任务」开始。</div>`;
+  } else {
+    list = state.taskList.map((t) => {
+      const on = t.id === state.taskId;
+      const dot = TASK_STATUS_DOT[t.status] ?? 'idle';
+      return `<div class="task-row ${on ? 'on' : ''}" data-id="${t.id}">
+        <span class="status ${dot}"></span>
+        <span class="task-copy">
+          <strong>${esc(t.title)}</strong>
+          ${t.goal ? `<small>${esc(t.goal)}</small>` : ''}
+        </span>
+        <span class="task-side">
+          <b>${t.agentCount || 0}</b>
+          <small>${t.pendingApprovals ? `${t.pendingApprovals} 待批` : 'agents'}</small>
+        </span>
+      </div>`;
+    }).join('');
+  }
+
+  $('colTasks').innerHTML = head + `<div class="tl-body">${list}</div>`;
+  const nt = $('newTask');
+  if (nt) nt.onclick = () => openNewTaskModal(state.taskProjectId);
+  for (const el of $('colTasks').querySelectorAll('.task-row')) {
+    el.onclick = () => selectTask(el.dataset.id);
+  }
+}
+
+function renderTaskDetail() {
+  if (state.mode !== 'tasks') return;
+  const d = state.taskDetail;
+  if (!state.taskId || !d) {
+    $('colDetail').innerHTML = `<div class="td-empty">${
+      state.taskId ? '加载中…' : '从左侧选一个任务查看详情。'}</div>`;
+    return;
+  }
+  const { task, project, agents, events } = d;
+  const st = task.status;
+
+  const brief = `<div class="td-brief">
+    <dl>
+      <div><dt>目标</dt><dd>${task.goal ? esc(task.goal) : '<span class="muted">未填写</span>'}</dd></div>
+      <div><dt>验收</dt><dd>${task.acceptance ? esc(task.acceptance) : '<span class="muted">未填写</span>'}</dd></div>
+    </dl>
+  </div>`;
+
+  const agentCards = agents.length ? agents.map((a) => agentCard(a)).join('') :
+    `<div class="muted" style="padding:4px 0">还没有绑定 agent。</div>`;
+
+  const bindOpts = [...state.sessions.values()]
+    .filter((s) => s.state !== 'exited')
+    .map((s) => `<option value="${s.localId}">${esc(s.name)}${s.title ? ' · ' + esc(s.title) : ''} (${s.transport})</option>`)
+    .join('');
+
+  const agentsBlock = `<div class="td-agents">
+    <div class="td-sect-head"><h3>Agents</h3>
+      <div class="bind-row">
+        <select id="bindSel"><option value="">绑定已有会话…</option>${bindOpts}</select>
+        <select id="bindRole"><option value="sub">子 agent</option><option value="main">主 agent</option></select>
+        <button class="btn" id="bindBtn">绑定</button>
+      </div>
+    </div>
+    <div class="agent-grid">${agentCards}</div>
+  </div>`;
+
+  const timeline = `<div class="td-timeline">
+    <h3>任务流</h3>
+    ${events.length ? `<ol>${events.slice().reverse().map((e) => `<li>
+      <time>${new Date(e.createdAt).toLocaleTimeString('zh', { hour: '2-digit', minute: '2-digit' })}</time>
+      <div><strong>${TASK_EVENT_LABEL[e.kind] ?? e.kind}</strong><p>${esc(e.message)}</p></div>
+    </li>`).join('')}</ol>` : '<p class="muted">还没有事件。</p>'}
+  </div>`;
+
+  $('colDetail').innerHTML = `
+    <div class="td-head">
+      <div class="crumb">${esc(project?.name ?? '')} / ${esc(task.title)}</div>
+      <div class="td-head-main">
+        <h2>${esc(task.title)}</h2>
+        <div class="td-head-act">
+          <select id="tdStatus">${Object.entries(TASK_STATUS_LABEL).map(([k, v]) =>
+            `<option value="${k}" ${k === st ? 'selected' : ''}>${v}</option>`).join('')}</select>
+          <button class="btn" id="editTask">编辑</button>
+        </div>
+      </div>
+    </div>
+    <div class="td-body">${brief}${agentsBlock}${timeline}</div>`;
+
+  $('tdStatus').onchange = async (e) => {
+    try { await api(`/api/tasks/${task.id}`, { method: 'PATCH', body: JSON.stringify({ status: e.target.value }) }); }
+    catch (err) { alert(err.message); }
+    loadTaskDetail(task.id);
+    loadTasks(state.taskProjectId);
+  };
+  $('editTask').onclick = () => openEditTaskModal(task);
+  $('bindBtn').onclick = async () => {
+    const localId = $('bindSel').value;
+    const role = $('bindRole').value;
+    if (!localId) return;
+    try {
+      await api(`/api/tasks/${task.id}/agents`, { method: 'POST', body: JSON.stringify({ localId, role }) });
+      loadTaskDetail(task.id);
+      loadTasks(state.taskProjectId);
+    } catch (err) { alert(err.message); }
+  };
+  for (const el of $('colDetail').querySelectorAll('[data-open-session]')) {
+    el.onclick = () => { switchMode('sessions'); navigate(el.dataset.openSession); };
+  }
+  for (const el of $('colDetail').querySelectorAll('[data-detach]')) {
+    el.onclick = async () => {
+      if (!confirm('解除该 agent 绑定?底层会话不会关闭。')) return;
+      try { await api(`/api/tasks/${task.id}/agents/${el.dataset.detach}`, { method: 'DELETE' }); }
+      catch (err) { alert(err.message); }
+      loadTaskDetail(task.id);
+      loadTasks(state.taskProjectId);
+    };
+  }
+}
+
+const TASK_EVENT_LABEL = {
+  task_created: '任务创建', task_updated: '任务更新', task_status_changed: '状态变更',
+  agent_attached: 'Agent 绑定', agent_detached: 'Agent 解绑', agent_started: 'Agent 启动',
+  approval_requested: '等待批准', approval_resolved: '批准处理', turn_completed: '轮次完成',
+  agent_exited: 'Agent 退出',
+};
+
+function agentCard(a) {
+  const b = a.binding;
+  const s = a.session; // 现有 session summary 形状 + pendingCount(可能为 null)
+  const ended = b.endedAt !== null;
+  const transport = b.transportKind === 'tmux' ? 'tmux' : 'json';
+  const stateLabel = ended ? '已解绑' : (s ? (STATE_LABEL[s.state] ?? s.state) : '会话不在');
+  const stateCls = ended ? 'idle'
+    : !s ? 'idle'
+    : s.state === 'waiting' || (a.pending?.length) ? 'wait'
+    : s.state === 'busy' || s.state === 'starting' ? 'run'
+    : s.state === 'exited' ? 'idle' : 'done';
+  const ctx = s && s.contextTokens && s.contextWindow
+    ? `${Math.round((s.contextTokens / s.contextWindow) * 100)}% ctx` : '';
+  const cost = s && s.costUsd ? `$${s.costUsd.toFixed(4)}` : '';
+  const pend = a.pending?.length ? `<div class="approval-line">${a.pending.length} 项待批准</div>` : '';
+  return `<article class="agent ${b.role === 'main' ? 'primary-agent' : ''} ${stateCls === 'wait' ? 'waiting' : ''}">
+    <div class="agent-top">
+      <span class="transport ${transport}">${transport}</span>
+      <strong>${b.role === 'main' ? '主 agent' : '子 agent'}${s ? ' · ' + esc(s.name) : ''}</strong>
+      <span class="agent-state ${stateCls}">${stateLabel}</span>
+    </div>
+    <p>${s && s.title ? esc(s.title) : (s ? esc(s.workspace) : '会话已不存在,可解绑')}</p>
+    ${pend}
+    <footer>
+      <span>${[ctx, cost].filter(Boolean).join(' · ') || b.transportKind}</span>
+      ${s ? `<button data-open-session="${s.localId}">打开会话</button>` : ''}
+      ${!ended ? `<button data-detach="${b.id}">解绑</button>` : ''}
+    </footer>
+  </article>`;
+}
+
+// ── 任务视图:模态框 ────────────────────────────────────────
+
+function openNewTaskModal(projectId) {
+  taskModal({
+    title: '新建任务',
+    values: { title: '', goal: '', acceptance: '', priority: 'normal' },
+    onSubmit: async (v) => {
+      const created = await api('/api/tasks', {
+        method: 'POST',
+        body: JSON.stringify({ projectId, ...v }),
+      });
+      await loadTasks(projectId);
+      selectTask(created.task.id);
+    },
+  });
+}
+
+function openEditTaskModal(task) {
+  taskModal({
+    title: '编辑任务',
+    values: { title: task.title, goal: task.goal, acceptance: task.acceptance, priority: task.priority },
+    onSubmit: async (v) => {
+      await api(`/api/tasks/${task.id}`, { method: 'PATCH', body: JSON.stringify(v) });
+      await loadTaskDetail(task.id);
+      await loadTasks(state.taskProjectId);
+    },
+  });
+}
+
+function taskModal({ title, values, onSubmit }) {
+  const bg = document.createElement('div');
+  bg.className = 'modal-bg';
+  bg.innerHTML = `<div class="modal">
+    <h3>${esc(title)}</h3>
+    <label for="tmTitle">标题</label>
+    <input id="tmTitle" value="${esc(values.title)}" spellcheck="false" placeholder="任务标题">
+    <label for="tmGoal">目标</label>
+    <textarea id="tmGoal" rows="2" placeholder="这个任务要达成什么">${esc(values.goal)}</textarea>
+    <label for="tmAcc">验收标准</label>
+    <textarea id="tmAcc" rows="2" placeholder="怎样算完成">${esc(values.acceptance)}</textarea>
+    <label for="tmPri">优先级</label>
+    <select id="tmPri">
+      <option value="low" ${values.priority === 'low' ? 'selected' : ''}>低</option>
+      <option value="normal" ${values.priority === 'normal' ? 'selected' : ''}>普通</option>
+      <option value="high" ${values.priority === 'high' ? 'selected' : ''}>高</option>
+    </select>
+    <div class="err" id="tmErr" style="display:none"></div>
+    <div class="modal-act">
+      <button class="btn" id="tmCancel">取消</button>
+      <button class="btn pri" id="tmOk">保存</button>
+    </div>
+  </div>`;
+  document.body.append(bg);
+  bg.querySelector('#tmTitle').focus();
+  const close = () => bg.remove();
+  bg.querySelector('#tmCancel').onclick = close;
+  bg.onclick = (e) => { if (e.target === bg) close(); };
+  bg.querySelector('#tmOk').onclick = async () => {
+    const v = {
+      title: bg.querySelector('#tmTitle').value.trim(),
+      goal: bg.querySelector('#tmGoal').value,
+      acceptance: bg.querySelector('#tmAcc').value,
+      priority: bg.querySelector('#tmPri').value,
+    };
+    if (!v.title) { bg.querySelector('#tmTitle').focus(); return; }
+    const ok = bg.querySelector('#tmOk');
+    const err = bg.querySelector('#tmErr');
+    ok.disabled = true;
+    try { await onSubmit(v); close(); }
+    catch (e) { err.textContent = e.message; err.style.display = 'block'; ok.disabled = false; }
+  };
+}
+
+function switchMode(mode) {
+  if (state.mode === mode) return;
+  state.mode = mode;
+  try { localStorage.setItem(MODE_KEY, mode); } catch { /* private mode */ }
+  renderAll();
+  if (mode === 'tasks') loadProjects();
 }
 
 // ── 导航 ────────────────────────────────────────────────────
@@ -1245,10 +1626,16 @@ setInterval(() => {
   else if (state.detail && isStalled(state.detail)) renderBody();
 }, 5000);
 
+// ── 模式切换 ────────────────────────────────────────────────
+for (const b of $('modeSwitch').querySelectorAll('button')) {
+  b.onclick = () => switchMode(b.dataset.mode);
+}
+
 // ── 启动 ────────────────────────────────────────────────────
 if (!token) {
   document.body.innerHTML = `<div class="empty" style="margin:auto">缺少访问令牌 —— 请使用终端打印的完整链接打开。</div>`;
 } else {
   connect();
   renderAll();
+  if (state.mode === 'tasks') loadProjects();
 }

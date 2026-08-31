@@ -10,11 +10,18 @@
 
 <aside>
   <div class="brand"><span class="conn" id="conn"></span>Synapse</div>
+  <div class="mode-switch" id="modeSwitch">
+    <button data-mode="tasks" class="on">任务</button>
+    <button data-mode="sessions">会话</button>
+  </div>
   <div class="nav" id="nav"></div>
-  <div class="side-foot"><button class="add-btn" id="add">+ 新建会话</button></div>
+  <div class="side-foot">
+    <button class="add-btn" id="add">+ 新建会话</button>
+  </div>
 </aside>
 
-<main>
+<!-- 会话视图:顶层优先级流 + 单会话详情(原有能力,保持不变) -->
+<main id="sessionView" hidden>
   <div class="topbar" id="topbar"></div>
   <div class="tabs" id="tabs" style="display:none"></div>
   <div class="body" id="body"></div>
@@ -26,6 +33,12 @@
     </div>
   </footer>
 </main>
+
+<!-- 任务视图:项目 / 任务 / 任务详情 三栏(Phase 1) -->
+<section class="task-cols" id="taskView">
+  <div class="col-tasks" id="colTasks"></div>
+  <div class="col-detail" id="colDetail"></div>
+</section>
 
 <script type="module" src="/app.js"></script>
 </body>

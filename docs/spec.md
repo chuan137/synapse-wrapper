@@ -468,7 +468,10 @@ wrapper CLI 自己启动。存储层、worktree、预检 UI 等留待 Phase 1 �
 
 ## 5. UI
 
-两层结构。
+左上角切换两个模式,偏好存 localStorage:
+
+- **任务**(Phase 1 默认)— 项目 / 任务 / 任务详情三栏。左栏(复用 aside)列项目,带任务数、运行中 agent 数、待批准数;中栏列任务,带状态点、agent 数、待批准数;右栏是任务详情:目标 / 验收、agent 卡片(transport / state / context / cost / pending,主 agent 绿底)、任务流事件(newest-first)。项目按 name `localeCompare`、任务按 `createdAt` 固定排序,不随状态跳动(呼应 §2.17)。交互:创建 / 编辑任务、绑定已有会话为主/子 agent、解绑(不关会话)、点 agent 卡片「打开会话」跳到会话模式的该会话详情。任务流首次拉取(`GET /api/tasks/:id`)与 WS 增量(`task_event` 消息)push 进同一个 `events` 数组、同一套渲染(§2.10 的老问题)。
+- **会话** — 下面描述的原有两层结构,能力不变。
 
 **顶层 — 优先级流。** 左栏按 workspace 分组(Project List),组内按「需要你 / 进行中 / 静默」排序;主区是跨会话的事件流,同样按「谁最需要你」排序。待批准项排最前并按等待时长排序,可就地批准无需进入会话。每项附风险说明(如「递归删除」「会直接改动线上基础设施」),而非仅展示命令原文。
 
