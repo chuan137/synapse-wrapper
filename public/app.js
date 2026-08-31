@@ -1338,6 +1338,15 @@ function renderTaskDetail() {
       } catch (err) { showTaskError(err.message); }
     };
   }
+  for (const el of $('colDetail').querySelectorAll('[data-stop-session]')) {
+    el.onclick = async () => {
+      if (!confirm('停止该 agent?进程会被终止,会话记录保留。')) return;
+      try {
+        await api(`/api/sessions/${el.dataset.stopSession}/stop`, { method: 'POST' });
+        afterMutation();
+      } catch (err) { showTaskError(err.message); }
+    };
+  }
 }
 
 const TASK_EVENT_LABEL = {
@@ -1368,6 +1377,9 @@ function agentCard(a) {
     ? `${Math.round((s.contextTokens / s.contextWindow) * 100)}% ctx` : '';
   const cost = s && s.costUsd ? `$${s.costUsd.toFixed(4)}` : '';
   const pend = a.pending?.length ? `<div class="approval-line">${a.pending.length} 项待批准</div>` : '';
+  // 会话还在跑(未解绑、进程未退出)才给「停止」—— stream-json 子 agent 卡住或
+  // 跑偏时用它收回进程,记录保留标 exited。
+  const canStop = !ended && s && s.state !== 'exited';
   return `<article class="agent ${b.role === 'main' ? 'primary-agent' : ''} ${stateCls === 'wait' ? 'waiting' : ''}">
     <div class="agent-top">
       <span class="transport ${transport}">${transport}</span>
@@ -1379,6 +1391,7 @@ function agentCard(a) {
     <footer>
       <span>${[ctx, cost].filter(Boolean).join(' · ') || b.transportKind}</span>
       ${s ? `<button data-open-session="${s.localId}">打开会话</button>` : ''}
+      ${canStop ? `<button data-stop-session="${s.localId}">停止</button>` : ''}
       ${!ended ? `<button data-detach="${b.id}">解绑</button>` : ''}
     </footer>
   </article>`;

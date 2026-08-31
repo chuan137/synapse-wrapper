@@ -200,6 +200,19 @@ app.post('/api/sessions/:id/focus', async (req, res) => {
   res.json({ ok: true });
 });
 
+/** 停掉会话进程但保留记录(标 exited)—— 任务子 agent 停止用这个,历史不丢。 */
+app.post('/api/sessions/:id/stop', async (req, res) => {
+  if (!checkOrigin(req, res)) return;
+  const s = manager.get(String(req.params.id));
+  if (!s) {
+    res.status(404).json({ error: '会话不存在' });
+    return;
+  }
+  if (s.claudeId) permissions.drain(s.claudeId);
+  await manager.stop(String(req.params.id));
+  res.json({ ok: true });
+});
+
 app.delete('/api/sessions/:id', async (req, res) => {
   if (!checkOrigin(req, res)) return;
   const s = manager.get(String(req.params.id));

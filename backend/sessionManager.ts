@@ -876,6 +876,18 @@ export class SessionManager {
     this.#store.scheduleSave();
   }
 
+  /**
+   * 停掉会话进程但保留记录(标 exited)—— 用于任务子 agent:进程不再跑,
+   * 但任务详情页仍要看到「这个 agent 跑过、改了什么、已停止」。
+   * 与 close() 的区别是 close() 连记录一起摘除。已 exited 的会话直接返回。
+   */
+  async stop(localId: string): Promise<void> {
+    const s = this.#sessions.get(localId);
+    if (!s || s.state === 'exited') return;
+    await s.transport.stop();
+    this.#markExited(s, '已手动停止');
+  }
+
   /** 用户在网页上主动删除会话 —— 记录本身也从持久化里摘除,不留痕迹。 */
   async close(localId: string): Promise<void> {
     const s = this.#sessions.get(localId);
