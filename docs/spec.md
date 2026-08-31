@@ -170,7 +170,7 @@ async function createWorktree(spec: WorktreeSpec): Promise<{ path: string; clean
 
 `wrapper` CLI 走接管模式:claude 在用户当前 pane 里启动,CLI 只做前置准备(拉起后端、写 settings),不制造额外的会话层级。因此 **CLI 必须在 tmux 内运行** —— pane 是后端寻址的唯一手段;裸终端下直接提示而非隐式建会话。
 
-`wrapper serve` 是例外:它只拉起 daemon 并打印网页链接,不创建会话、不接管 pane,因此不要求在 tmux 内。用于「只看任务面板,会话之后从网页里创建/绑定」的场景(Phase 1,见 `docs/phase1-task-management.md`)。
+`wrapper daemon start` 是例外:它只拉起 daemon 并打印网页链接,不创建会话、不接管 pane,因此不要求在 tmux 内。用于「只看任务面板,会话之后从网页里创建/绑定」的场景(Phase 1,见 `docs/phase1-task-management.md`)。`daemon <start|status|restart|stop>` 四个子命令都只管后端本身的生命周期,与「就地拉起 claude」的主流程无关。
 
 tmux 的所有 `-t` 目标在两种模式下分别取 pane ID 与会话名,pane ID(如 `%3`)在 tmux 中处处可作 target。接管模式下 `stop()` 无论如何都不销毁 pane —— 那属于用户。
 
@@ -428,8 +428,9 @@ daemon 每次监听成功后重写一遍(幂等)。**URL 里的端口必须是�
 
 显式指定端口时**不允许递增重试**,占用即报错退出;只有默认端口才走原有的递增容错(`MAX_PORT_TRIES`)。这不是随意选择 —— 状态目录用「请求端口」命名的前提是它必须等于「实际监听端口」,否则下次启动按请求端口去读状态目录,读到的 `port` 字段会跟真实监听地址对不上,健康检查看着像活的,实际连不上。默认端口允许偏移是因为此时没人会显式记住"我要的是哪个端口",复用逻辑本就是"矬子里拔将军"——先看有没有活的,没有就在默认值附近另起一个。
 
-**`wrapper daemon <status|restart|stop>` 子命令。** 改完后端代码想让它生效,原先只能手动 `kill` 旧进程再随便跑一次 `wrapper` 触发 `ensureDaemon()` 的自愈——容易漏步骤(比如忘了确认旧进程真退出就拉新的,或者 kill -9 跳过收尾)。三个子命令都基于既有的 `readState`/`checkHealth`/`ensureDaemon`,不是另起一套逻辑:
+**`wrapper daemon <start|status|restart|stop>` 子命令。** 改完后端代码想让它生效,原先只能手动 `kill` 旧进程再随便跑一次 `wrapper` 触发 `ensureDaemon()` 的自愈——容易漏步骤(比如忘了确认旧进程真退出就拉新的,或者 kill -9 跳过收尾)。四个子命令都基于既有的 `readState`/`checkHealth`/`ensureDaemon`,不是另起一套逻辑:
 
+- `start` — `ensureDaemon()` + 打印网页链接,随即退出。不创建会话、不接管 pane、不要求在 tmux 内 —— 只看任务面板时用(Phase 1)。已在跑就复用(健康检查通过即直接返回)
 - `status` — 读状态文件 + 健康检查,报告运行中/陈旧/未运行
 - `stop` — 发 `SIGTERM`(而非 `SIGKILL`)给 daemon 进程,轮询 PID 消失确认退出。`SIGTERM` 触发 `server.ts` 的 `shutdown()`,走 `stopAll()` 收尾(会话状态落盘、drain 挂起的批准请求),direct kill -9 会跳过这些
 - `restart` = `stop` 后接 `ensureDaemon()`
@@ -519,7 +520,7 @@ Project 分组默认展开,用户手动收起的记入 localStorage(键存收起
 **已落地范围(Phase 1 · 7a)。** `POST /api/tasks/:id/agents/start` 复用 `manager.create()` 起一个 stream-json 子 agent、写 `agent_started` 事件、按方案模板(项目 / 工作区 / 任务 / 目标 / 验收 / 子任务 / 收尾格式)拼 prompt 后 `send()`。`role:'main' + transport:'tmux'` 返回 400 —— 网页接管不了用户 pane。预检对话框展示工作区、`GET /api/git-status` 的 `git status --porcelain` 结果(**信息用途,7a 不阻断**)、system prompt 最终文本预览、model。**worktree 隔离(`dirtyStrategy` 三策略)与 policy 存储层是 7b,尚未落地** —— 子 agent 目前直接在传入工作区上跑,见 §1.3 / §7。
 
 **Phase 1 手动验证(测试端口,独立 `SYNAPSE_TASKS_PATH`,真实 claude 会话):**
-`wrapper serve` 起面板不附带会话;现有会话按 workspace 自动归入默认 project;创建 / 编辑任务即时落盘、刷新保留;绑定 tmux 会话为主 agent 后详情页绿底卡片显示 state / context / cost;从任务启动 stream-json 子 agent,子 agent timeline 出现完整模板 prompt 并回复,任务流按序出现 `agent_started` / `turn_completed`;同一会话绑第二个 task 返回 409,详情页顶部红色错误条显示原因;kill 承载 pane → 存活巡检把会话判 `exited`,任务流出现 `agent_exited`,binding `endedAt` 落上;点 agent 卡片「打开会话」切到会话视图并打开该会话四页签;切回会话视图旧 overview 功能不变;1400px / 480px 宽度均无横向溢出。`GET /api/sessions` 与非 `serve` 的 `wrapper` 行为回归无变化。
+`wrapper daemon start` 起面板不附带会话;现有会话按 workspace 自动归入默认 project;创建 / 编辑任务即时落盘、刷新保留;绑定 tmux 会话为主 agent 后详情页绿底卡片显示 state / context / cost;从任务启动 stream-json 子 agent,子 agent timeline 出现完整模板 prompt 并回复,任务流按序出现 `agent_started` / `turn_completed`;同一会话绑第二个 task 返回 409,详情页顶部红色错误条显示原因;kill 承载 pane → 存活巡检把会话判 `exited`,任务流出现 `agent_exited`,binding `endedAt` 落上;点 agent 卡片「打开会话」切到会话视图并打开该会话四页签;切回会话视图旧 overview 功能不变;1400px / 480px 宽度均无横向溢出。`GET /api/sessions` 与非 `serve` 的 `wrapper` 行为回归无变化。
 
 tmux agent 卡片:会话 `exited` 且 `transport === 'tmux'` 时状态标「pane 已失效」而非「已退出」——claude 进程可能还活着,只是网页失去了观察通道。binding 被存活巡检自动 `endedAt` 后卡片转「已解绑」,历史留在任务流的 `agent_exited` 事件里。
 

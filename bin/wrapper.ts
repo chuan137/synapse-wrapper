@@ -119,14 +119,10 @@ export async function main(argv: string[]): Promise<void> {
   if (argv[0] === '-h' || argv[0] === '--help') {
     console.log(`
 用法: wrapper [目录] [--port <端口>] [-- <claude 参数...>]
-      wrapper serve [--port <端口>]
-      wrapper daemon <status|restart|stop> [--port <端口>]
+      wrapper daemon <start|status|restart|stop> [--port <端口>]
 
   在当前 tmux pane 里启动 claude,同时接入网页端监管。
   目录默认为当前目录;后端未运行时自动以守护进程拉起。
-
-  serve  只拉起后端并打印网页链接,不创建 claude 会话、不要求在 tmux 内。
-         用于只看任务面板 —— 会话之后从网页里创建或绑定。
 
   --port 指定要连接/拉起的后端端口(默认 ${DEFAULT_PORT},也可用 PORT 环境变量)。
   不同 workspace 下不传 --port 会连到同一个后端 —— 这是 Project List 能跨
@@ -141,6 +137,8 @@ export async function main(argv: string[]): Promise<void> {
 
   需在 tmux 会话中运行 —— 后端通过 pane 观察与注入。
 
+  daemon start    只拉起后端并打印网页链接,不创建会话、不要求在 tmux 内
+                  (只看任务面板时用 —— 会话之后从网页里创建或绑定)
   daemon status   查看后端是否在跑、PID/端口
   daemon restart  优雅重启(改完代码后用这个加载新版本,不影响已在跑的 claude 会话)
   daemon stop     只停止,不重新拉起
@@ -150,11 +148,6 @@ export async function main(argv: string[]): Promise<void> {
 
   if (argv[0] === 'daemon') {
     await daemonCmd(argv.slice(1));
-    return;
-  }
-
-  if (argv[0] === 'serve') {
-    await serveCmd(argv.slice(1));
     return;
   }
 
@@ -218,22 +211,6 @@ export async function main(argv: string[]): Promise<void> {
 }
 
 /**
- * serve 子命令 —— 只要任务面板,不附带会话。
- *
- * 主流程 `wrapper` 是「带前置准备的 claude」,必须在 tmux 内就地接管 pane;
- * 任务面板只需要 daemon + 网页 UI,没有「当前 workspace」的概念(会话之后
- * 从网页里创建/绑定/启动)。故这里跳过 tmux 校验、sessionId、POST /api/sessions
- * 与 spawn claude,只留 ensureDaemon + 链接输出,随即退出。
- */
-async function serveCmd(argv: string[]): Promise<void> {
-  const { port } = parseArgv(argv);
-  const state = await ensureDaemon(port).catch((err) => die(String(err?.message ?? err)));
-  console.log(`${c.blue('●')} 任务面板已就绪 (PID ${state.pid})`);
-  console.log(`${c.dim('网页链接:')}\n${urlFor(state)}`);
-  process.exit(0);
-}
-
-/**
  * daemon 子命令 —— 独立于「拉起 claude」的主流程,只管后端本身的生命周期。
  * restart 不影响已在跑的 tmux 会话:daemon 只是旁路观察者,pane 里的 claude
  * 进程独立于它存活(见 tmuxTransport.ts stop() 的接管模式说明)。改完后端
@@ -242,6 +219,15 @@ async function serveCmd(argv: string[]): Promise<void> {
 async function daemonCmd(argv: string[]): Promise<void> {
   // parseArgv 把非 --port 的位置参数当「目录」摘出来,子命令名恰好落在同一个槽位。
   const { dir: sub, port } = parseArgv(argv);
+
+  // start —— 只拉起 daemon + 打印网页链接,不附带会话、不要求在 tmux 内。
+  // 任务面板只需要 daemon + 网页 UI:会话之后从网页里创建/绑定/启动。
+  if (sub === 'start') {
+    const state = await ensureDaemon(port).catch((err) => die(String(err?.message ?? err)));
+    console.log(`${c.blue('●')} 端口 ${state.port} 已就绪 (PID ${state.pid})`);
+    console.log(`${c.dim('网页链接:')}\n${urlFor(state)}`);
+    process.exit(0);
+  }
 
   if (sub === 'status') {
     const state = readState(port);
@@ -271,7 +257,7 @@ async function daemonCmd(argv: string[]): Promise<void> {
     return;
   }
 
-  die(`未知子命令: ${sub ?? '(缺失)'} —— 可用: status / restart / stop`);
+  die(`未知子命令: ${sub ?? '(缺失)'} —— 可用: start / status / restart / stop`);
 }
 
 /**
