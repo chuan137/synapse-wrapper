@@ -170,6 +170,8 @@ async function createWorktree(spec: WorktreeSpec): Promise<{ path: string; clean
 
 `wrapper` CLI 走接管模式:claude 在用户当前 pane 里启动,CLI 只做前置准备(拉起后端、写 settings),不制造额外的会话层级。因此 **CLI 必须在 tmux 内运行** —— pane 是后端寻址的唯一手段;裸终端下直接提示而非隐式建会话。
 
+`wrapper serve` 是例外:它只拉起 daemon 并打印网页链接,不创建会话、不接管 pane,因此不要求在 tmux 内。用于「只看任务面板,会话之后从网页里创建/绑定」的场景(Phase 1,见 `docs/phase1-task-management.md`)。
+
 tmux 的所有 `-t` 目标在两种模式下分别取 pane ID 与会话名,pane ID(如 `%3`)在 tmux 中处处可作 target。接管模式下 `stop()` 无论如何都不销毁 pane —— 那属于用户。
 
 ### 2.6 会话 ID 必须由调用方指定

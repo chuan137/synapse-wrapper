@@ -119,10 +119,14 @@ export async function main(argv: string[]): Promise<void> {
   if (argv[0] === '-h' || argv[0] === '--help') {
     console.log(`
 用法: wrapper [目录] [--port <端口>] [-- <claude 参数...>]
+      wrapper serve [--port <端口>]
       wrapper daemon <status|restart|stop> [--port <端口>]
 
   在当前 tmux pane 里启动 claude,同时接入网页端监管。
   目录默认为当前目录;后端未运行时自动以守护进程拉起。
+
+  serve  只拉起后端并打印网页链接,不创建 claude 会话、不要求在 tmux 内。
+         用于只看任务面板 —— 会话之后从网页里创建或绑定。
 
   --port 指定要连接/拉起的后端端口(默认 ${DEFAULT_PORT},也可用 PORT 环境变量)。
   不同 workspace 下不传 --port 会连到同一个后端 —— 这是 Project List 能跨
@@ -146,6 +150,11 @@ export async function main(argv: string[]): Promise<void> {
 
   if (argv[0] === 'daemon') {
     await daemonCmd(argv.slice(1));
+    return;
+  }
+
+  if (argv[0] === 'serve') {
+    await serveCmd(argv.slice(1));
     return;
   }
 
@@ -206,6 +215,22 @@ export async function main(argv: string[]): Promise<void> {
 
   // 交棒:用 claude 替换本进程,用户拿到的就是原生 TUI,退出即退出
   execClaude(dir, settingsPath, sessionId, claudeArgs);
+}
+
+/**
+ * serve 子命令 —— 只要任务面板,不附带会话。
+ *
+ * 主流程 `wrapper` 是「带前置准备的 claude」,必须在 tmux 内就地接管 pane;
+ * 任务面板只需要 daemon + 网页 UI,没有「当前 workspace」的概念(会话之后
+ * 从网页里创建/绑定/启动)。故这里跳过 tmux 校验、sessionId、POST /api/sessions
+ * 与 spawn claude,只留 ensureDaemon + 链接输出,随即退出。
+ */
+async function serveCmd(argv: string[]): Promise<void> {
+  const { port } = parseArgv(argv);
+  const state = await ensureDaemon(port).catch((err) => die(String(err?.message ?? err)));
+  console.log(`${c.blue('●')} 任务面板已就绪 (PID ${state.pid})`);
+  console.log(`${c.dim('网页链接:')}\n${urlFor(state)}`);
+  process.exit(0);
 }
 
 /**
