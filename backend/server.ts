@@ -12,8 +12,9 @@ import { createServer } from 'node:http';
 import { resolve } from 'node:path';
 import { existsSync, statSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { SessionManager, replayTranscriptTimeline, mergedTodos, type ManagerEvent } from './sessionManager.ts';
+import { SessionManager, replayTranscriptTimeline, mergedTodos, type ManagerEvent, type SessionSummary } from './sessionManager.ts';
 import { PermissionEngine, HOOK_TIMEOUT_S, type PendingApproval } from './permissions.ts';
+import { TaskStore, tasksPath, type AgentBinding } from './taskStore.ts';
 import {
   writeState, clearState, readOrCreateToken, writeHookSettings, hookSettingsPath,
   DEFAULT_PORT, MAX_PORT_TRIES,
@@ -46,6 +47,9 @@ let activePort = PORT;
 // 里等实际监听端口确定后才写。会话启动都在监听成功之后,读到的一定是新版本。
 const manager = new SessionManager(PORT, hookSettingsPath(PORT));
 const permissions = new PermissionEngine();
+// 任务存储落 ~/.synapse/tasks.json —— 不按端口分区(见 spec §1.4),
+// 与 sessions.json 不同:Project List 要跨 workspace/daemon 聚合。
+const tasks = new TaskStore(tasksPath());
 const stopLivenessWatch = manager.startLivenessWatch();
 
 const app = express();
@@ -201,6 +205,105 @@ app.delete('/api/sessions/:id', async (req, res) => {
   if (s?.claudeId) permissions.drain(s.claudeId);
   await manager.close(String(req.params.id));
   res.json({ ok: true });
+});
+
+// ── 任务视图接口 ────────────────────────────────────────────
+// Task 层只经 localId / claudeId 单向引用会话,不往 Session 加字段(spec §1.1)。
+// 聚合读到的 session 一律用现有 summary 形状,不新造(方案 §285)。
+
+const RUNNING_STATES = new Set(['busy', 'waiting', 'starting']);
+
+/** localId → 现有会话 summary(含 pendingCount),给任务详情复用。 */
+function sessionView(localId: string): (SessionSummary & { pendingCount: number }) | null {
+  const s = manager.list().find((x) => x.localId === localId);
+  if (!s) return null;
+  return { ...s, pendingCount: s.claudeId ? permissions.countFor(s.claudeId) : 0 };
+}
+
+/** 一个 binding 对应会话的待批准数;会话不在了记 0。 */
+function pendingForBinding(b: AgentBinding): number {
+  const s = manager.list().find((x) => x.localId === b.localId);
+  return s?.claudeId ? permissions.countFor(s.claudeId) : 0;
+}
+
+/** GET /api/tasks/:id 的详情形状 —— 多处复用(POST/PATCH 也返回它,见 step 4)。 */
+function taskDetail(taskId: string) {
+  const task = tasks.getTask(taskId);
+  if (!task) return null;
+  const project = tasks.getProject(task.projectId) ?? null;
+  const agents = tasks.listBindings(taskId).map((binding) => ({
+    binding,
+    session: sessionView(binding.localId),
+    pending: (() => {
+      const s = manager.list().find((x) => x.localId === binding.localId);
+      return s?.claudeId ? permissions.listPending(s.claudeId) : [];
+    })(),
+  }));
+  return { task, project, agents, events: tasks.listEvents(taskId) };
+}
+
+app.get('/api/projects', (req, res) => {
+  if (!checkOrigin(req, res)) return;
+  // 惰性补默认 project:现有会话的 workspace 尚未归属任何 project 就建一个。
+  for (const s of manager.list()) {
+    tasks.ensureProjectForWorkspace(s.workspace);
+  }
+  const projects = tasks.listProjects().map((p) => {
+    const projTasks = tasks.listTasks(p.id);
+    let runningAgents = 0;
+    let pendingApprovals = 0;
+    for (const t of projTasks) {
+      for (const b of tasks.listBindings(t.id)) {
+        if (b.endedAt !== null) continue;
+        const s = manager.list().find((x) => x.localId === b.localId);
+        if (s && RUNNING_STATES.has(s.state)) runningAgents++;
+        pendingApprovals += pendingForBinding(b);
+      }
+    }
+    return {
+      id: p.id,
+      name: p.name,
+      workspaceRoots: p.workspaceRoots,
+      goal: p.goal,
+      taskCount: projTasks.length,
+      runningAgents,
+      pendingApprovals,
+      updatedAt: p.updatedAt,
+    };
+  });
+  res.json({ projects });
+});
+
+app.get('/api/projects/:id/tasks', (req, res) => {
+  if (!checkOrigin(req, res)) return;
+  const project = tasks.getProject(String(req.params.id));
+  if (!project) {
+    res.status(404).json({ error: 'project 不存在' });
+    return;
+  }
+  const list = tasks.listTasks(project.id).map((t) => {
+    const bindings = tasks.listBindings(t.id).filter((b) => b.endedAt === null);
+    const main = bindings.find((b) => b.role === 'main');
+    const events = tasks.listEvents(t.id);
+    return {
+      ...t,
+      agentCount: bindings.length,
+      mainAgent: main ? sessionView(main.localId) : null,
+      pendingApprovals: bindings.reduce((n, b) => n + pendingForBinding(b), 0),
+      lastEvent: events.length ? events[events.length - 1] : null,
+    };
+  });
+  res.json({ project, tasks: list });
+});
+
+app.get('/api/tasks/:id', (req, res) => {
+  if (!checkOrigin(req, res)) return;
+  const detail = taskDetail(String(req.params.id));
+  if (!detail) {
+    res.status(404).json({ error: 'task 不存在' });
+    return;
+  }
+  res.json(detail);
 });
 
 app.use(express.static(resolve(ROOT, 'public')));
