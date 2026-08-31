@@ -900,6 +900,11 @@ function wireQuestionPicker(card) {
       }
     }
   }
+
+  // 卡片 HTML 里「提交回答」写死 disabled(见 approvalCard),重绘后选中态
+  // 会从 state.pendingAnswers 回填到 DOM,但按钮的 disabled 不会跟着复原 ——
+  // 必须在接线后按已回填的选中态重新判定一次。
+  if (submit) submit.disabled = !anySelected();
 }
 
 /** 把各 qblock 里选中的项拼成模型能读的回答文本,"其他"取输入框文字而非 label。 */
