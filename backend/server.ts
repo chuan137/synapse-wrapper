@@ -477,11 +477,58 @@ wss.on('connection', (ws) => {
   ws.on('close', () => clients.delete(ws));
 });
 
+// ── 任务事件派生 ────────────────────────────────────────────
+// 现有会话/权限回调里顺带写 task event。fail-safe:查不到 active binding 就
+// 静默跳过,绝不影响原 broadcast / 会话流程(方案 §412、全局约束 4)。
+
+/**
+ * 派生一条 task event 并 broadcast。localId 找不到 active binding 时什么都不做。
+ * try/catch 兜底 —— TaskStore 写盘失败不能让会话事件转发链断掉。
+ */
+function emitTaskEvent(
+  localId: string,
+  kind: Parameters<typeof tasks.appendEvent>[0]['kind'],
+  message: string,
+  data?: unknown,
+): void {
+  try {
+    const binding = tasks.bindingForSession(localId);
+    if (!binding) return;
+    const event = tasks.appendEvent({
+      taskId: binding.taskId,
+      agentBindingId: binding.id,
+      kind,
+      message,
+      data,
+    });
+    broadcast({ type: 'task_event', taskId: binding.taskId, event });
+  } catch (err) {
+    console.error('[task-event] 派生失败:', err);
+  }
+}
+
+/** 会话退出时结束其 active binding —— 详情页 agent 卡片据此不再显示为「在跑」。 */
+function endBindingForExited(localId: string): void {
+  try {
+    const binding = tasks.bindingForSession(localId);
+    if (binding) tasks.detachAgent(binding.id);
+  } catch (err) {
+    console.error('[task-event] 结束 binding 失败:', err);
+  }
+}
+
 // ── 事件转发 ────────────────────────────────────────────────
 manager.onEvent((e: ManagerEvent) => {
   // 会话退出后其挂起批准再也不会有人放行,留着会一直占着「需要你」分组
   if (e.type === 'session_updated' && e.session.state === 'exited' && e.session.claudeId) {
     permissions.drain(e.session.claudeId);
+  }
+  if (e.type === 'session_updated' && e.session.state === 'exited') {
+    emitTaskEvent(e.session.localId, 'agent_exited', 'agent 会话已退出');
+    endBindingForExited(e.session.localId);
+  }
+  if (e.type === 'session_event' && e.event.kind === 'turn_end') {
+    emitTaskEvent(e.localId, 'turn_completed', e.event.interrupted ? '轮次已中断' : '轮次完成');
   }
   broadcast(e);
 });
@@ -490,6 +537,7 @@ permissions.onApprovalRequested((a: PendingApproval) => {
   // 有待批准项时把会话标为 waiting,顶层列表据此排序与显示角标
   const s = manager.byClaudeId(a.sessionId);
   if (s) manager.setState(s.localId, 'waiting');
+  if (s) emitTaskEvent(s.localId, 'approval_requested', `等待批准:${a.toolName}`, { toolUseId: a.toolUseId });
   broadcast({ type: 'approval_request', approval: a, localId: s?.localId ?? null });
 });
 
@@ -505,6 +553,7 @@ permissions.onApprovalResolved((toolUseId, decision, reason, sessionId) => {
   if (s && s.state === 'waiting' && permissions.countFor(sessionId) === 0) {
     manager.setState(s.localId, s.pendingTurns > 0 ? 'busy' : 'ready');
   }
+  if (s) emitTaskEvent(s.localId, 'approval_resolved', `批准${decision === 'allow' ? '通过' : '拒绝'}`, { toolUseId, decision });
   broadcast({ type: 'approval_resolved', toolUseId, decision, reason });
 });
 
