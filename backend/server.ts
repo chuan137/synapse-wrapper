@@ -119,6 +119,10 @@ app.post('/api/sessions', async (req, res) => {
       paneId: typeof req.body?.paneId === 'string' ? req.body.paneId : undefined,
       sessionId: typeof req.body?.sessionId === 'string' ? req.body.sessionId : undefined,
       model: typeof req.body?.model === 'string' && req.body.model.trim() ? req.body.model.trim() : undefined,
+      appendSystemPrompt:
+        typeof req.body?.appendSystemPrompt === 'string' && req.body.appendSystemPrompt.trim()
+          ? req.body.appendSystemPrompt
+          : undefined,
     });
     res.json({ localId: s.localId, tmuxName: s.tmuxName, settingsPath: s.settingsPath });
   } catch (err) {

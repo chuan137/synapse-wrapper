@@ -106,6 +106,12 @@ export interface TmuxOptions {
    * 按 mtime 认领会张冠李戴,批准请求随之路由到错误的会话。
    */
   sessionId?: string;
+  /**
+   * 透传给 claude CLI 的额外参数(如 --append-system-prompt)。
+   * 仅自建会话模式(sessionName)生效 —— 接管模式下 claude 由 wrapper CLI
+   * 启动,不经本类。
+   */
+  extraArgs?: string[];
 }
 
 /**
@@ -210,6 +216,7 @@ export class TmuxTransport extends EventEmitterBase implements SessionTransport 
         '-x', '200', '-y', '50',
         '-c', this.#opts.cwd,
         'claude', '--settings', this.#opts.settingsPath,
+        ...(this.#opts.extraArgs ?? []),
       ]);
       await sleep(2500);  // 等首屏渲染,否则 capture 拿到空屏
       await this.#describe();

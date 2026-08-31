@@ -38,6 +38,13 @@ export interface CreateOptions {
   sessionId?: string;
   /** 仅 stream-json:透传 `--model`,省略则用 CLI/settings 的默认值。 */
   model?: string;
+  /**
+   * 追加到默认 system prompt 之后的一段文本(`claude --append-system-prompt`)。
+   * 只在 claude 进程启动时读一次,无法作用于已在跑的会话 —— 调用方须在新建
+   * 会话时就把最终内容拼好传进来。paneId 接管模式不生效:那条路径的 claude
+   * 由 wrapper CLI 自己启动,不经这里的 transport。
+   */
+  appendSystemPrompt?: string;
 }
 
 /** 会话内累积的一次文件改动。 */
@@ -678,6 +685,10 @@ export class SessionManager {
     const settingsPath = this.#hookSettingsPath;
     const kind = opts.transport ?? 'stream-json';
 
+    const sys = opts.appendSystemPrompt?.trim()
+      ? ['--append-system-prompt', opts.appendSystemPrompt]
+      : [];
+
     const transport =
       kind === 'tmux'
         ? new TmuxTransport({
@@ -686,11 +697,13 @@ export class SessionManager {
             sessionName: opts.tmuxName,
             paneId: opts.paneId,
             sessionId: opts.sessionId,
+            // paneId 接管模式下 claude 由 CLI 启动,这个参数只对自建会话生效。
+            extraArgs: sys,
           })
         : new StreamJsonTransport({
             cwd: workspace,
             settingsPath,
-            extraArgs: opts.model ? ['--model', opts.model] : undefined,
+            extraArgs: [...(opts.model ? ['--model', opts.model] : []), ...sys],
           });
 
     const session: Session = {
