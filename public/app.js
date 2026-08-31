@@ -1426,7 +1426,7 @@ function openStartAgentModal(task, project, defaultWs) {
     `任务:${task.title}`,
     `目标:${task.goal || '(未填写)'}`,
     `验收:${task.acceptance || '(未填写)'}`, '',
-    '请只完成以下子任务:', userText || '(在上方填写)', '',
+    '请只完成以下子任务:', userText || task.goal || '(在上方填写)', '',
     '完成后用简短中文总结:', '- 做了什么', '- 改了哪些文件', '- 如何验证', '- 剩余风险',
   ].join('\n');
 
@@ -1439,7 +1439,7 @@ function openStartAgentModal(task, project, defaultWs) {
     <input id="saWs" value="${esc(defaultWs)}" spellcheck="false">
     <div class="sa-git muted" id="saGit">检查 git 状态…</div>
     <label for="saPrompt">子任务</label>
-    <textarea id="saPrompt" rows="3" placeholder="要子 agent 完成的具体子任务"></textarea>
+    <textarea id="saPrompt" rows="3" placeholder="要子 agent 完成的具体子任务${task.goal ? '(留空则用任务目标)' : ''}"></textarea>
     <label for="saModel">模型</label>
     <select id="saModel">
       <option value="">默认(跟随 CLI / settings.json)</option>
@@ -1486,8 +1486,15 @@ function openStartAgentModal(task, project, defaultWs) {
   bg.querySelector('#saOk').onclick = async () => {
     const workspace = wsInput.value.trim();
     if (!workspace) { wsInput.focus(); return; }
-    const ok = bg.querySelector('#saOk');
     const err = bg.querySelector('#saErr');
+    // 子任务与任务目标都为空,子 agent 起来后没有输入会干等 —— 提前拦住。
+    if (!promptInput.value.trim() && !task.goal.trim()) {
+      err.textContent = '请填写子任务(该任务还没有目标可回退)';
+      err.style.display = 'block';
+      promptInput.focus();
+      return;
+    }
+    const ok = bg.querySelector('#saOk');
     ok.disabled = true;
     try {
       await api(`/api/tasks/${task.id}/agents/start`, {

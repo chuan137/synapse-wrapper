@@ -42,6 +42,11 @@ export class StreamJsonTransport extends EventEmitterBase implements SessionTran
       '--verbose',
       '--include-partial-messages',
       '--settings', this.#opts.settingsPath,
+      // headless 下没有终端弹批准框,PreToolUse hook 又只拦 AskUserQuestion
+      // (daemon.ts APPROVAL_MATCHER),写文件的默认判断无处应答,子 agent 只能
+      // 在对话里干问「approve?」并卡住。acceptEdits 放行文件编辑、Bash 等仍走
+      // 默认判断 —— 让后台子 agent 能自动改代码,又不至于全量免批准。
+      '--permission-mode', 'acceptEdits',
       ...(this.#opts.extraArgs ?? []),
     ];
 

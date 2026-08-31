@@ -472,7 +472,13 @@ app.post('/api/tasks/:id/agents/start', async (req, res) => {
     return;
   }
 
-  const userPrompt = typeof b.prompt === 'string' && b.prompt.trim() ? b.prompt.trim() : '';
+  // 留空则回退到任务目标 —— 不带子任务启动会让子 agent 起来后干等,没有触发轮次的输入。
+  const userPrompt =
+    (typeof b.prompt === 'string' && b.prompt.trim() ? b.prompt.trim() : '') || task.goal.trim();
+  if (!userPrompt) {
+    res.status(400).json({ error: '需要子任务描述(或先给任务填写目标)' });
+    return;
+  }
   const project = tasks.getProject(task.projectId);
   const appendSystemPrompt =
     typeof b.appendSystemPrompt === 'string' && b.appendSystemPrompt.trim()
@@ -498,9 +504,7 @@ app.post('/api/tasks/:id/agents/start', async (req, res) => {
       kind: 'agent_started',
       message: `启动 ${role} agent(${transport})于 ${workspace}`,
     });
-    if (userPrompt) {
-      manager.send(s.localId, subAgentPrompt(project, task, workspace, userPrompt));
-    }
+    manager.send(s.localId, subAgentPrompt(project, task, workspace, userPrompt));
     res.json(taskDetail(task.id));
   } catch (err) {
     res.status(500).json({ error: String(err instanceof Error ? err.message : err) });
