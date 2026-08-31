@@ -306,6 +306,117 @@ app.get('/api/tasks/:id', (req, res) => {
   res.json(detail);
 });
 
+app.post('/api/tasks', (req, res) => {
+  if (!checkOrigin(req, res)) return;
+  const projectId = String(req.body?.projectId ?? '');
+  const title = typeof req.body?.title === 'string' ? req.body.title.trim() : '';
+  if (!title) {
+    res.status(400).json({ error: 'title 必填' });
+    return;
+  }
+  if (!tasks.getProject(projectId)) {
+    res.status(404).json({ error: 'project 不存在' });
+    return;
+  }
+  const task = tasks.createTask({
+    projectId,
+    title,
+    goal: typeof req.body?.goal === 'string' ? req.body.goal : undefined,
+    acceptance: typeof req.body?.acceptance === 'string' ? req.body.acceptance : undefined,
+    priority: req.body?.priority === 'low' || req.body?.priority === 'high' ? req.body.priority : undefined,
+  });
+  tasks.appendEvent({ taskId: task.id, kind: 'task_created', message: `创建任务「${task.title}」` });
+  res.json(taskDetail(task.id));
+});
+
+const TASK_STATUSES = new Set(['todo', 'running', 'waiting', 'blocked', 'done', 'archived']);
+const TASK_PRIORITIES = new Set(['low', 'normal', 'high']);
+
+app.patch('/api/tasks/:id', (req, res) => {
+  if (!checkOrigin(req, res)) return;
+  const before = tasks.getTask(String(req.params.id));
+  if (!before) {
+    res.status(404).json({ error: 'task 不存在' });
+    return;
+  }
+  const patch: Parameters<typeof tasks.updateTask>[1] = {};
+  const b = req.body ?? {};
+  if (typeof b.title === 'string' && b.title.trim()) patch.title = b.title.trim();
+  if (typeof b.goal === 'string') patch.goal = b.goal;
+  if (typeof b.acceptance === 'string') patch.acceptance = b.acceptance;
+  if (typeof b.status === 'string' && TASK_STATUSES.has(b.status)) patch.status = b.status;
+  if (typeof b.priority === 'string' && TASK_PRIORITIES.has(b.priority)) patch.priority = b.priority;
+  if (b.archivedAt === null || typeof b.archivedAt === 'number') patch.archivedAt = b.archivedAt;
+
+  const statusChanged = patch.status !== undefined && patch.status !== before.status;
+  const task = tasks.updateTask(before.id, patch);
+  if (statusChanged) {
+    tasks.appendEvent({
+      taskId: task.id,
+      kind: 'task_status_changed',
+      message: `状态 ${before.status} → ${task.status}`,
+    });
+  } else {
+    tasks.appendEvent({ taskId: task.id, kind: 'task_updated', message: '更新任务' });
+  }
+  res.json(taskDetail(task.id));
+});
+
+app.post('/api/tasks/:id/agents', (req, res) => {
+  if (!checkOrigin(req, res)) return;
+  const task = tasks.getTask(String(req.params.id));
+  if (!task) {
+    res.status(404).json({ error: 'task 不存在' });
+    return;
+  }
+  const localId = String(req.body?.localId ?? '');
+  const role = req.body?.role === 'main' ? 'main' : 'sub';
+  const s = manager.get(localId);
+  if (!s) {
+    res.status(400).json({ error: '会话不存在' });
+    return;
+  }
+  try {
+    // transportKind 由后端从会话读,不信客户端(spec §1.1 / 方案 §324)。
+    const binding = tasks.attachAgent({
+      taskId: task.id,
+      localId,
+      claudeId: s.claudeId,
+      role,
+      transportKind: s.transportKind,
+    });
+    tasks.appendEvent({
+      taskId: task.id,
+      agentBindingId: binding.id,
+      kind: 'agent_attached',
+      message: `绑定会话 ${s.name} 为 ${role} agent`,
+    });
+    res.json(taskDetail(task.id));
+  } catch (err) {
+    // TaskStore 在「会话已绑其它 active task」时抛错 —— 转 409(方案 §339)。
+    res.status(409).json({ error: String(err instanceof Error ? err.message : err) });
+  }
+});
+
+app.delete('/api/tasks/:id/agents/:bindingId', (req, res) => {
+  if (!checkOrigin(req, res)) return;
+  const task = tasks.getTask(String(req.params.id));
+  const binding = tasks.getBinding(String(req.params.bindingId));
+  if (!task || !binding || binding.taskId !== task.id) {
+    res.status(404).json({ error: 'binding 不存在' });
+    return;
+  }
+  tasks.detachAgent(binding.id);
+  // 只解绑,不关会话 —— 用户的 tmux pane / 后台 worker 继续跑(方案 §366)。
+  tasks.appendEvent({
+    taskId: task.id,
+    agentBindingId: binding.id,
+    kind: 'agent_detached',
+    message: '解除 agent 绑定',
+  });
+  res.json({ ok: true });
+});
+
 app.use(express.static(resolve(ROOT, 'public')));
 
 // ── WebSocket ───────────────────────────────────────────────
