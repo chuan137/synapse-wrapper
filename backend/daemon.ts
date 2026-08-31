@@ -27,7 +27,8 @@ import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
 import { HOOK_TIMEOUT_S } from './permissions.ts';
 
-const SYNAPSE_DIR = join(homedir(), '.synapse');
+/** 用户级 Synapse 状态根目录。会话数据按端口分子目录,任务数据直接落在根下(见 taskStore.ts)。 */
+export const SYNAPSE_DIR = join(homedir(), '.synapse');
 
 export const HOST = '127.0.0.1';
 // 3000 是 React/Next.js/Rails 等大量工具的默认端口,极易撞;

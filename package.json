@@ -9,6 +9,7 @@
   "scripts": {
     "dev": "PORT=47190 tsx watch backend/server.ts",
     "start": "tsx backend/server.ts",
+    "test": "node --test --disable-warning=ExperimentalWarning 'backend/*.test.ts'",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

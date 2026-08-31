@@ -36,6 +36,78 @@
 
 **为什么是 stream-json 而不是 tmux。** 早期方案用 tmux 承载交互式 TTY,配合 paste-buffer 注入提示词、tail 转写文件取输出。实测确认 stream-json 提供双向 JSON 协议,直接消除了缓冲区注入、ANSI 清洗、转写解析三块工作量。tmux 的独有价值(进程存活于后端重启、终端可 attach)被评估为 nice-to-have,列入阶段二。
 
+### 1.1 首选方向:Claude 下的任务管理
+
+当前首选演进方向是先在 Claude Code 体系内实现任务管理,形成 **项目 -> 任务 -> agents** 的层级。
+
+- 项目(Project):对应一个工作区或一组相关工作区,承载目标、上下文、会话列表与任务集合。
+- 任务(Task):项目内可追踪的工作单元,记录目标、状态、优先级、负责人/参与 agent、关联会话、产物与验收结果。
+- agents:执行任务的 Claude Code 会话。一个任务可以绑定一个主 agent,也可以挂多个辅助 agent;agent 的运行状态、权限请求、最终回复和中间执行过程都归入所属任务。
+
+第一阶段不引入跨 CLI 执行者,只把现有 Claude 会话纳入任务视图:用户先选项目,在项目下创建或选择任务,再把一个或多个 Claude 会话挂到任务上。UI 顶层从“会话列表”演进为“项目 / 任务 / agents”三层导航,但底层仍复用现有 SessionManager、PermissionEngine 与 SessionTransport。
+
+任务管理状态应独立于 SessionManager。SessionManager 继续只负责会话生命周期、传输与运行时统计;Project/Task/AgentBinding 由新的任务存储维护,通过 localId/claudeId 引用现有会话,不要把项目、任务、验收等业务字段塞进 Session 对象。
+
+### 1.2 备选方向:Claude 组织者 / Codex 执行者
+
+一个可选的多 agent 方向是 **Claude Code 作为组织者、Codex 作为执行者** 的分层模型。该方向尚未决定是否由 Synapse 实现,暂作为架构备选记录。
+
+Claude 会话负责理解目标、拆解任务、决定并行度、汇总结果与向用户解释取舍。Codex 会话作为被调度的执行 worker,负责在指定工作区内完成明确、边界清楚的实现、验证、审查或调查任务。
+
+Synapse 后端提供 agent bus,而不是依赖某个 CLI 内部的 session 间通信协议:
+
+- `AgentRegistry` 记录可调度的执行者:agentId、类型、workspace、thread/session ID、状态、角色与最近活动。
+- `send_message` 把 Claude 的任务投递到目标 Codex thread/session,底层优先走 Codex app-server 的 thread/turn 协议。
+- `wait_agent` 监听目标执行者的 turn 完成事件,把最终回复、执行过程摘要、文件变更与失败原因返回给组织者。
+- 所有跨 agent 消息落后端事件日志,用于网页展示、权限审计与失败恢复。
+
+若未来选择由 Synapse 实现,这层 bus 应作为 Synapse 自有能力:第一版只需要支持 Claude -> Codex 的单向调度和结果回收,不要把生产路径押在 Codex 内部 experimental collab/subagent 协议上。Codex app-server 暴露的 `collabAgentToolCall`、`spawnAgent`、`sendInput` 等事件可以展示和研究,但暂不作为稳定控制面。
+
+### 1.3 任务 agent 的 worktree 隔离(Phase 1 设计)
+
+Phase 1 从任务启动子 agent 时,默认让 agent 在一个独立的 `git worktree` 上工作,而非直接进主工作区 —— 多个子 agent 并行改同一个仓库、或用户自己正在主库里操作时,不互相踩。这一节定死这个机制在「主库 dirty」下的行为。
+
+**`git worktree add` 不要求主库 clean。** 它从某个 commit(默认 `HEAD`)拉一个新目录,主库的未提交改动留在原地、不跟过去。所以「建不建得出来」不是问题;真正的问题是**主库那些未提交改动 agent 看不到** —— 新 worktree 拿到的是干净的 `HEAD`。
+
+按「主库 dirty 的改动与本次任务的关系」分三种策略,由预检步(见 §5.2)让用户选,后端不替他猜:
+
+| 策略 | 适用 | 行为 |
+|---|---|---|
+| `require-clean` | 默认,最安全 | 主库 `git status --porcelain` 非空就报错,让用户先提交或 stash |
+| `ignore` | dirty 改动与任务无关(改的是别的东西、构建产物) | `git worktree add <path> -b synapse/<taskId> HEAD`,agent 从干净 HEAD 开始,用户的改动继续留在主库 |
+| `carry-stash` | dirty 改动是任务起点,agent 要接着改 | `worktree add` 后 `git -C <mainrepo> stash push -u`,再 `git -C <path> stash apply`(用 `apply` 不 `pop` —— 主库那份 stash 留着兜底);必须记下主库 stash ref 供任务结束时提示用户清理 |
+
+`carry-stash` 的坑,实现时注意:`stash apply` 到新 worktree 可能因索引状态 / 子模块冲突;`-u` 带上 untracked 但 `.gitignore` 的文件不带。
+
+**gitignore 的关键文件要单独搬。** worktree 是独立目录,`.env` / `.env.local` / `.claude/settings.local.json` / `node_modules` 都不会自动出现 —— 这与 dirty 无关,是 worktree 的固有性质。后端在 `worktree add` 后按一份可配置的 `linkFiles` 列表从主库 symlink 或 copy 过去;`node_modules` 太大,让 agent 自己 `npm install` 或整目录 symlink。
+
+**worktree vs 本地 clone。** worktree 共享 `.git`,主库的 `git gc` / `git rebase` / 切分支会经 HEAD 引用、reflog 影响所有 worktree。agent 跑很久、或用户会在主库频繁操作时,`git clone --shared <repo> <path>`(甚至完整 `clone`)隔离性更好,代价是磁盘与 `npm install` 时间。子 agent 场景默认用 worktree(轻、快),clone 作为可选项留在这里。
+
+**清理。** worktree 目录 `~/.synapse/worktrees/<project>-<taskId>`,任务结束后**不自动删**(和 tmux pane 同样的处置原则,见 §2.5)—— 里面可能有未提交/未合并的产物。UI 给一个显式的「移除 worktree」入口,执行 `git worktree remove` + 分支删除 + `carry-stash` 时提示主库残留的 stash。
+
+拟新增 `backend/worktree.ts`:
+
+```ts
+interface WorktreeSpec {
+  repoRoot: string;
+  branch: string;              // synapse/<taskId>
+  base: string;                // 默认 'HEAD'
+  dirtyStrategy: 'require-clean' | 'ignore' | 'carry-stash';
+  linkFiles: string[];         // 从主库软链过去的 gitignore 文件
+}
+
+// 返回 worktree 路径与 cleanup 回调(carry-stash 时 cleanup 内含主库 stash ref)
+async function createWorktree(spec: WorktreeSpec): Promise<{ path: string; cleanup: () => Promise<void> }>;
+```
+
+主 agent(tmux,用户 pane)不套 worktree —— 用户在自己的 pane 里,换目录不合适(呼应 §3.1 结论:wrapper 的 tmux 会话不套 policy)。
+
+### 1.4 任务数据的存储位置(Phase 1)
+
+`sessions.json` 按 `~/.synapse/<请求端口>/` 分区,因为会话跟着 daemon 实例走(见 §4「端口」段、store.ts 头注释)。任务数据不同:Project List 要跨 workspace 聚合,而不传 `--port` 的 wrapper 都复用同一默认 daemon —— 任务视图同样应活在一个不随测试端口分裂的用户级命名空间里。
+
+故 `tasks.json` 落 `~/.synapse/tasks.json`,**不带端口**。测试用环境变量 `SYNAPSE_TASKS_PATH` 覆盖以隔离生产数据。文件权限 `0600`,写入原子(临时文件 + chmod + rename)且串行化,JSON 解析失败不静默覆盖(重命名为 `tasks.json.corrupt-<ts>` 后新建空结构)。数据结构见 `docs/phase1-task-management.md`。
+
 ---
 
 ## 2. 关键实测结论
@@ -60,7 +132,7 @@
 
 因此 `matcher: "*"` 会让**所有**工具调用(包括只读操作)绕开 Claude Code 自身的权限模式,一律先挂起等网页决策。这在早期是有意选择(见 §6 全量监管前提),但代价是繁琐 —— 常规操作也要网页确认一遍,且与 Auto/Edit Mode 的直觉不符(切了模式,网页请求仍照发)。
 
-现按 `backend/sessionManager.ts` 的 `ENABLE_FULL_APPROVAL` 开关收窄:默认 `matcher` 只匹配 `AskUserQuestion`,其余工具（Bash/Write/Edit 等）交还给 Claude Code 内置权限系统处理，不再经过网页。需要恢复全量监管时把开关改回 `true` 即可，钩子入口与决策协议不变。
+现按 `backend/daemon.ts` 的 `ENABLE_FULL_APPROVAL` 开关收窄:默认 `matcher` 只匹配 `AskUserQuestion`,其余工具（Bash/Write/Edit 等）交还给 Claude Code 内置权限系统处理，不再经过网页。需要恢复全量监管时把开关改回 `true` 即可，钩子入口与决策协议不变。（开关与 hook 配置一起放在 `daemon.ts` —— hook 配置文件由 daemon 写,见 §3.1。）
 
 ### 2.3 ⚠ 钩子超时是 fail-open
 
@@ -236,16 +308,22 @@ StreamJsonTransport 无终端可供直接按键,中断只能经网页调用 `int
 
 ## 3. 数据协议
 
-### 3.1 settings 注入
+### 3.1 hook 配置注入
 
-写入工作区的 `.claude/settings.local.json`。
+**一份 daemon 级文件,所有会话共用,经 `--settings` 挂载 —— 不碰用户的仓库文件。**
 
-**必须合并,不得覆盖。** 该文件通常已被用户占用(model、permissions、插件、statusLine 等)。合并规则:
+早期实现把 hook 追加进每个工作区的 `.claude/settings.local.json`。那是工作区级、非会话级的文件,代价:
 
-- 顶层字段保留
-- `hooks` 下按事件名**追加**,不替换 —— 用户可能已有 PreToolUse / Stop 钩子
-- 写入前剔除本工具此前注入的条目(按 URL 含 `/api/claude-event` 识别),避免重启堆积
-- 文件权限 `0600`
+- 该目录里任何一个裸 `claude`(不经 wrapper)也会读到 hook,开始给后端发请求;
+- 同目录并存两个 wrapper 会话共用一份文件;
+- 会话退出后 hook 条目留在文件里,下一个无关的 `claude` 打到可能已死的后端 —— 按 §2.3 是 fail-open。
+`#writeSettings` 里那套「写入前按 URL 剔除旧条目」的去重逻辑就是为了缓解最后一条,治标不治本。
+
+**实测 + 官方文档确认:`claude --settings <path|json>` 是叠加而非覆盖。** 优先级从高到低:企业级 → `--settings`(CLI)→ `.claude/settings.local.json` → `.claude/settings.json` → `~/.claude/settings.json`。`--settings` 里写的键覆盖同名文件键、省略的键保留文件值;`hooks` 按**事件名 + matcher** 求并集,各来源的 hook 全部生效,互不遮蔽。
+
+因此 hook 配置改由 `daemon.ts` 的 `writeHookSettings()` 写一份 `~/.synapse/<请求端口>/hooks.settings.json`(`0600`),内容只有 `hooks`。所有会话(`TmuxTransport` 与 `StreamJsonTransport` 都是 `--settings <这个路径>`)共用它,并与各自工作区自己的 `.claude/settings*.json` 由 Claude Code 求并集 —— 不必把用户的 model / permissions 拷进来,也不写用户仓库里的任何文件。
+
+daemon 每次监听成功后重写一遍(幂等)。**URL 里的端口必须是实际监听端口**(默认端口被占用时会递增,见 §4),写错等同 fail-open,故 `writeHookSettings(请求端口, 实际端口)` 两个端口分开传:前者定文件路径,后者进 URL。文件路径仅依赖请求端口,可在监听前推导出来传给 `SessionManager`;文件本身等实际端口确定后才写,而会话启动都在监听成功之后,读到的一定是最新版本。
 
 ```json
 {
@@ -256,26 +334,28 @@ StreamJsonTransport 无终端可供直接按键,中断只能经网页调用 `int
         "hooks": [
           {
             "type": "http",
-            "url": "http://127.0.0.1:3000/api/claude-event",
+            "url": "http://127.0.0.1:47100/api/claude-event",
             "timeout": 300
           }
         ]
       }
     ],
     "Stop": [
-      { "hooks": [{ "type": "http", "url": "http://127.0.0.1:3000/api/claude-event", "timeout": 300 }] }
+      { "hooks": [{ "type": "http", "url": "http://127.0.0.1:47100/api/claude-event", "timeout": 300 }] }
     ],
     "SessionEnd": [
       {
         "matcher": "*",
-        "hooks": [{ "type": "http", "url": "http://127.0.0.1:3000/api/claude-event", "timeout": 300 }]
+        "hooks": [{ "type": "http", "url": "http://127.0.0.1:47100/api/claude-event", "timeout": 300 }]
       }
     ]
   }
 }
 ```
 
-`PreToolUse` 的 `matcher` 由 `ENABLE_FULL_APPROVAL` 开关控制,见 §2.3a。`Stop`/`SessionEnd` 不参与权限判断,`handleHookRequest` 里非 `PreToolUse` 事件一律立即放行 —— `SessionEnd` 额外触发退出回调(见 §2.13),`Stop` 目前只是占位。
+`PreToolUse` 的 `matcher` 由 `daemon.ts` 的 `ENABLE_FULL_APPROVAL` 开关控制,见 §2.3a(开关随 hook 配置一起搬到了 `daemon.ts`)。`Stop`/`SessionEnd` 不参与权限判断,`handleHookRequest` 里非 `PreToolUse` 事件一律立即放行 —— `SessionEnd` 额外触发退出回调(见 §2.13),`Stop` 目前只是占位。
+
+**副作用:hook 配置不再出现在工作区的 `.claude/settings.local.json` 里。** 那个文件通常是用户 gitignore 掉、用来查「Synapse 对我的仓库做了什么」的地方;现在要查得看 `~/.synapse/<端口>/hooks.settings.json`。实测(独立测试端口):stream-json 会话拿到的 `settingsPath` 正确指向该文件,`claude` 加载无报错;`ENABLE_FULL_APPROVAL=true` 下发一条需要 `Bash` 的提示词,后端 pending 表按 `tool_use_id` 挂起该调用、会话转 `waiting`、`deadlineAt` 就位 —— hook 全链路生效。
 
 ### 3.2 PreToolUse 钩子载荷(Claude Code → 后端)
 
@@ -334,7 +414,7 @@ StreamJsonTransport 无终端可供直接按键,中断只能经网页调用 `int
 
 ### 守护进程(`backend/daemon.ts`)
 
-状态存 `~/.synapse/<port>/`(`daemon.pid` / `port` / `token`,均 `0600`),由后端监听成功后自己写入 —— 端口递增发生在服务端,detached 启动的父进程读不到 stdout,无从得知最终端口。
+状态存 `~/.synapse/<port>/`(`daemon.pid` / `port` / `token` / `hooks.settings.json` / `sessions.json` / `daemon.log`,均 `0600`),由后端监听成功后自己写入 —— 端口递增发生在服务端,detached 启动的父进程读不到 stdout,无从得知最终端口。`hooks.settings.json` 是所有会话共用的 hook 配置,见 §3.1;`daemon.pid`/`port` 是「进程是否存活」的判定依据,`clearState()` 只清这两个,其余保留。
 
 健康检查必须 **PID 存活 + HTTP 探活且 token 相符** 双过:PID 可能已被系统回收并分配给无关进程,单看 PID 会误认;端口可能被别的程序占着,单看 HTTP 会把陌生服务当成自己人。任一不过即清理陈旧文件重启。
 
@@ -374,6 +454,13 @@ onEvent(fn)  订阅事件流
 阶段二:`TmuxTransport` — load-buffer/paste-buffer 注入,tail 转写文件。
 
 权限引擎**不在**此接口内。
+
+**`CreateOptions.appendSystemPrompt`** — `POST /api/sessions` 可带一段文本,后端拼成
+`claude --append-system-prompt <text>` 传给新会话(stream-json 与 tmux 自建会话都走
+`extraArgs`)。这是「把工作区约定 / 子 agent 模板固化进 system prompt」的最小能力,
+只在进程启动时读一次 —— **无法作用于已在跑的会话**(运行时改 system prompt 没有通道,
+唯一干净的注入点是启动前;详见 §7)。paneId 接管模式不生效:那条路径的 claude 由
+wrapper CLI 自己启动。存储层、worktree、预检 UI 等留待 Phase 1 子 agent 场景验证后再建。
 
 ---
 
@@ -416,6 +503,14 @@ Project 分组默认展开,用户手动收起的记入 localStorage(键存收起
 - **不算失败。** Claude Code 把这次 `deny` 等同工具失败,`tool_result` 的 `is_error` 为 `true`。但这是协议限制下的正常回传,不是真的出错 —— 归约逻辑(`reduceEvent` 与前端 `onSessionEvent` 的 `tool_result` 分支)对 `AskUserQuestion` 强制把 `isError` 记为 `false`,「N 步」折叠摘要与单步图标因此不会把提交回答/跳过标成失败。
 - **会话状态要收回。** `onApprovalRequested` 触发时会话被标 `waiting`(§4 PermissionEngine),但早期实现只在挂起时置位,没有对应的复位 —— `#settle` 落定决策后无人把 `s.state` 改回去,只能靠前端 `pendingFor()` 派生值动态覆盖显示,凡是直接读 `s.state` 原始字面量的地方都会一直显示"等待批准"。现在 `ResolveListener` 额外带上 `sessionId`,`onApprovalResolved` 里若该会话已无其它待批准项,按 `pendingTurns` 决定收回到 `busy` 还是 `ready`。
 
+### 5.2 从任务启动子 agent 的预检步(Phase 1 设计)
+
+从任务启动子 agent 前插入一步确认 —— system prompt、cwd/worktree、`--add-dir`、model 全是启动参数,启动后不可变(见 §7 与 §4 `CreateOptions.appendSystemPrompt`),既然如此就在唯一能真正生效的时刻让用户确认。这一步同时决定 §1.3 的 worktree `dirtyStrategy`。
+
+对话框展示:目标工作区、`git status --porcelain` 结果(dirty 时高亮)、worktree 策略选择(`require-clean` / `ignore` / `carry-stash`)、要注入 system prompt 的最终文本(可预览)、model、`--add-dir` 列表。默认值来自工作区 / project 的 policy(policy 存储层本身留待验证后再建,见 §4 与 §3.1);改动只作用于这一次,除非用户勾「设为该工作区默认」。
+
+运行中的会话不进入这个流程 —— 无法改 system prompt,唯一「动态」的手段是往对话里 `send()` 一条要求消息,效果弱且会污染时间线,不作为正式路径。
+
 ---
 
 ## 6. 安全
@@ -440,3 +535,4 @@ Project 分组默认展开,用户手动收起的记入 localStorage(键存收起
 - **中断能力** — `interrupt()` 目前发 SIGINT,stream-json 下的正确中断方式尚未实测确认,可能会终止整个会话。
 - **崩溃恢复** — 后端退出会带走所有子进程。`--resume <session_id>` 可恢复对话上下文,但不恢复进行中的轮次。恢复流程尚未设计。
 - **阶段二 tmux** — 提供进程存活与终端 attach 能力,接口已预留。
+- **任务 agent 的 worktree 隔离** — 设计见 §1.3,预检步见 §5.2;`backend/worktree.ts` 与 policy 存储层待 Phase 1 子 agent 场景验证后落地。
