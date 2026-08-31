@@ -516,6 +516,8 @@ Project 分组默认展开,用户手动收起的记入 localStorage(键存收起
 
 运行中的会话不进入这个流程 —— 无法改 system prompt,唯一「动态」的手段是往对话里 `send()` 一条要求消息,效果弱且会污染时间线,不作为正式路径。
 
+**已落地范围(Phase 1 · 7a)。** `POST /api/tasks/:id/agents/start` 复用 `manager.create()` 起一个 stream-json 子 agent、写 `agent_started` 事件、按方案模板(项目 / 工作区 / 任务 / 目标 / 验收 / 子任务 / 收尾格式)拼 prompt 后 `send()`。`role:'main' + transport:'tmux'` 返回 400 —— 网页接管不了用户 pane。预检对话框展示工作区、`GET /api/git-status` 的 `git status --porcelain` 结果(**信息用途,7a 不阻断**)、system prompt 最终文本预览、model。**worktree 隔离(`dirtyStrategy` 三策略)与 policy 存储层是 7b,尚未落地** —— 子 agent 目前直接在传入工作区上跑,见 §1.3 / §7。
+
 ---
 
 ## 6. 安全

@@ -491,6 +491,12 @@ textarea:focus { outline: 2px solid var(--blue); outline-offset: -1px; backgroun
 .modal label { display: block; font-size: 12px; color: var(--ink-2); margin-bottom: 4px; }
 .modal-act { display: flex; gap: 8px; justify-content: flex-end; }
 .modal .err { color: var(--red); font-size: 12.5px; margin-bottom: 10px; }
+.sa-git { font-size: 12px; margin: -6px 0 12px; }
+.sa-preview {
+  margin: 0 0 12px; padding: 10px; border-radius: 8px; background: var(--bg);
+  border: 1px solid var(--hair); font: 11.5px/1.5 var(--mono); color: var(--ink-2);
+  white-space: pre-wrap; max-height: 180px; overflow-y: auto;
+}
 
 /* ══ 任务视图 ══════════════════════════════════════════════════
    项目列表借用左栏(mode-switch 切换),任务列表 + 详情占主区两栏 ——

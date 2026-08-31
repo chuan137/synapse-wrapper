@@ -1251,9 +1251,13 @@ function renderTaskDetail() {
     .map((s) => `<option value="${s.localId}">${esc(s.name)}${s.title ? ' · ' + esc(s.title) : ''} (${s.transport})</option>`)
     .join('');
 
+  // 启动子 agent 的默认工作区:优先 project 的第一个 root。
+  const defaultWs = project?.workspaceRoots?.[0] ?? '';
+
   const agentsBlock = `<div class="td-agents">
     <div class="td-sect-head"><h3>Agents</h3>
       <div class="bind-row">
+        <button class="btn pri" id="startSub">启动子 agent</button>
         <select id="bindSel"><option value="">绑定已有会话…</option>${bindOpts}</select>
         <select id="bindRole"><option value="sub">子 agent</option><option value="main">主 agent</option></select>
         <button class="btn" id="bindBtn">绑定</button>
@@ -1291,6 +1295,7 @@ function renderTaskDetail() {
     loadTasks(state.taskProjectId);
   };
   $('editTask').onclick = () => openEditTaskModal(task);
+  $('startSub').onclick = () => openStartAgentModal(task, project, defaultWs);
   $('bindBtn').onclick = async () => {
     const localId = $('bindSel').value;
     const role = $('bindRole').value;
@@ -1380,6 +1385,102 @@ function openEditTaskModal(task) {
       await loadTasks(state.taskProjectId);
     },
   });
+}
+
+/**
+ * 从任务启动子 agent 的预检对话框(spec §5.2)。system prompt / cwd / model
+ * 都是启动参数、启动后不可变,在唯一能生效的时刻让用户确认。
+ * 7a:git status 只作信息展示,不阻断;worktree 策略选择留待 7b。
+ */
+function openStartAgentModal(task, project, defaultWs) {
+  const promptPreview = (userText) => [
+    '你是该任务的子 agent。', '',
+    `项目:${project?.name ?? '(未命名)'}`,
+    `工作区:${defaultWs}`,
+    `任务:${task.title}`,
+    `目标:${task.goal || '(未填写)'}`,
+    `验收:${task.acceptance || '(未填写)'}`, '',
+    '请只完成以下子任务:', userText || '(在上方填写)', '',
+    '完成后用简短中文总结:', '- 做了什么', '- 改了哪些文件', '- 如何验证', '- 剩余风险',
+  ].join('\n');
+
+  const bg = document.createElement('div');
+  bg.className = 'modal-bg';
+  bg.innerHTML = `<div class="modal">
+    <h3>启动子 agent</h3>
+    <p>子 agent 用 stream-json 传输在后台执行。启动参数(工作区、system prompt、模型)启动后不可改。</p>
+    <label for="saWs">工作区</label>
+    <input id="saWs" value="${esc(defaultWs)}" spellcheck="false">
+    <div class="sa-git muted" id="saGit">检查 git 状态…</div>
+    <label for="saPrompt">子任务</label>
+    <textarea id="saPrompt" rows="3" placeholder="要子 agent 完成的具体子任务"></textarea>
+    <label for="saModel">模型</label>
+    <select id="saModel">
+      <option value="">默认(跟随 CLI / settings.json)</option>
+      <option value="claude-opus-5">Opus 5</option>
+      <option value="claude-sonnet-5">Sonnet 5</option>
+      <option value="claude-haiku-4-5-20251001">Haiku 4.5</option>
+    </select>
+    <label>发给子 agent 的 prompt 预览</label>
+    <pre class="sa-preview" id="saPreview">${esc(promptPreview(''))}</pre>
+    <div class="err" id="saErr" style="display:none"></div>
+    <div class="modal-act">
+      <button class="btn" id="saCancel">取消</button>
+      <button class="btn pri" id="saOk">启动</button>
+    </div>
+  </div>`;
+  document.body.append(bg);
+  const close = () => bg.remove();
+  bg.querySelector('#saCancel').onclick = close;
+  bg.onclick = (e) => { if (e.target === bg) close(); };
+
+  const wsInput = bg.querySelector('#saWs');
+  const promptInput = bg.querySelector('#saPrompt');
+  const preview = bg.querySelector('#saPreview');
+  const gitLine = bg.querySelector('#saGit');
+  promptInput.oninput = () => { preview.textContent = promptPreview(promptInput.value.trim()); };
+
+  const checkGit = async () => {
+    const ws = wsInput.value.trim();
+    if (!ws) { gitLine.textContent = ''; return; }
+    gitLine.textContent = '检查 git 状态…';
+    try {
+      const r = await api(`/api/git-status?workspace=${encodeURIComponent(ws)}`);
+      if (!r.isRepo) gitLine.textContent = '不是 git 仓库';
+      else if (!r.porcelain.trim()) gitLine.textContent = 'git 工作区干净';
+      else {
+        const n = r.porcelain.trim().split('\n').length;
+        gitLine.innerHTML = `<span style="color:var(--amber)">git 有 ${n} 处未提交改动</span> —— 子 agent 直接在此工作区上跑(7a 不隔离 worktree)`;
+      }
+    } catch (e) { gitLine.textContent = `git 状态查询失败:${e.message}`; }
+  };
+  wsInput.onchange = checkGit;
+  checkGit();
+
+  bg.querySelector('#saOk').onclick = async () => {
+    const workspace = wsInput.value.trim();
+    if (!workspace) { wsInput.focus(); return; }
+    const ok = bg.querySelector('#saOk');
+    const err = bg.querySelector('#saErr');
+    ok.disabled = true;
+    try {
+      await api(`/api/tasks/${task.id}/agents/start`, {
+        method: 'POST',
+        body: JSON.stringify({
+          role: 'sub',
+          transport: 'stream-json',
+          workspace,
+          prompt: promptInput.value.trim() || undefined,
+          model: bg.querySelector('#saModel').value || undefined,
+        }),
+      });
+      close();
+      loadTaskDetail(task.id);
+      loadTasks(state.taskProjectId);
+    } catch (e) {
+      err.textContent = e.message; err.style.display = 'block'; ok.disabled = false;
+    }
+  };
 }
 
 function taskModal({ title, values, onSubmit }) {

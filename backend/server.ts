@@ -9,12 +9,13 @@
 import express from 'express';
 import { WebSocketServer, type WebSocket } from 'ws';
 import { createServer } from 'node:http';
+import { execFile } from 'node:child_process';
 import { resolve } from 'node:path';
 import { existsSync, statSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { SessionManager, replayTranscriptTimeline, mergedTodos, type ManagerEvent, type SessionSummary } from './sessionManager.ts';
 import { PermissionEngine, HOOK_TIMEOUT_S, type PendingApproval } from './permissions.ts';
-import { TaskStore, tasksPath, type AgentBinding } from './taskStore.ts';
+import { TaskStore, tasksPath, type AgentBinding, type Project, type Task } from './taskStore.ts';
 import {
   writeState, clearState, readOrCreateToken, writeHookSettings, hookSettingsPath,
   DEFAULT_PORT, MAX_PORT_TRIES,
@@ -395,6 +396,114 @@ app.post('/api/tasks/:id/agents', (req, res) => {
   } catch (err) {
     // TaskStore 在「会话已绑其它 active task」时抛错 —— 转 409(方案 §339)。
     res.status(409).json({ error: String(err instanceof Error ? err.message : err) });
+  }
+});
+
+/**
+ * 从任务启动子 agent(Phase 1 · 7a:不带 worktree)。
+ * body: { role, transport?, workspace, prompt?, model?, appendSystemPrompt? }
+ *
+ * 复用 manager.create() —— 与 POST /api/sessions 同一条创建路径。worktree 隔离
+ * (spec §1.3)、预检 policy 存储留待 7b,本步只验证「起 stream-json 子 agent +
+ * prompt 模板 + agent_started 事件 + 卡片状态」这条主链路。
+ */
+function subAgentPrompt(
+  project: Project | undefined,
+  task: Task,
+  workspace: string,
+  userPrompt: string,
+): string {
+  return [
+    '你是该任务的子 agent。',
+    '',
+    `项目:${project?.name ?? '(未命名)'}`,
+    `工作区:${workspace}`,
+    `任务:${task.title}`,
+    `目标:${task.goal || '(未填写)'}`,
+    `验收:${task.acceptance || '(未填写)'}`,
+    '',
+    '请只完成以下子任务:',
+    userPrompt,
+    '',
+    '完成后用简短中文总结:',
+    '- 做了什么',
+    '- 改了哪些文件',
+    '- 如何验证',
+    '- 剩余风险',
+  ].join('\n');
+}
+
+/** 预检用:目标工作区的 git 状态(信息用途,7a 不据此阻断)。 */
+app.get('/api/git-status', (req, res) => {
+  if (!checkOrigin(req, res)) return;
+  const workspace = resolve(String(req.query.workspace ?? ''));
+  if (!workspace || !existsSync(workspace)) {
+    res.status(400).json({ error: '工作目录不存在' });
+    return;
+  }
+  execFile('git', ['-C', workspace, 'status', '--porcelain'], { timeout: 5000 }, (err, stdout) => {
+    if (err) {
+      res.json({ isRepo: false, porcelain: '' });
+      return;
+    }
+    res.json({ isRepo: true, porcelain: stdout });
+  });
+});
+
+app.post('/api/tasks/:id/agents/start', async (req, res) => {
+  if (!checkOrigin(req, res)) return;
+  const task = tasks.getTask(String(req.params.id));
+  if (!task) {
+    res.status(404).json({ error: 'task 不存在' });
+    return;
+  }
+  const b = req.body ?? {};
+  const role = b.role === 'main' ? 'main' : 'sub';
+  const transport = b.transport === 'tmux' ? 'tmux' : 'stream-json';
+  const workspace = resolve(String(b.workspace ?? ''));
+
+  if (role === 'main' && transport === 'tmux') {
+    // 网页接管不了用户 pane —— 主 tmux agent 只能在终端用 wrapper 起,再绑定进来。
+    res.status(400).json({ error: '不能从网页启动 tmux 主 agent,请在终端用 wrapper 起会话后绑定' });
+    return;
+  }
+  if (!workspace || !existsSync(workspace) || !statSync(workspace).isDirectory()) {
+    res.status(400).json({ error: '工作目录不存在' });
+    return;
+  }
+
+  const userPrompt = typeof b.prompt === 'string' && b.prompt.trim() ? b.prompt.trim() : '';
+  const project = tasks.getProject(task.projectId);
+  const appendSystemPrompt =
+    typeof b.appendSystemPrompt === 'string' && b.appendSystemPrompt.trim()
+      ? b.appendSystemPrompt
+      : undefined;
+
+  try {
+    const s = await manager.create(workspace, {
+      transport,
+      model: typeof b.model === 'string' && b.model.trim() ? b.model.trim() : undefined,
+      appendSystemPrompt,
+    });
+    const binding = tasks.attachAgent({
+      taskId: task.id,
+      localId: s.localId,
+      claudeId: s.claudeId,
+      role,
+      transportKind: s.transportKind,
+    });
+    tasks.appendEvent({
+      taskId: task.id,
+      agentBindingId: binding.id,
+      kind: 'agent_started',
+      message: `启动 ${role} agent(${transport})于 ${workspace}`,
+    });
+    if (userPrompt) {
+      manager.send(s.localId, subAgentPrompt(project, task, workspace, userPrompt));
+    }
+    res.json(taskDetail(task.id));
+  } catch (err) {
+    res.status(500).json({ error: String(err instanceof Error ? err.message : err) });
   }
 });
 
