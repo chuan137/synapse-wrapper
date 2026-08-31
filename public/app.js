@@ -41,6 +41,7 @@ const state = {
   taskList: [],          // 当前 project 的任务列表(带聚合)
   taskId: null,          // 当前打开的任务
   taskDetail: null,      // GET /api/tasks/:id
+  taskError: '',         // 最近一次任务操作的错误(409/400/404 等),渲染在详情顶部
   draftQueue: new Map(), // localId -> string[],会话忙碌时攒的待发 prompt(纯前端,不持久化)
   pinBottom: false,      // 下次 renderDetail 是否无条件贴底(切会话/切页签/刚发消息)
   // toolUseId -> { [qi]: { oi: Set<number|'other'>, other: string } }
@@ -1156,6 +1157,7 @@ function selectProject(id) {
 function selectTask(id) {
   state.taskId = id;
   state.taskDetail = null;
+  state.taskError = '';
   renderTaskList();
   loadTaskDetail(id);
 }
@@ -1180,7 +1182,7 @@ function renderProjectNav() {
     </div>`;
   }).join('');
   $('nav').innerHTML = `<div class="nav-sect">项目</div>${rows ||
-    '<div class="nav-empty">还没有项目。用 <code>wrapper</code> 在某个目录起一个会话,或从会话视图新建。</div>'}`;
+    '<div class="nav-empty">还没有项目。项目按会话的工作区自动生成 —— 切到<b>会话</b>视图新建一个会话,或在终端跑 <code>wrapper</code>。</div>'}`;
   for (const el of $('nav').querySelectorAll('.proj-row')) {
     el.onclick = () => selectProject(el.dataset.id);
   }
@@ -1225,6 +1227,12 @@ function renderTaskList() {
   }
 }
 
+/** 任务操作失败时在详情顶部显示一条可关闭的错误条,替代打断式 alert。 */
+function showTaskError(msg) {
+  state.taskError = msg;
+  renderTaskDetail();
+}
+
 function renderTaskDetail() {
   if (state.mode !== 'tasks') return;
   const d = state.taskDetail;
@@ -1235,6 +1243,8 @@ function renderTaskDetail() {
   }
   const { task, project, agents, events } = d;
   const st = task.status;
+  const errBar = state.taskError
+    ? `<div class="td-err">${esc(state.taskError)}<button id="tdErrX" title="关闭">✕</button></div>` : '';
 
   const brief = `<div class="td-brief">
     <dl>
@@ -1244,7 +1254,7 @@ function renderTaskDetail() {
   </div>`;
 
   const agentCards = agents.length ? agents.map((a) => agentCard(a)).join('') :
-    `<div class="muted" style="padding:4px 0">还没有绑定 agent。</div>`;
+    `<div class="muted" style="padding:4px 0">还没有 agent。「启动子 agent」在后台起一个,或「绑定已有会话」把手头的会话挂进来。</div>`;
 
   const bindOpts = [...state.sessions.values()]
     .filter((s) => s.state !== 'exited')
@@ -1275,6 +1285,7 @@ function renderTaskDetail() {
   </div>`;
 
   $('colDetail').innerHTML = `
+    ${errBar}
     <div class="td-head">
       <div class="crumb">${esc(project?.name ?? '')} / ${esc(task.title)}</div>
       <div class="td-head-main">
@@ -1288,11 +1299,16 @@ function renderTaskDetail() {
     </div>
     <div class="td-body">${brief}${agentsBlock}${timeline}</div>`;
 
+  const errX = $('tdErrX');
+  if (errX) errX.onclick = () => { state.taskError = ''; renderTaskDetail(); };
+
+  const afterMutation = () => { state.taskError = ''; loadTaskDetail(task.id); loadTasks(state.taskProjectId); };
+
   $('tdStatus').onchange = async (e) => {
-    try { await api(`/api/tasks/${task.id}`, { method: 'PATCH', body: JSON.stringify({ status: e.target.value }) }); }
-    catch (err) { alert(err.message); }
-    loadTaskDetail(task.id);
-    loadTasks(state.taskProjectId);
+    try {
+      await api(`/api/tasks/${task.id}`, { method: 'PATCH', body: JSON.stringify({ status: e.target.value }) });
+      afterMutation();
+    } catch (err) { showTaskError(err.message); }
   };
   $('editTask').onclick = () => openEditTaskModal(task);
   $('startSub').onclick = () => openStartAgentModal(task, project, defaultWs);
@@ -1302,9 +1318,8 @@ function renderTaskDetail() {
     if (!localId) return;
     try {
       await api(`/api/tasks/${task.id}/agents`, { method: 'POST', body: JSON.stringify({ localId, role }) });
-      loadTaskDetail(task.id);
-      loadTasks(state.taskProjectId);
-    } catch (err) { alert(err.message); }
+      afterMutation();
+    } catch (err) { showTaskError(err.message); }
   };
   for (const el of $('colDetail').querySelectorAll('[data-open-session]')) {
     el.onclick = () => { switchMode('sessions'); navigate(el.dataset.openSession); };
@@ -1312,10 +1327,10 @@ function renderTaskDetail() {
   for (const el of $('colDetail').querySelectorAll('[data-detach]')) {
     el.onclick = async () => {
       if (!confirm('解除该 agent 绑定?底层会话不会关闭。')) return;
-      try { await api(`/api/tasks/${task.id}/agents/${el.dataset.detach}`, { method: 'DELETE' }); }
-      catch (err) { alert(err.message); }
-      loadTaskDetail(task.id);
-      loadTasks(state.taskProjectId);
+      try {
+        await api(`/api/tasks/${task.id}/agents/${el.dataset.detach}`, { method: 'DELETE' });
+        afterMutation();
+      } catch (err) { showTaskError(err.message); }
     };
   }
 }
@@ -1332,7 +1347,13 @@ function agentCard(a) {
   const s = a.session; // 现有 session summary 形状 + pendingCount(可能为 null)
   const ended = b.endedAt !== null;
   const transport = b.transportKind === 'tmux' ? 'tmux' : 'json';
-  const stateLabel = ended ? '已解绑' : (s ? (STATE_LABEL[s.state] ?? s.state) : '会话不在');
+  // tmux 会话 exited = 承载 pane 已消失(存活巡检据此判 exited,见 spec §2.13);
+  // 对用户来说「pane 已失效」比「已退出」更准确 —— claude 进程可能还在,只是
+  // 网页失去了观察它的通道。
+  const deadPane = s && s.state === 'exited' && s.transport === 'tmux';
+  const stateLabel = ended ? '已解绑'
+    : deadPane ? 'pane 已失效'
+    : (s ? (STATE_LABEL[s.state] ?? s.state) : '会话不在');
   const stateCls = ended ? 'idle'
     : !s ? 'idle'
     : s.state === 'waiting' || (a.pending?.length) ? 'wait'

@@ -582,6 +582,16 @@ textarea:focus { outline: 2px solid var(--blue); outline-offset: -1px; backgroun
 
 /* 任务详情 */
 .td-empty { margin: auto; padding: 40px; color: var(--ink-3); font-size: 13px; text-align: center; }
+.td-err {
+  display: flex; align-items: center; gap: 10px; flex: none;
+  background: var(--red-soft); color: var(--red); font-size: 12.5px;
+  padding: 8px 16px; border-bottom: 1px solid #eccac6;
+}
+.td-err button {
+  margin-left: auto; border: 0; background: transparent; color: inherit;
+  cursor: pointer; font-size: 13px; line-height: 1;
+}
+.nav-empty b { color: var(--ink-2); }
 .td-head {
   background: rgba(255,255,255,.85); backdrop-filter: saturate(180%) blur(20px);
   border-bottom: 1px solid var(--hair); padding: 14px 22px 12px; flex: none;
