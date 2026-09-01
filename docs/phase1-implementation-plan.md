@@ -96,7 +96,7 @@ export interface AppendTaskEventInput {
 ### 测试框架决策
 
 项目当前无测试框架(方案 §498 允许先写轻量 Node 脚本)。
-**决策**:用 Node 内置 `node:test` + `node:assert`,免新依赖(Node 24 环境,spec §2.7)。
+**决策**:用 Node 内置 `node:test` + `node:assert`,免新依赖(Node 24 环境,spec §2.2)。
 加 `package.json` script:`"test": "node --test --disable-warning=ExperimentalWarning backend/*.test.ts"`。
 
 ### 验收
@@ -122,7 +122,7 @@ export interface AppendTaskEventInput {
 
 ## Step 2 —— `wrapper serve` 入口
 
-**依据**:方案 §「`wrapper serve` 入口」;spec §2.5(wrapper 必须在 tmux 内)、§4 守护进程。
+**依据**:方案 §「`wrapper serve` 入口」;spec §0.1 / notes(CLI 必须在 tmux 内)、§4 守护进程。
 
 ### 改动文件
 
@@ -261,7 +261,7 @@ export interface AppendTaskEventInput {
 
 ## Step 5 —— 任务事件聚合
 
-**依据**:方案 §「事件聚合」;spec §2.13(SessionEnd)、§2.9(turn_end / stop_reason)、§4 PermissionEngine。
+**依据**:方案 §「事件聚合」;notes/implementation-lessons.md(SessionEnd 双通道)、notes/claude-code-behavior.md(turn_end / stop_reason)、spec §4 PermissionEngine。
 
 ### 改动文件
 
@@ -327,12 +327,12 @@ fail-safe 验证:binding 查不到时,原 `broadcast(e)` / `manager.setState` �
 - 任务列表项:title、goal 摘要、status、agent 数、待批准数(方案 §428)。
 - 任务详情(方案 §429):目标 + 验收;main agent 卡片;sub agents 卡片;每个 agent 的 transport / state / context / cost / pending;任务流事件列表。
 - 交互第一版(方案 §436):创建任务、编辑任务基本字段、绑定当前已有 session、点 agent 打开现有会话详情(复用 `renderDetail`)。「从任务启动子 agent」留 step 7。
-- WS:收到 `task_event` 且当前正看该 task → 增量追加到任务流;否则刷新列表角标。参照 spec §2.10 教训 —— 首次拉取(HTTP)与增量(WS)必须落同一套渲染结构。
-- 排序:项目按 name `localeCompare`,任务按 `createdAt`(呼应 spec §2.17 固定排序,不随状态跳动)。
+- WS:收到 `task_event` 且当前正看该 task → 增量追加到任务流;否则刷新列表角标。参照 notes/implementation-lessons.md「timeline 双路径对齐」教训 —— 首次拉取(HTTP)与增量(WS)必须落同一套渲染结构。
+- 排序:项目按 name `localeCompare`,任务按 `createdAt`(呼应 notes/implementation-lessons.md「左栏排序固定」,不随状态跳动)。
 
 ### mock 文件处置
 
-`public/task-mock.*` 是 git 未跟踪的视觉稿。**决策**:样式并入 `app.css` 后,把 mock 文件删除(不 commit),避免留下第二套漂移的样式源(呼应 spec §2.10 对「两份独立实现」的警惕)。
+`public/task-mock.*` 是 git 未跟踪的视觉稿。**决策**:样式并入 `app.css` 后,把 mock 文件删除(不 commit),避免留下第二套漂移的样式源(呼应 notes/implementation-lessons.md 对「两份独立实现」的警惕)。
 
 ### 验收
 

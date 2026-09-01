@@ -373,7 +373,7 @@ Phase 1 约束:
 
 ## `wrapper serve` 入口
 
-现有 `wrapper`(spec §2.5 / handoff)是「带前置准备的 claude」:必须在 tmux 内跑,就地接管当前 pane 启动一个 claude 会话,拉起 daemon 只是副作用。任务面板只需要 daemon + 网页 UI,不需要这个附带的会话 —— 从网页里创建任务、绑定已有会话、启动子 agent 时,没有「当前 workspace」这个概念。
+现有 `synapse`(spec §0.1 / notes / handoff)是「带前置准备的 claude」:必须在 tmux 内跑,就地接管当前 pane 启动一个 claude 会话,拉起 daemon 只是副作用。任务面板只需要 daemon + 网页 UI,不需要这个附带的会话 —— 从网页里创建任务、绑定已有会话、启动子 agent 时,没有「当前 workspace」这个概念。
 
 因此 Phase 1 加一个轻量子命令:
 
@@ -543,7 +543,7 @@ Phase 1 之后的一个方向是让主 agent 变成「只编排、不动手」�
 
 但它与 Phase 1 现状有几处冲突,需要专门设计:
 
-- **hook 开关**:现在默认 `matcher` 只匹配 `AskUserQuestion`,其余工具交还 Claude Code 内置权限系统(spec §2.3a)。裁剪主 agent 工具能力要重新打开 `ENABLE_FULL_APPROVAL` 或引入按工具名的自动决策层,且必须 fail-closed —— hook 超时是 fail-open(spec §2.3),「按调用次数打断」这类计数策略一旦后端判断慢了就形同虚设。
+- **hook 开关**:现在默认 `matcher` 只匹配 `AskUserQuestion`,其余工具交还 Claude Code 内置权限系统(spec §2.1)。裁剪主 agent 工具能力要重新打开 `ENABLE_FULL_APPROVAL` 或引入按工具名的自动决策层,且必须 fail-closed —— hook 超时是 fail-open(spec §2.2),「按调用次数打断」这类计数策略一旦后端判断慢了就形同虚设。
 - **主 agent 的 transport**:Phase 1 的主 agent 是 tmux 接管模式(用户自己的 pane),spec §3.1 明确「wrapper 的 tmux 会话不套 policy」。要真正控制主 agent 看到的工具,可能得把主 agent 从 tmux 改成 stream-json,这会牺牲「用户在原生 TUI 里接管」的能力。
 - **触发通道**:主 agent 如何触发子 agent —— 自定义 MCP 工具?还是拦截 `Task` 工具调用改写成「创建子 agent binding」?未定。
 - **中断能力**:spec §7 —— stream-json 下 `interrupt()` 可能杀掉整个会话,「read 多次就 stop 他」需要可靠的逐轮中断,先实测掉。

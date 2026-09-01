@@ -7,34 +7,84 @@
 
 ---
 
+## 0. 命名与路径约定
+
+### 0.1 CLI 命名:单一 `synapse` 命令 + 子命令
+
+历史上入口叫 `wrapper`,`wrapper daemon <...>` 是它的子命令,主 agent 调度设计(`docs/design/main-agent-orchestration.md`)又拟了个独立的 `synapse-agent`。统一成**一个 `synapse` 命令**,其余都是子命令:
+
+| 旧 | 新 |
+|---|---|
+| `wrapper [目录] [-- <claude 参数>]` | `synapse [目录] [-- <claude 参数>]`(默认动作:就地拉起 claude,不变) |
+| `wrapper daemon <start\|status\|restart\|stop>` | `synapse daemon <start\|status\|restart\|stop>` |
+| `synapse-agent <context\|spawn\|wait\|doc>` | `synapse agent <context\|spawn\|wait\|doc>` |
+
+`bin/wrapper` → `bin/synapse`(无扩展名 JS 薄壳,§2.2 约束不变),`bin/wrapper.ts` → `bin/synapse.ts`,`package.json` 的 `bin` 键 `wrapper` → `synapse`。子命令分发在薄壳之后的实现里按 `argv[0]` 分:无参或路径 → 就地起 claude;`daemon` / `agent` → 各自的子模块。`agent` 子命令是 daemon HTTP 端点的瘦客户端(见 `docs/design/main-agent-orchestration.md`),不是单独的 binary。
+
+**代码重命名尚未执行** —— 本节先定约定,`bin/`、`backend/`、`package.json` 与各处注释里的 `wrapper` 字样待统一改。改的时候一次性 sweep,`npm run typecheck` 兜底。
+
+### 0.2 Artifacts 路径:`~/.synapse/artifacts/<cwd 转写>-<sessionId 前缀>/`
+
+会话产出物(Artifacts 页签,§5;后端目前未采集,见 handoff)统一落:
+
+```
+~/.synapse/artifacts/<cwd 路径转写>-<sessionId 前 8 位>/
+```
+
+- `<cwd 路径转写>` 与 Claude Code 转写目录同一套规则:斜杠转连字符,前导斜杠保留成前导连字符(如 `/Users/me/proj` → `-Users-me-proj`)。**不要自行推算**能拿到的路径 —— 能从钩子/事件载荷取到就取(见 `docs/notes/claude-code-behavior.md`)。
+- `<sessionId 前 8 位>`:裸 UUID 的前 8 个字符,同目录并存的多个会话据此分开,不必写全长。
+- 与 `worktrees/`(§1.3)、`tasks.json`(§1.4)、`<port>/`(§4)平级,都在 `~/.synapse/` 下;artifacts 按会话分、不按端口分(产出物跟会话走,不跟 daemon 实例走)。
+
+目录不自动清理(呼应 §1.3 worktree、接管模式下 tmux pane 归用户的处置原则)—— 里面是会话的产出。UI 提供显式删除入口。
+
+---
+
 ## 1. 架构
 
 ```
-                +----------------------------------------------+
-                |                  浏览器 UI                    |
-                |  顶层:优先级流(全部会话)                    |
-                |  详情:改动文件 / Artifacts / 对话 / 终端输出  |
-                +----------------------+-----------------------+
-                       WebSocket       |      HTTP
-                    (状态与事件推送)    | (提示词与批准决策)
-                                       v
-                +----------------------------------------------+
-                |                  Web 后端                     |
-                |  SessionManager   — 多会话生命周期            |
-                |  PermissionEngine — 钩子接收 + 决策挂起        |
-                |  SessionTransport — 传输抽象                  |
-                +----------+-----------------------+-----------+
-                           |                       |
-              HTTP 钩子响应 |                       | NDJSON over stdin/stdout
-             (allow / deny) |                       |
-                           v                       v
-                +----------------------------------------------+
-                |  claude -p --input-format stream-json   × N   |
-                |  每个工作区一个常驻子进程                      |
-                +----------------------------------------------+
+        +----------------------------------------------------------+
+        |                       浏览器 UI                           |
+        |  任务视图:项目 / 任务 / 任务详情(Phase 1 默认)          |
+        |  会话视图:优先级流 + 单会话详情                           |
+        |    详情页签:改动文件 / Artifacts / 对话 / 终端输出        |
+        +---------------------------+------------------------------+
+                    WebSocket       |      HTTP
+                 (状态与事件推送)    | (提示词、批准决策、任务读写)
+                                    v
+        +----------------------------------------------------------+
+        |                        Web 后端                           |
+        |  SessionManager   — 多会话生命周期、运行时统计            |
+        |  PermissionEngine — 钩子接收 + 决策挂起(fail-closed)     |
+        |  SessionTransport — 传输抽象(tmux / stream-json)        |
+        |  TaskStore        — 项目 / 任务 / agent 绑定 / 任务流事件 |
+        |                     独立于 SessionManager,单向引用会话   |
+        +--------+---------------------+-------------------------+--+
+                 |                     |                         |
+    HTTP 钩子响应 |                     | NDJSON over stdin/stdout | tmux paste-buffer
+   (allow / deny) |                     |   (StreamJsonTransport)  | + tail 转写文件
+                 v                     v                         v
+        +----------------------------------------------------------+
+        |  claude(--settings <hook 配置>)  × N                    |
+        |    tmux 接管(长命):用户 pane 里的原生 TUI,进程独立于   |
+        |      后端存活,wrapper/synapse CLI 起                     |
+        |    stream-json(短命):后端 spawn 的子进程,后端退出即消失 |
+        |      网页从任务里起的子 agent                             |
+        +----------------------------------------------------------+
 ```
 
-**为什么是 stream-json 而不是 tmux。** 早期方案用 tmux 承载交互式 TTY,配合 paste-buffer 注入提示词、tail 转写文件取输出。实测确认 stream-json 提供双向 JSON 协议,直接消除了缓冲区注入、ANSI 清洗、转写解析三块工作量。tmux 的独有价值(进程存活于后端重启、终端可 attach)被评估为 nice-to-have,列入阶段二。
+**两种传输并存,不是先后替代;本质区别是生命周期归谁。**
+
+最初的实现(初始提交「tmux 包装 + 网页监管」)只有 tmux。后来加了 `StreamJsonTransport`(`claude -p --input-format stream-json`,双向 NDJSON),消除了缓冲区注入、ANSI 清洗、转写解析。
+
+| | `TmuxTransport`(长命会话) | `StreamJsonTransport`(短命会话) |
+|---|---|---|
+| 进程归属 | 活在用户的 tmux pane 里,后端只是旁路观察者 | 后端 `spawn` 的子进程 |
+| 后端重启 | claude 照跑,后端重启后重新探活接管(`notes/implementation-lessons.md`) | 随后端退出被带走(§7「崩溃恢复」) |
+| 终端 | 可 attach,用户能直接在 pane 里接手 | 无 TTY,`AskUserQuestion` 等交互工具会挂起(§5.1) |
+| 注入 / 观测 | paste-buffer 注入 + tail 转写文件 | stdin/stdout 双向 NDJSON |
+| 用在 | `wrapper`/`synapse` CLI 就地拉起的会话(用户要能在自己的 pane 里干活) | 网页从任务里启动的后台子 agent |
+
+两条路径共用一份转写解析逻辑(`backend/transcript.ts`,见 `notes/claude-code-behavior.md`)与同一套 hook 协议。
 
 ### 1.1 首选方向:Claude 下的任务管理
 
@@ -83,7 +133,7 @@ Phase 1 从任务启动子 agent 时,默认让 agent 在一个独立的 `git wor
 
 **worktree vs 本地 clone。** worktree 共享 `.git`,主库的 `git gc` / `git rebase` / 切分支会经 HEAD 引用、reflog 影响所有 worktree。agent 跑很久、或用户会在主库频繁操作时,`git clone --shared <repo> <path>`(甚至完整 `clone`)隔离性更好,代价是磁盘与 `npm install` 时间。子 agent 场景默认用 worktree(轻、快),clone 作为可选项留在这里。
 
-**清理。** worktree 目录 `~/.synapse/worktrees/<project>-<taskId>`,任务结束后**不自动删**(和 tmux pane 同样的处置原则,见 §2.5)—— 里面可能有未提交/未合并的产物。UI 给一个显式的「移除 worktree」入口,执行 `git worktree remove` + 分支删除 + `carry-stash` 时提示主库残留的 stash。
+**清理。** worktree 目录 `~/.synapse/worktrees/<project>-<taskId>`,任务结束后**不自动删**(和 tmux pane 同样的处置原则:里面可能有未提交/未合并的产物)——UI 给一个显式的「移除 worktree」入口,执行 `git worktree remove` + 分支删除 + `carry-stash` 时提示主库残留的 stash。
 
 拟新增 `backend/worktree.ts`:
 
@@ -108,25 +158,24 @@ async function createWorktree(spec: WorktreeSpec): Promise<{ path: string; clean
 
 故 `tasks.json` 落 `~/.synapse/tasks.json`,**不带端口**。测试用环境变量 `SYNAPSE_TASKS_PATH` 覆盖以隔离生产数据。文件权限 `0600`,写入原子(临时文件 + chmod + rename)且串行化,JSON 解析失败不静默覆盖(重命名为 `tasks.json.corrupt-<ts>` 后新建空结构)。数据结构见 `docs/phase1-task-management.md`。
 
+### 1.5 任务主 agent 与子 agent 的调度
+
+设计移出本文件 —— 见 `docs/design/main-agent-orchestration.md`(主 agent 四项职责、`synapse agent` 子命令、`synapse-tasks` 共享文档库、文档端点)。落地步骤见 `docs/phase1-implementation-plan.md` Step 8。
+
+一句话:调度用 `synapse agent {context,spawn,wait,doc}` 子命令(daemon HTTP 的瘦客户端),不引入 MCP;主 agent 沉淀的 handoff / progress / changelog 落一个独立 git repo。
+
 ---
 
 ## 2. 关键实测结论
 
-这一节是本规格的事实基础,实现时不得与之冲突。
+这一节是本规格的事实基础,实现时不得与之冲突。**只保留三条构成整体设计前提的硬约束**;完整的实测记录分两处:
 
-### 2.1 stream-json 支持多轮对话
+- `docs/notes/claude-code-behavior.md` — Claude Code / stream-json / hook 的固有行为(多轮对话、hook 同步控制、路径与标识符、tmux 承载方式、ai-title、转写文件结构、`stop_reason` 逐轮边界…)
+- `docs/notes/implementation-lessons.md` — Synapse 某次实现错了 → 实测 → 修正的踩坑记录(会话 ID 认领、timeline 双路径对齐、持久化关停语义、退出检测、终端旁路观测…),锚在具体函数上
 
-`-p` 意为 programmatic(程序化)而非 one-shot(单轮)。单轮行为来自 `--input-format text`。
+两条快速提醒(细节在上述 notes):转写路径**不要自行推算**,用钩子载荷的 `transcript_path`;会话 ID **由 CLI 生成经 `--session-id` 传入**,不按 mtime 事后认领 —— 踩过一次,批准请求路由到了错误的会话。
 
-实测:单进程连续三轮,`session_id` 保持一致,第二轮正确答出第一轮要求记住的数字 —— **上下文跨轮保留**,不只是进程复用。
-
-### 2.2 HTTP 钩子可同步控制权限
-
-`type: "http"` 的钩子会向指定 URL 发 POST,并**等待响应体中的决策**。实测 allow 与 deny 均被遵守。
-
-延迟响应有效:模拟人工思考延迟 6 秒后返回 deny,工具被成功拦下。这是网页批准流程可行的前提。
-
-### 2.3a PreToolUse hook 无条件触发,早于内置权限判断
+### 2.1 PreToolUse hook 无条件触发,早于内置权限判断
 
 `matcher` 只按工具名匹配,匹配即触发 HTTP 请求 —— 与 `permissions.allow/deny/ask` 规则、权限模式(`default`/`acceptEdits`/`auto`/`bypassPermissions`)无关,发生在内置权限引擎判断之前。不存在「内置引擎判定需要询问时才转发」这种钩子事件,`settings.json` 里配得再全的 allow 规则也拦不住已匹配 matcher 的请求。
 
@@ -134,7 +183,7 @@ async function createWorktree(spec: WorktreeSpec): Promise<{ path: string; clean
 
 现按 `backend/daemon.ts` 的 `ENABLE_FULL_APPROVAL` 开关收窄:默认 `matcher` 只匹配 `AskUserQuestion`,其余工具（Bash/Write/Edit 等）交还给 Claude Code 内置权限系统处理，不再经过网页。需要恢复全量监管时把开关改回 `true` 即可，钩子入口与决策协议不变。（开关与 hook 配置一起放在 `daemon.ts` —— hook 配置文件由 daemon 写,见 §3.1。）
 
-### 2.3 ⚠ 钩子超时是 fail-open
+### 2.2 ⚠ 钩子超时是 fail-open
 
 | 项目 | 实测值 |
 |---|---|
@@ -150,163 +199,12 @@ async function createWorktree(spec: WorktreeSpec): Promise<{ path: string; clean
 - 后端内部截止 `DECISION_TIMEOUT_MS` 必须**更短**(当前 280 秒),留出响应回传余量
 - 到点主动返回 `deny`,把 fail-open 翻转为 fail-closed
 
-### 2.4 路径与标识符
-
-| 项目 | 实际值 |
-|---|---|
-| 转写文件位置 | `~/.claude/projects/<cwd 路径转写>/<session_uuid>.jsonl` |
-| `session_id` 格式 | 裸 UUID,如 `205d25cb-93b6-4c27-bd02-580ae7078aa7` |
-
-转写路径中的 cwd 会被路径转写(斜杠转连字符,macOS 上 `/tmp` 会解析为 `/private/tmp`)。**不要自行推算此路径** —— 钩子载荷中的 `transcript_path` 字段直接给出准确值。
-
-使用 stream-json 时无需读取转写文件,助手消息、工具调用与结果均从 stdout 获得。
-
-### 2.5 tmux 有两种承载方式
-
-| 模式 | 触发方 | 行为 |
-|---|---|---|
-| 自建会话 | `sessionName` | `new-session -d` 建独立会话,后端持有其生命周期 |
-| 接管 pane | `paneId` | 不建也不销毁会话,只对给定 pane 注入与观察 |
-
-`wrapper` CLI 走接管模式:claude 在用户当前 pane 里启动,CLI 只做前置准备(拉起后端、写 settings),不制造额外的会话层级。因此 **CLI 必须在 tmux 内运行** —— pane 是后端寻址的唯一手段;裸终端下直接提示而非隐式建会话。
-
-`wrapper daemon start` 是例外:它只拉起 daemon 并打印网页链接,不创建会话、不接管 pane,因此不要求在 tmux 内。用于「只看任务面板,会话之后从网页里创建/绑定」的场景(Phase 1,见 `docs/phase1-task-management.md`)。`daemon <start|status|restart|stop>` 四个子命令都只管后端本身的生命周期,与「就地拉起 claude」的主流程无关。
-
-tmux 的所有 `-t` 目标在两种模式下分别取 pane ID 与会话名,pane ID(如 `%3`)在 tmux 中处处可作 target。接管模式下 `stop()` 无论如何都不销毁 pane —— 那属于用户。
-
-### 2.6 会话 ID 必须由调用方指定
-
-`claude --session-id <uuid>` 可指定会话 ID,转写文件即 `<uuid>.jsonl`。
-
-**同目录并存时不能靠推断。** 早期实现按「转写目录里 mtime 最新的文件」认领 session_id。同一目录并存两个会话时(两个 pane 各开一个 claude),两者共用转写目录且几乎同时创建文件,认领会张冠李戴 —— 实测出现过 A 会话认领了 B 的转写文件,导致批准请求路由到错误的会话:**网页上批准 A,实际放行的是 B**。
-
-故 `wrapper` 生成 UUID,注册时告知后端、启动时传给 claude,归属从此确定而非依赖时序。`SessionManager` 另有防御:同一 claudeId 被二次认领时告警并拒绝改判,不静默覆盖。
-
-按 mtime 认领的旧路径保留给自建会话模式(该模式下目录内只有一个会话,不会冲突)。
-
-### 2.7 原生类型剥离替代 tsx
+### 2.3 原生类型剥离替代 tsx
 
 Node 22.6+ 直接执行 `.ts`(擦除类型标注,不做类型检查)。实测 Node 24 下整个后端可由 `node backend/server.ts` 启动,代码中无 `enum` / `namespace` / 装饰器 / 参数属性等需要代码生成的语法。
 
-两个约束:剥离**只认 `.ts` 扩展名**,故 `bin/wrapper` 是无扩展名的 JS 薄壳,实现在 `bin/wrapper.ts`;版本闸门也必须写在薄壳里,低版本 Node 会在 import `.ts` 时先抛语法错误。运行时警告用 `--disable-warning=ExperimentalWarning` 压掉。类型安全仍由 `npm run typecheck` 保证。
+两个约束:剥离**只认 `.ts` 扩展名**,故 `bin/synapse`(见 §0.1)是无扩展名的 JS 薄壳,实现在 `bin/synapse.ts`;版本闸门也必须写在薄壳里,低版本 Node 会在 import `.ts` 时先抛语法错误。运行时警告用 `--disable-warning=ExperimentalWarning` 压掉。类型安全仍由 `npm run typecheck` 保证。
 
-### 2.8 会话标题来自转写里的 ai-title
-
-claude 会给会话起一个语义化标题(即 `/resume` 列表里显示的那个),写进转写文件:
-
-```json
-{ "type": "ai-title", "aiTitle": "查找login.js中硬编码密码的风险", "sessionId": "…" }
-```
-
-实测:首轮对话后不久出现(样本中位于第 8 行 / 共 38 行),**同一标题会重复写入多次**且该行**没有 `uuid`**,躲不过按 uuid 的去重,需自行比对上次值。
-
-**标题几乎不会随话题变化更新。** 大范围扫描本地转写文件(435 个有多次 `ai-title` 写入的会话)发现:约 98%(426/435)的标题内容自始至终未变,即使反复写入多次;仅有的 9 个真正换过标题的样本,每一个的第二次标题都伴随新出现的 `agent-name` 行 —— 即标题变化只发生在会话被 `Task` 工具(子代理)接管的场景,不是主话题内部自然漂移出新标题。`s.title = ev.title`(见 `sessionManager.ts` `#absorb` 的 `case 'title'`)本身能正确处理"标题变了"的情况,只是触发条件在实践中极少满足 —— 这是上游行为,不是本项目的解析缺陷,遇到"标题一直不变"不必怀疑传递链路。
-
-UI 用它区分同目录并存的会话 —— pane ID 能区分但不解释,标题才说明「这个会话在做什么」。标题与 `name`(目录名)并存而非覆盖,后者仍用于分组。
-
-### 2.9 转写文件结构
-
-行类型不止 `user` / `assistant`,还包括 `queue-operation`、`attachment`、`ai-title`、`last-prompt`,以及子代理产生的 `isSidechain` 条目。解析时须用白名单,否则控制类记录会被当作对话渲染。
-
-实测确认:`claude -p --input-format stream-json` 与 tmux 里的原生 TUI 写的是**同一套路径规则**(`~/.claude/projects/<cwd 转写>/<session_id>.jsonl`),并非 tmux 独有。两种传输方式因此可以共用一份解析逻辑(`backend/transcript.ts`),既用于 tmux 的实时 tail,也用于 §2.11 的历史重放。
-
-**`last-prompt` 不能当作逐轮 `turn_end` 信号。** 早期实现认为转写没有显式的 result 行,拿 `last-prompt`(CLI 回到顶层输入态时写入)当"本轮结束"的近似判断。实测某会话 93 次用户输入只对应 15 次 `last-prompt` —— 它标记的是空闲态,不是每轮回复的收尾,二者不是一一对应。多数轮次因此永远等不到配对的 `turn_end`,界面对话气泡与 header 状态卡死在"进行中"。改用 `assistant` 消息自带的 `stop_reason` 字段:值为 `tool_use` 表示后面还要继续调工具、同一轮未结束;其他值(如 `end_turn`)才是这一轮真正说完。每轮必有恰好一条这样的收尾消息,是可靠的逐轮边界。
-
-### 2.10 服务端 timeline 与前端增量视图必须落同一套分组边界
-
-`GET /api/sessions/:id` 首次拉取用的是 `SessionManager` 自己维护的 `s.timeline`,与 WebSocket 增量更新走的前端 `onSessionEvent` 是两份独立实现,字段结构必须保持一致 —— 改其中一份而漏另一份,不会报类型错误(两边都是各自文件里的字面量对象),只在运行时表现为数据缺失。
-
-`turn_end` 一度只被前端 `onSessionEvent` 记录为 timeline 分组边界,`SessionManager.#absorb` 里同名分支只更新了计数器,没有写回 `s.timeline`。后果:每次刷新页面或重新打开会话,拉到的历史 timeline 里没有任何 `turn_end`,渲染时把整段历史当成"一个仍在进行中的轮次" —— 而进行中轮次只展示最新一步,已完成轮次的全部工具调用与中间文本因此从界面上消失,而非折叠。
-
-### 2.11 会话元数据持久化,对话内容不重复存
-
-`SessionManager` 原本纯内存态,后端一重启会话列表就清空。持久化只落会话元数据(`~/.synapse/sessions.json`,0600):workspace、name、title、claudeId、turns/costUsd 等统计、以及 `transcriptPath`。
-
-**对话 timeline 不进这份快照。** Claude Code 自己已经把完整对话写在转写文件里(§2.9),重复落一份等于造出两个可能不同步的历史来源。`GET /api/sessions/:id` 对没有内存态 timeline 的 exited 会话,现读 `transcriptPath` 重放出 timeline/files/commands(`replayTranscriptTimeline`),与在线会话走的 `#absorb` 共用同一个归约函数 `reduceEvent` —— 避免 §2.10 那次事故的重演(两条路径分叉出不一致的字段结构)。
-
-写盘走 500ms debounce(`#absorb` 里几乎每条转写行都会触发一次状态变化,逐条同步写盘是明显的 I/O 负担),用户在网页上主动删除会话时改为立即 `saveNow()`,否则紧接着的进程退出会让磁盘上的旧快照把这条"已删除"的记录复活。
-
-**关停语义分两种,不能共用一个方法。** 早期实现让 `SIGINT/SIGTERM` 触发的 `closeAll()` 直接调用 `close()`,而 `close()` 的语义是"用户主动删除,记录也从磁盘摘除"—— 结果是每次 Ctrl-C 正常关闭后端,`sessions.json` 就被清空,持久化形同虚设。故拆成两个方法:`close(localId)` 保留给用户删除操作;`stopAll()` 供进程退出用,只停子进程、把状态标 `exited`,记录本身留着。
-
-重启后加载出的历史会话,`Session.transport` 落一个 `NullTransport` 占位(`alive()` 恒 `false`),避免 `Session.transport` 这个必填字段在历史记录上无处安放。
-
-### 2.12 任务清单工具实测有两套,不能只认 TodoWrite
-
-同一 2.1.226 环境下,同一会话实测调用的是 `TaskCreate` / `TaskUpdate` / `TaskGet` 这套增量工具,而非文档里常见的 `TodoWrite`。两者语义不同,不能共用一套归约逻辑:
-
-| | `TodoWrite` | `TaskCreate` / `TaskUpdate` |
-|---|---|---|
-| 更新方式 | 单次调用给全量清单,直接覆盖 | 增量:`TaskCreate` 建一项,`TaskUpdate` 按 `taskId` 改状态 |
-| 任务 ID | 无(数组顺序即身份) | 有,但 `TaskCreate` 的 `tool_use.input` 里**没有**,要等 `tool_result` |
-| ID 的实际来源 | 不适用 | `tool_result` 是人话确认文本 `"Task #4 created successfully: …"`,`taskId` 只能从这段文本正则解析(`/Task #(\S+) created/`),没有结构化字段 |
-
-哪套工具会被实际调用,目前判断依据不明(未观察到与 model/环境变量的明确关联),故两套都要接。两个来源(`s.todos` 全量数组、`s.tasks` 按 taskId 维护的 Map)合并成一份只读视图给前端,`TodoItem` 加一个可选 `id` 字段承载 `taskId`。归约逻辑并入 §2.11 提到的 `reduceEvent`,使其与 `#absorb`/`replayTranscriptTimeline` 两条路径天然共享,不需要单独维护;前端首次拉取详情页后要用 `id` 重建本地的 taskId 索引,否则后续 WS 增量的 `TaskUpdate` 事件找不到条目可改(参照 §2.10 的教训,这也是一处"服务端归约"与"前端增量"必须对齐的分叉点)。
-
-### 2.13 会话退出检测靠 SessionEnd 钩子 + 存活巡检双通道
-
-stream-json 管道没有显式的"本轮/本会话结束"事件可读 —— 转写文件末行只是进程停下时恰好在做的事,不是结束标记(呼应 §2.9)。退出检测因此不能指望从 stdout/转写内容里推断,改挂 `SessionEnd` 钩子:进程退出时 Claude Code 会向钩子 URL 发一次带 `reason` 的 POST,后端在 `permissions.ts` 里识别该事件、直接回调,不进入权限 pending 表。
-
-钩子是快路径,但覆盖不了 `kill -9`、直接关掉承载的 tmux pane 等场景 —— 那些情况下 Claude Code 自己也来不及发钩子。故 `SessionManager` 另起一个 4 秒间隔的存活巡检(`startLivenessWatch`)兜底,双通道都指向同一个 `#markExited`。
-
-`Stop` 事件也一并挂了钩子(见 §3.1),但目前只是占位放行,尚无消费逻辑。
-
-### 2.14 终端里直接按 Escape 中断,转写文件有痕迹但需专门识别
-
-`interrupt(localId)`(见 §4 SessionManager)处理的是网页发起的中断。tmux 接管模式下用户完全可以绕过网页、直接在承载的 pane 里按 Escape——这个动作不经过后端任何入口,只能靠转写文件事后感知。
-
-实测:CLI 会把中断写成一条 `type: "user"` 消息,`content` 是纯文本块而非 `tool_result`:
-
-```json
-{ "type": "user", "message": { "role": "user", "content": [{ "type": "text", "text": "[Request interrupted by user]" }] } }
-```
-
-工具调用中途被中断则是变体 `"[Request interrupted by user for tool use]"`。
-
-`parseTranscriptLineMulti` 原先的 `user` 分支只认数组里的 `tool_result` 块,这类纯文本块会被静默丢弃 —— 之后也不会再有 assistant 消息带来 `stop_reason` 触发的 `turn_end`(见 §2.9),会话因此永久卡在 `busy`。现改为识别这段固定前缀,直接产出 `{ kind: 'turn_end', interrupted: true }` 收尾;`sessionManager.ts` 据此把 `lastAction` 设为「已中断,等待输入」,与网页发起中断的文案统一。`interrupted` 标记只影响 `#absorb`(在线路径)的 `lastAction`,不进 `reduceEvent`/`ReplayTarget` 的 timeline —— 折叠渲染只需要轮次边界,中断与正常结束在这一层是同一件事(呼应 §2.11 对运行时态与可派生历史的区分)。
-
-StreamJsonTransport 无终端可供直接按键,中断只能经网页调用 `interrupt()`,不受此路径影响 —— 这条修复只对 `TmuxTransport` 的实时 tail 与历史重放生效,两者共用同一份 `parseTranscriptLineMulti`(见 §2.9)。
-
-### 2.15 终端里直接发下一轮 prompt,同样只能靠转写文件补分组边界
-
-与 §2.14 同一类问题的另一面:用户在 tmux pane 里不经网页、直接敲下一轮对话。`send()`(网页发送)会主动 `s.timeline.push({ kind: 'user', ... })`,但终端直接输入完全绕开这条代码路径,后端唯一能感知它的地方仍是转写文件。
-
-实测:正常用户输入的 `type: "user"` 行,`content` 是**纯字符串**,不是数组 —— `parseTranscriptLineMulti` 原先只在 `Array.isArray(c)` 分支产出事件,字符串分支直接落空 `return []`,连一个开新分组的信号都没有。后果:`renderTurns`(前端)靠 `kind: 'user'` 的 timeline 条目切分轮次,没有这个边界,新一轮的 assistant 文本与工具调用全部并入上一轮 —— 也就是这轮"结论"读起来混进了上一轮的过程里,除非手动滚动细看,否则界面上分不出两轮已经切换。
-
-字符串 `content` 并非都是真人敲的新一轮:同一路径也会承载会话摘要(`isCompactSummary`)、跨会话消息通知、queue 提醒等合成消息(`isMeta: true`),以及 CLI 内置 `!command` 的转写(`<bash-input>...</bash-input>` / `<bash-stdout>...`)。这些都不代表"新一轮对话开始",错误识别会把无关内容当结论插进时间线。故只在 `!d.isMeta && !c.startsWith('<bash-')` 时才产出 `{ kind: 'user', text: c }`。
-
-**自我回显的去重。** `TmuxTransport.send()` 本质是把文本粘贴进 pane 再回车,与用户手动敲键盘在 tmux 层面完全等价 —— 转写文件里产生的行没有任何字段能区分"这是网页注入的"还是"用户自己敲的"。不去重的话,网页发的每条消息会被识别两次:一次是 `send()` 主动 push,一次是 tail 读到转写文件里的回显、又经 `parseTranscriptLineMulti` 产出一次。`TmuxTransport` 因此维护一个 `#pendingEchoes` FIFO,`send()` 注入前记一笔,`#handleLine` 解析出 `user` 事件时先查这个队列、命中则消费掉不下发。
-
-`SessionEvent` 新增的 `user` kind 只服务这一条转写观测路径,`#absorb` 的运行时态 switch 没有对应 case(不需要,新一轮开始不改 `lastAction`/`state`,那些交给后续的 assistant/tool_use/turn_end 事件自然更新),但 `reduceEvent`(见 §2.10/2.11)与前端 `onSessionEvent` 都要接住它写入各自的 timeline —— 仍是两条归约路径必须对齐的老问题。
-
-### 2.16 后端重启后,tmux 接管会话默认全部判 exited —— 需要重新探活,且 paneId 本身可能缺失
-
-`#loadPersisted`(见 §2.11)早期实现无条件把所有历史记录标 `exited` 并挂 `NullTransport`,不检查对应的 tmux pane 是否其实还活着。`wrapper daemon restart`(见 §4 守护进程)让这个盲区第一次被实际触发到:重启纯粹是为了加载新代码,并不代表这些会话真的死了,但网页刷新后全部显示"已退出",体验上等同于"重启一次弄丢所有进行中的会话"。
-
-**修复分两层。** 运行时状态:`#reclaimTmuxSessions()` 在构造函数末尾异步跑,对 `transportKind === 'tmux'` 且有 `paneId` 的历史记录逐个 `paneExists()` 探测,还在就重建 `TmuxTransport`(带上已知 `sessionId`,定位转写文件不必猜)接回去,状态交给 `start()` 的正常流程 ——`#waitReady()` 探到 TUI 已就绪会很快返回,不是从头等首屏。构造函数本身不能是 `async`,故先同步把历史记录标 `exited` 让 `SessionManager` 立刻可用,这批会话的真实状态在随后几秒内异步纠正;存活巡检(`#sweep`)对 `state === 'exited'` 的会话直接跳过,不会跟这段异步重建产生竞态。
-
-**数据缺口:`paneId` 是后加的字段。** `PersistedSession` 起初没有 `paneId`(§2.11 落盘设计成型时,持久化只关心元数据统计,没考虑过要重新接管 pane)。补上字段后,新产生的记录会正确落盘,但**旧数据补不回来** —— 磁盘上已有的记录里这个字段就是不存在,`#loadPersisted` 读出来是 `undefined`,`#reclaimTmuxSessions` 因为没有 `paneId` 可用而直接跳过这些会话,继续显示 `exited`。
-
-手动改 `sessions.json` 补这个字段是条死路:只要还有一个跑着旧内存状态(没有 `paneId`)的进程,它下一次触发 `stopAll()`(`shutdown()` 收尾)或任何 `scheduleSave()`,就会用自己内存里的（缺字段的）快照同步覆盖磁盘,把手动补丁冲掉 —— 实测踩过,连续两次手动补丁都被冲掉,因为每次补完还得再重启一次才能让新数据被读到,而这次重启本身又会经过一次旧进程的 `stopAll`。
-
-**因此补全逻辑必须在代码里自己完成,不能依赖磁盘曾经存过这个字段。** `findClaimedPanes()`(`tmuxTransport.ts`)反查当前操作系统状态:`ps -eo pid,ppid,command` 全量扫描,用 `--session-id <uuid>` 定位每个 claude 进程,再沿 `ppid` 链向上爬直到匹配某个 tmux pane 的 `pane_pid`(claude 不是 pane 的直接子进程 ——`wrapper` 会先起一层 node 壳、``execClaude`` 再 spawn claude,中间隔着至少一层),建立 `sessionId -> paneId` 的映射。`#reclaimTmuxSessions()` 对 `paneId` 缺失但有 `claudeId` 的候选记录,先用这份映射补一次,查到就顺手写回 `s.paneId`,随后 `scheduleSave()` 落盘 —— 只需要反查这一次,之后的重启直接读磁盘上已经补全的数据,不必每次都重新扫描进程表。
-
-### 2.17 左栏排序固定,不随会话状态跳动
-
-早期实现里 project 与 session 的排序都掺了 `sessionRank`(需要你/进行中/静默):project 按 `min(rank)` 排,组内 session 按 `rank` 再按 `lastActivity` 倒序排。代价是顺序随时间不断改变 —— 一个会话变 busy、来一条批准请求、或者单纯有了新动态,所在的 project 与 session 位置就会跳,常用会话在列表里"眼疾手快"才找得到。
-
-改为固定排序:project 纯字母序(`localeCompare`),session 按 `createdAt`(创建时间,旧到新)排序,两者都不再受 `rank` 影响位置。`rank` 仍然保留,只用于 `attn` class(project header 高亮)与 `pip` 颜色这类纯视觉提示,不参与排序比较函数。
-
-`createdAt` 是本次新增字段,贯穿 `Session`/`SessionSummary`/`PersistedSession` 三层。旧数据(升级前落盘的记录)没有这个字段,`#loadPersisted` 用 `p.createdAt ?? p.lastActivity` 兜底顶替 —— 不精确(旧会话的"创建时间"实际是它最后一次活动的时间),但保证有排序依据而不是 `undefined` 参与比较导致顺序不确定。新建的会话从 `create()` 起就有准确的 `createdAt`,不受此影响。
-
-### 2.18 网页发消息与终端回显对不上换行符,导致重复消息
-
-`TmuxTransport.send()` 用 `#pendingEchoes` FIFO 消化自己的回显(见 §2.15),精确字符串匹配比对注入文本与转写文件里读回的文本。多行消息(网页 textarea 用 Shift+Enter 换行)会命中一个换行符不一致的坑:
-
-实测转写文件:`claude` 收到粘贴内容后,把消息内部的换行符**落盘成 `\r`**(如 `"...状态\r从 Manila API..."`),而网页 `<textarea>` 的 `value` 里 Shift+Enter 产生的是标准 `\n`。`send()` 传入 `#pendingEchoes` 的是原始 `\n` 版本,`#handleLine` 从转写文件解析出的 `ev.text` 是 `\r` 版本,`indexOf` 精确匹配永远不命中 —— 回显消不掉,`emit(ev)` 照常发出,叠加前端自己已经通过 `user_message` 展示的那条,网页上同一条多行消息显示两遍。单行消息不受影响(没有换行符可比对,天然一致)。
-
-修复:比对前对两侧都过一遍 `normalizeNewlines()`(`\r\n?` 统一换成 `\n`)。`#inject()` 实际写入 tmux 的仍是原始 `text` —— 归一化只用于回显比对这一步,不改动真正注入的字节内容。
-
----
 
 ## 3. 数据协议
 
@@ -318,7 +216,7 @@ StreamJsonTransport 无终端可供直接按键,中断只能经网页调用 `int
 
 - 该目录里任何一个裸 `claude`(不经 wrapper)也会读到 hook,开始给后端发请求;
 - 同目录并存两个 wrapper 会话共用一份文件;
-- 会话退出后 hook 条目留在文件里,下一个无关的 `claude` 打到可能已死的后端 —— 按 §2.3 是 fail-open。
+- 会话退出后 hook 条目留在文件里,下一个无关的 `claude` 打到可能已死的后端 —— 按 §2.2 是 fail-open。
 `#writeSettings` 里那套「写入前按 URL 剔除旧条目」的去重逻辑就是为了缓解最后一条,治标不治本。
 
 **实测 + 官方文档确认:`claude --settings <path|json>` 是叠加而非覆盖。** 优先级从高到低:企业级 → `--settings`(CLI)→ `.claude/settings.local.json` → `.claude/settings.json` → `~/.claude/settings.json`。`--settings` 里写的键覆盖同名文件键、省略的键保留文件值;`hooks` 按**事件名 + matcher** 求并集,各来源的 hook 全部生效,互不遮蔽。
@@ -355,7 +253,7 @@ daemon 每次监听成功后重写一遍(幂等)。**URL 里的端口必须是�
 }
 ```
 
-`PreToolUse` 的 `matcher` 由 `daemon.ts` 的 `ENABLE_FULL_APPROVAL` 开关控制,见 §2.3a(开关随 hook 配置一起搬到了 `daemon.ts`)。`Stop`/`SessionEnd` 不参与权限判断,`handleHookRequest` 里非 `PreToolUse` 事件一律立即放行 —— `SessionEnd` 额外触发退出回调(见 §2.13),`Stop` 目前只是占位。
+`PreToolUse` 的 `matcher` 由 `daemon.ts` 的 `ENABLE_FULL_APPROVAL` 开关控制,见 §2.1(开关随 hook 配置一起搬到了 `daemon.ts`)。`Stop`/`SessionEnd` 不参与权限判断,`handleHookRequest` 里非 `PreToolUse` 事件一律立即放行 —— `SessionEnd` 额外触发退出回调(退出检测双通道见 `notes/implementation-lessons.md`),`Stop` 目前只是占位。
 
 **副作用:hook 配置不再出现在工作区的 `.claude/settings.local.json` 里。** 那个文件通常是用户 gitignore 掉、用来查「Synapse 对我的仓库做了什么」的地方;现在要查得看 `~/.synapse/<端口>/hooks.settings.json`。实测(独立测试端口):stream-json 会话拿到的 `settingsPath` 正确指向该文件,`claude` 加载无报错;`ENABLE_FULL_APPROVAL=true` 下发一条需要 `Bash` 的提示词,后端 pending 表按 `tool_use_id` 挂起该调用、会话转 `waiting`、`deadlineAt` 就位 —— hook 全链路生效。
 
@@ -408,7 +306,7 @@ daemon 每次监听成功后重写一遍(幂等)。**URL 里的端口必须是�
 接收 `/api/claude-event`,挂起 HTTP 响应直到网页决策或内部截止触发。
 
 - pending 表以 `tool_use_id` 为键
-- 内部定时器到点主动 deny(见 §2.3)
+- 内部定时器到点主动 deny(见 §2.2)
 - 客户端断开时清理,避免连接泄漏
 - 会话结束时 drain 所有挂起项
 
@@ -435,7 +333,7 @@ daemon 每次监听成功后重写一遍(幂等)。**URL 里的端口必须是�
 - `stop` — 发 `SIGTERM`(而非 `SIGKILL`)给 daemon 进程,轮询 PID 消失确认退出。`SIGTERM` 触发 `server.ts` 的 `shutdown()`,走 `stopAll()` 收尾(会话状态落盘、drain 挂起的批准请求),direct kill -9 会跳过这些
 - `restart` = `stop` 后接 `ensureDaemon()`
 
-**重启 daemon 不影响正在跑的 claude 会话。** daemon 只是 tmux pane 的旁路观察者(见 §2.5「接管模式下 `stop()` 无论如何都不销毁 pane」),`wrapper daemon restart` 只终止/拉起后端进程本身,不碰任何 pane 或其中的 claude 进程。网页 WebSocket 连接会短暂断开(daemon 重启期间),刷新页面后重新连上;这段空窗期内若 claude 恰好发起需要批准的工具调用,钩子请求会打空 —— 按 §2.3 是 fail-open,工具照常执行,不算安全风险(重启是本机操作者主动发起的)。
+**重启 daemon 不影响正在跑的 claude 会话。** daemon 只是 tmux pane 的旁路观察者(接管模式下 `stop()` 无论如何都不销毁 pane,见 `notes/claude-code-behavior.md`),`wrapper daemon restart` 只终止/拉起后端进程本身,不碰任何 pane 或其中的 claude 进程。网页 WebSocket 连接会短暂断开(daemon 重启期间),刷新页面后重新连上;这段空窗期内若 claude 恰好发起需要批准的工具调用,钩子请求会打空 —— 按 §2.2 是 fail-open,工具照常执行,不算安全风险(重启是本机操作者主动发起的)。
 
 **token 跨 restart 复用,不必换链接。** `AUTH_TOKEN` 原先每次进程启动都 `randomUUID()`(§6 的安全设计:token 不因绑定本机而形同虚设),但这让 `wrapper daemon restart` ——一个纯粹为了加载新代码、不代表用户想切身份的操作——也附带地址失效的副作用,浏览器书签、终端历史里存的链接全部作废。改为 `daemon.ts` 的 `readOrCreateToken()`:同请求端口的状态目录下若已有 `token` 文件就复用,没有才新生成;`clearState()` 相应地只删 `daemon.pid`/`port`,不再删 `token`(那两个字段才是「进程是否存活」的判定依据,token 只是凭据值,没有这层语义)。`shutdown()` 里的 `clearState(PORT)` 因此不会带走 token,新进程启动时能读到旧值。
 
@@ -453,10 +351,10 @@ stop()       关闭并释放
 onEvent(fn)  订阅事件流
 ```
 
-阶段一:`StreamJsonTransport` — 常驻子进程,NDJSON 收发。
-阶段二:`TmuxTransport` — load-buffer/paste-buffer 注入,tail 转写文件。
+- `TmuxTransport` — **长命会话**:claude 活在用户的 tmux pane 里,进程独立于后端存活(后端重启后重新探活接管,见 `notes/implementation-lessons.md`)。load-buffer/paste-buffer 注入,tail 转写文件。`synapse` CLI 就地起的会话用它(用户 pane 接管模式),或自建 tmux 会话。
+- `StreamJsonTransport` — **短命会话**:后端 `spawn` 的子进程,后端退出即消失。常驻期间 NDJSON 双向收发。网页从任务启动的后台子 agent 用它。无 TTY,`AskUserQuestion` 等交互工具会挂起(§5.1)。
 
-权限引擎**不在**此接口内。
+区别详见 §1 架构下的对照表。权限引擎**不在**此接口内。
 
 **`CreateOptions.appendSystemPrompt`** — `POST /api/sessions` 可带一段文本,后端拼成
 `claude --append-system-prompt <text>` 传给新会话(stream-json 与 tmux 自建会话都走
@@ -471,7 +369,8 @@ wrapper CLI 自己启动。存储层、worktree、预检 UI 等留待 Phase 1 �
 
 左上角切换两个模式,偏好存 localStorage:
 
-- **任务**(Phase 1 默认)— 项目 / 任务 / 任务详情三栏。左栏(复用 aside)列项目,带任务数、运行中 agent 数、待批准数;中栏列任务,带状态点、agent 数、待批准数;右栏是任务详情:目标 / 验收、agent 卡片(transport / state / context / cost / pending,主 agent 绿底)、任务流事件(newest-first)。项目按 name `localeCompare`、任务按 `createdAt` 固定排序,不随状态跳动(呼应 §2.17)。交互:创建 / 编辑任务、绑定已有会话为主/子 agent、解绑(不关会话)、点 agent 卡片「打开会话」跳到会话模式的该会话详情。任务流首次拉取(`GET /api/tasks/:id`)与 WS 增量(`task_event` 消息)push 进同一个 `events` 数组、同一套渲染(§2.10 的老问题)。
+- **任务**(Phase 1 默认)— 项目 / 任务 / 任务详情三栏。左栏(复用 aside)列项目,带任务数、运行中 agent 数、待批准数;中栏列任务,带状态点、agent 数、待批准数;右栏是任务详情:目标 / 验收、agent 卡片(transport / state / context / cost / pending,主 agent 绿底)、任务流事件(newest-first)。项目按 name `localeCompare`、任务按 `createdAt` 固定排序,不随状态跳动(理由见 `notes/implementation-lessons.md`「左栏排序固定」)。交互:创建 / 编辑任务、绑定已有会话为主/子 agent、解绑(不关会话)、点 agent 卡片「打开会话」跳到会话模式的该会话详情。任务流首次拉取(`GET /api/tasks/:id`)与 WS 增量(`task_event` 消息)push 进同一个 `events` 数组、同一套渲染(「服务端归约与前端增量必须对齐」的老问题,见 `notes/implementation-lessons.md`)。
+  - **未绑定会话区。** `wrapper` 起的 tmux 会话进了 `SessionManager` 但不会自动成为任务 —— 若只渲染有 binding 的 agent,这些会话在任务视图里完全不可见。故中栏任务列表上方单列一区:属于当前项目 `workspaceRoots`、`state !== 'exited'`、且无 active binding 的会话,由 `GET /api/projects/:id/tasks` 的 `unboundSessions` 字段给出(服务端按 binding 算,前端无从本地推导 —— 新会话出现或 tmux 会话 `exited` 时前端重取该接口)。每行一个「转为任务」按钮,调 `POST /api/tasks/from-session`:以会话 `title || name` 建任务、立即把该会话挂为 main agent,一步到位。点会话行本身跳到会话模式查看。
 - **会话** — 下面描述的原有两层结构,能力不变。
 
 **顶层 — 优先级流。** 左栏按 workspace 分组(Project List),组内按「需要你 / 进行中 / 静默」排序;主区是跨会话的事件流,同样按「谁最需要你」排序。待批准项排最前并按等待时长排序,可就地批准无需进入会话。每项附风险说明(如「递归删除」「会直接改动线上基础设施」),而非仅展示命令原文。
@@ -483,7 +382,7 @@ Project 分组默认展开,用户手动收起的记入 localStorage(键存收起
 | 页签 | 内容 |
 |---|---|
 | 改动文件 | 文件列表带增删统计,点开看 diff |
-| Artifacts | 会话产出物网格 |
+| Artifacts | 会话产出物网格,文件落 `~/.synapse/artifacts/...`(路径规范见 §0.2;后端采集待做) |
 | 对话 | 按轮次分组,过程折叠,详见下 |
 | 终端输出 | 命令输出按次分卡,带退出码与耗时 |
 
@@ -495,6 +394,8 @@ Project 分组默认展开,用户手动收起的记入 localStorage(键存收起
 - 展开状态按轮次索引存在 `detail.expandedTurns`,随会话切换重置。
 
 视觉风格:macOS 系统应用 —— 浅色、发丝分隔线、系统蓝作唯一强调色、状态用淡彩底、整体弱对比。
+
+**列表行统一。** 两个视图都是「侧栏 + 主区」同一个 shell(会话视图主区单栏、任务视图主区两栏,取舍不同,不强行统一)。但列表行只有一套视觉:选中态一律 `blue-soft` 底 + 蓝字 + `0 1px 2px rgba(0,113,227,.16), 0 0 0 1px rgba(0,113,227,.08)` 阴影(`.nav-item.on` / `.proj-row.on` / `.task-row.on` 共用一条规则,见 `app.css`);「未绑定会话」行是 `.task-row.unbound`,与任务行共用网格,只少一点内边距、右侧放按钮而非计数。新增列表时复用这些 class,不要再造第四套。
 
 ### 5.1 AskUserQuestion 的回传机制
 
@@ -535,7 +436,7 @@ tmux agent 卡片:会话 `exited` 且 `transport === 'tmux'` 时状态标「pane
 - 钩子接口不校验 Origin(子进程请求不带该头),仅接受本机来源
 - settings 文件权限 `0600`
 
-**超时必须 fail-closed。** 见 §2.3 —— 这是本系统最容易被忽略的安全缺口。
+**超时必须 fail-closed。** 见 §2.2 —— 这是本系统最容易被忽略的安全缺口。
 
 **钩子 URL 必须用实际监听端口。** 端口被占用时后端会递增重试,若 settings 里写的仍是初始端口,钩子会打到无人监听的地址而失败 —— 而钩子失败等同于 fail-open,所有工具将无审批执行。故 `SessionManager` 的端口取函数而非定值,Origin 校验与 WebSocket 同理。
 
@@ -547,5 +448,8 @@ tmux agent 卡片:会话 `exited` 且 `transport === 'tmux'` 时状态标「pane
 
 - **中断能力** — `interrupt()` 目前发 SIGINT,stream-json 下的正确中断方式尚未实测确认,可能会终止整个会话。
 - **崩溃恢复** — 后端退出会带走所有子进程。`--resume <session_id>` 可恢复对话上下文,但不恢复进行中的轮次。恢复流程尚未设计。
-- **阶段二 tmux** — 提供进程存活与终端 attach 能力,接口已预留。
+- **stream-json 会话的进程存活** — tmux 会话在后端重启后可重新探活接管(`notes/implementation-lessons.md`),stream-json 子进程随后端退出而消失(见「崩溃恢复」),这层还没补。
 - **任务 agent 的 worktree 隔离** — 设计见 §1.3,预检步见 §5.2;`backend/worktree.ts` 与 policy 存储层待 Phase 1 子 agent 场景验证后落地。
+- **主 agent 调度** — 设计见 `docs/design/main-agent-orchestration.md`。`synapse agent wait` 的长轮询信号、子 agent 异常退出的退出码语义待实现时定。
+- **CLI 重命名** — §0.1:`wrapper` → `synapse`,子命令合并。约定已定,代码 sweep 待做。
+
