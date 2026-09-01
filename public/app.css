@@ -72,9 +72,13 @@ aside {
   transition: background-color .15s ease, box-shadow .15s ease, color .15s ease;
 }
 .nav-item:hover { background: rgba(0,0,0,.04); }
-/* 选中态靠淡底浮起 + 蓝字提示,不用边条也不反白 —— 阴影给出「浮在列表上」的层次感 */
-.nav-item.on {
-  background: var(--blue-soft); color: var(--blue); font-weight: 600;
+/* 选中态靠淡底浮起 + 蓝字提示,不用边条也不反白 —— 阴影给出「浮在列表上」的层次感。
+   全应用只此一种被选中样式:侧栏会话、侧栏项目、任务行共用(见 .row-selected)。 */
+.nav-item.on { color: var(--blue); font-weight: 600; }
+.nav-item.on,
+.proj-row.on,
+.task-row.on {
+  background: var(--blue-soft);
   box-shadow: 0 1px 2px rgba(0,113,227,.16), 0 0 0 1px rgba(0,113,227,.08);
 }
 .pip { width: 7px; height: 7px; border-radius: 50%; flex: none; background: var(--ink-3); }
@@ -515,7 +519,9 @@ textarea:focus { outline: 2px solid var(--blue); outline-offset: -1px; backgroun
   box-shadow: 0 1px 2px rgba(0,0,0,.1);
 }
 
-.nav-sect { padding: 10px 8px 5px; font-size: 11px; font-weight: 700; color: var(--ink-3); }
+/* 列表分区小标题 —— 侧栏「项目」、任务栏「未绑定会话」共用 */
+.nav-sect, .unbound-head { font-size: 11px; font-weight: 700; color: var(--ink-3); }
+.nav-sect { padding: 10px 8px 5px; }
 .nav-empty { padding: 12px 10px; font-size: 12px; color: var(--ink-3); line-height: 1.5; }
 .nav-empty code { font: 11px var(--mono); background: rgba(0,0,0,.05); padding: 1px 4px; border-radius: 4px; }
 
@@ -524,10 +530,6 @@ textarea:focus { outline: 2px solid var(--blue); outline-offset: -1px; backgroun
   border-radius: 7px; cursor: pointer; margin-bottom: 2px;
 }
 .proj-row:hover { background: rgba(0,0,0,.04); }
-.proj-row.on {
-  background: var(--blue-soft);
-  box-shadow: 0 1px 2px rgba(0,113,227,.16), 0 0 0 1px rgba(0,113,227,.08);
-}
 .proj-row-name {
   font-size: 13px; font-weight: 600;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
@@ -558,16 +560,17 @@ textarea:focus { outline: 2px solid var(--blue); outline-offset: -1px; backgroun
 .tl-head .btn { flex: none; }
 .tl-body { overflow-y: auto; padding: 8px; flex: 1; }
 
+/* 任务行,以及「未绑定会话」区的行(.task-row.unbound)—— 同一套网格与选中态,
+   unbound 仅少一点内边距、右侧放按钮而非计数。 */
 .task-row {
   display: grid; grid-template-columns: 8px minmax(0,1fr) auto;
   align-items: center; gap: 10px; padding: 10px 8px; border-radius: 8px;
   cursor: pointer; margin-bottom: 3px;
 }
-.task-row:hover { background: var(--surface); }
-.task-row.on {
-  background: var(--surface);
-  box-shadow: 0 0 0 1px rgba(0,113,227,.14), 0 1px 3px rgba(0,0,0,.08);
-}
+.task-row:hover { background: rgba(0,0,0,.04); }
+.task-row.unbound { padding: 8px; }
+.task-row.unbound .btn { flex: none; padding: 4px 9px; font-size: 12px; }
+.task-row.unbound .btn:disabled { opacity: .5; cursor: default; }
 .status { width: 8px; height: 8px; border-radius: 50%; display: inline-block; flex: none; }
 .status.run { background: var(--blue); }
 .status.wait { background: var(--amber); }
@@ -579,6 +582,13 @@ textarea:focus { outline: 2px solid var(--blue); outline-offset: -1px; backgroun
 .task-side { text-align: right; line-height: 1.2; }
 .task-side b { font-size: 13px; }
 .task-side small { display: block; font-size: 11px; color: var(--ink-3); }
+
+/* 未绑定会话区 —— 任务列表上方,虚线分隔;行本身用 .task-row.unbound */
+.unbound-sect {
+  margin-bottom: 10px; padding-bottom: 8px;
+  border-bottom: 1px dashed var(--hair);
+}
+.unbound-head { padding: 4px 8px 6px; }
 
 /* 任务详情 */
 .td-empty { margin: auto; padding: 40px; color: var(--ink-3); font-size: 13px; text-align: center; }

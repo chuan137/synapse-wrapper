@@ -39,6 +39,7 @@ const state = {
   projects: [],          // GET /api/projects 的结果
   taskProjectId: null,   // 当前选中的 project
   taskList: [],          // 当前 project 的任务列表(带聚合)
+  unboundSessions: [],   // 当前 project 工作区下、未绑定任何任务的活跃会话(wrapper 起的 tmux 会话主要落这里)
   taskId: null,          // 当前打开的任务
   taskDetail: null,      // GET /api/tasks/:id
   taskError: '',         // 最近一次任务操作的错误(409/400/404 等),渲染在详情顶部
@@ -212,7 +213,15 @@ function connect() {
         if (state.mode === 'sessions' && state.view === 'overview') renderOverview();
         else if (state.mode === 'sessions' && state.view === m.session.localId) renderTopbar();
         // 会话状态变化会影响任务视图里 agent 卡片的 state/context/cost。
-        if (state.mode === 'tasks') { renderTaskList(); renderTaskDetail(); }
+        if (state.mode === 'tasks') {
+          renderTaskList();
+          renderTaskDetail();
+          // 新会话出现、或 tmux 会话 exited,都会改变「未绑定会话」区 ——
+          // 该列表是服务端按 binding 算出来的,前端无从本地推导,得重取。
+          if ((m.type === 'session_added' || m.session.state === 'exited') && state.taskProjectId) {
+            loadTasks(state.taskProjectId);
+          }
+        }
         break;
 
       case 'session_event':
@@ -1122,16 +1131,18 @@ async function loadProjects() {
     }
     renderProjectNav();
     if (state.taskProjectId) await loadTasks(state.taskProjectId);
-    else { state.taskList = []; renderTaskList(); renderTaskDetail(); }
+    else { state.taskList = []; state.unboundSessions = []; renderTaskList(); renderTaskDetail(); }
   } catch { /* 拉不到就维持现状 */ }
 }
 
 async function loadTasks(projectId) {
   try {
-    const { tasks } = await api(`/api/projects/${projectId}/tasks`);
+    const { tasks, unboundSessions } = await api(`/api/projects/${projectId}/tasks`);
     // 任务按 createdAt 固定排序(旧到新),状态变化不改变位置。
     tasks.sort((a, b) => a.createdAt - b.createdAt);
     state.taskList = tasks;
+    state.unboundSessions = (unboundSessions ?? []).slice()
+      .sort((a, b) => a.createdAt - b.createdAt);
     if (state.taskId && !tasks.some((t) => t.id === state.taskId)) {
       state.taskId = null;
       state.taskDetail = null;
@@ -1224,11 +1235,54 @@ function renderTaskList() {
     }).join('');
   }
 
-  $('colTasks').innerHTML = head + `<div class="tl-body">${list}</div>`;
+  // 未绑定会话:wrapper 起的 tmux 会话进了 SessionManager 但没有 binding,
+  // 任务列表看不到它们。在这里单列一区,「转为任务」= 建任务 + 挂为 main agent。
+  let unbound = '';
+  if (proj && state.unboundSessions.length) {
+    const rows = state.unboundSessions.map((s) => {
+      const dot = s.state === 'waiting' ? 'wait'
+        : s.state === 'busy' || s.state === 'starting' ? 'run' : 'idle';
+      const meta = [s.transport, s.pendingCount ? `${s.pendingCount} 待批` : '']
+        .filter(Boolean).join(' · ');
+      return `<div class="task-row unbound" data-local="${s.localId}">
+        <span class="status ${dot}"></span>
+        <span class="task-copy">
+          <strong>${esc(s.name)}${s.title ? ' · ' + esc(s.title) : ''}</strong>
+          <small>${esc(meta)}</small>
+        </span>
+        <button class="btn" data-totask="${s.localId}">转为任务</button>
+      </div>`;
+    }).join('');
+    unbound = `<div class="unbound-sect">
+      <div class="unbound-head">未绑定会话</div>${rows}</div>`;
+  }
+
+  $('colTasks').innerHTML = head + `<div class="tl-body">${unbound}${list}</div>`;
   const nt = $('newTask');
   if (nt) nt.onclick = () => openNewTaskModal(state.taskProjectId);
-  for (const el of $('colTasks').querySelectorAll('.task-row')) {
+  for (const el of $('colTasks').querySelectorAll('.task-row:not(.unbound)')) {
     el.onclick = () => selectTask(el.dataset.id);
+  }
+  for (const el of $('colTasks').querySelectorAll('[data-totask]')) {
+    el.onclick = async (ev) => {
+      ev.stopPropagation();
+      el.disabled = true;
+      try {
+        const detail = await api('/api/tasks/from-session', {
+          method: 'POST',
+          body: JSON.stringify({ localId: el.dataset.totask }),
+        });
+        await loadProjects();
+        await loadTasks(state.taskProjectId);
+        selectTask(detail.task.id);
+      } catch (err) {
+        el.disabled = false;
+        showTaskError(err.message);
+      }
+    };
+  }
+  for (const el of $('colTasks').querySelectorAll('.task-row.unbound')) {
+    el.onclick = () => { switchMode('sessions'); navigate(el.dataset.local); };
   }
 }
 

@@ -240,6 +240,24 @@ function pendingForBinding(b: AgentBinding): number {
   return s?.claudeId ? permissions.countFor(s.claudeId) : 0;
 }
 
+/**
+ * 属于该 project 的工作区、仍活着、且没有 active binding 的会话。
+ * `wrapper` 起的 tmux 会话进了 SessionManager 但不会自动成为任务 —— 任务视图
+ * 靠这个列表让它们可见,用户按需「转为任务」(见 spec §1.1)。
+ */
+function unboundSessionsFor(project: Project): (SessionSummary & { pendingCount: number })[] {
+  const roots = new Set(project.workspaceRoots);
+  return manager
+    .list()
+    .filter(
+      (s) =>
+        roots.has(s.workspace) &&
+        s.state !== 'exited' &&
+        !tasks.bindingForSession(s.localId),
+    )
+    .map((s) => ({ ...s, pendingCount: s.claudeId ? permissions.countFor(s.claudeId) : 0 }));
+}
+
 /** GET /api/tasks/:id 的详情形状 —— 多处复用(POST/PATCH 也返回它,见 step 4)。 */
 function taskDetail(taskId: string) {
   const task = tasks.getTask(taskId);
@@ -307,7 +325,7 @@ app.get('/api/projects/:id/tasks', (req, res) => {
       lastEvent: events.length ? events[events.length - 1] : null,
     };
   });
-  res.json({ project, tasks: list });
+  res.json({ project, tasks: list, unboundSessions: unboundSessionsFor(project) });
 });
 
 app.get('/api/tasks/:id', (req, res) => {
@@ -340,6 +358,48 @@ app.post('/api/tasks', (req, res) => {
     priority: req.body?.priority === 'low' || req.body?.priority === 'high' ? req.body.priority : undefined,
   });
   tasks.appendEvent({ taskId: task.id, kind: 'task_created', message: `创建任务「${task.title}」` });
+  res.json(taskDetail(task.id));
+});
+
+/**
+ * 把一个未绑定的会话「转为任务」—— 建任务 + 立即把该会话作为 main agent 挂上去。
+ * 供任务视图的「未绑定会话」区一键操作(见 spec §1.1)。建任务和绑定分两步各自
+ * 落盘,但对用户是一个动作,合并成一个端点少一次往返、也少一个「建了任务却没绑上」
+ * 的中间态。
+ */
+app.post('/api/tasks/from-session', (req, res) => {
+  if (!checkOrigin(req, res)) return;
+  const localId = String(req.body?.localId ?? '');
+  const s = manager.get(localId);
+  if (!s) {
+    res.status(400).json({ error: '会话不存在' });
+    return;
+  }
+  const project = tasks.ensureProjectForWorkspace(s.workspace);
+  const title =
+    typeof req.body?.title === 'string' && req.body.title.trim()
+      ? req.body.title.trim()
+      : s.title || s.name;
+  const task = tasks.createTask({ projectId: project.id, title });
+  tasks.appendEvent({ taskId: task.id, kind: 'task_created', message: `由会话 ${s.name} 转为任务` });
+  try {
+    const binding = tasks.attachAgent({
+      taskId: task.id,
+      localId,
+      claudeId: s.claudeId,
+      role: 'main',
+      transportKind: s.transportKind,
+    });
+    tasks.appendEvent({
+      taskId: task.id,
+      agentBindingId: binding.id,
+      kind: 'agent_attached',
+      message: `绑定会话 ${s.name} 为 main agent`,
+    });
+  } catch (err) {
+    res.status(409).json({ error: String(err instanceof Error ? err.message : err) });
+    return;
+  }
   res.json(taskDetail(task.id));
 });
 
