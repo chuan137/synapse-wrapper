@@ -6,5 +6,5 @@ node_modules/
 # 忽略目录时 Git 不会进入目录内部,子路径的 ! 单独写没用,须先取消目录本身。
 !bin/
 bin/*
-!bin/wrapper.ts
-!bin/wrapper
+!bin/synapse.ts
+!bin/synapse

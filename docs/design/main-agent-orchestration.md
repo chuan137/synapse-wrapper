@@ -98,7 +98,7 @@ repo 不存在时 `backend/taskDocs.ts` 首次写入前 `git init` + 放一份 `
 
 每步可独立验证,不重写现有会话页:
 
-1. **`wrapper` → `synapse` 重命名 sweep**(spec §0.1)—— 前置。`bin/`、`backend/`、`package.json`、各处注释里的 `wrapper` 字样一次性改,`npm run typecheck` 兜底。子命令分发挂在新名上。
+1. ~~**`wrapper` → `synapse` 重命名 sweep**(spec §0.1)~~ —— ✅ 已完成。`bin/wrapper*` → `bin/synapse*`、`package.json` 的 `bin` 键、`backend/` 与 `public/` 注释、living docs(spec / handoff / notes)里的 `wrapper` 字样已一次性改,`npm run typecheck` 通过。子命令分发挂在 `bin/synapse` → `bin/synapse.ts` 的 `main()` 上。
 2. **`synapse agent context` 骨架** —— `bin/synapse.ts` 的子命令分发加 `agent` 分支,先只做 `context`:读 `~/.synapse/<port>/`(port/token)+ `SYNAPSE_TASK_ID` 环境变量 → `GET /api/tasks/:id` → 打印 work dir / 目标 / 验收 / 子 agent 列表。
 3. **主 agent 启动路径** —— `POST /api/tasks/:id/agents/start` 的 `role:'main'` 分支:`manager.create()` 注入 `SYNAPSE_TASK_ID` / `SYNAPSE_AGENT_BINDING`(`CreateOptions` 加 `env?: Record<string,string>`,透传进 transport 的 spawn),`appendSystemPrompt` 拼调度者职责 + `synapse agent` 用法 + 「先 handoff 再 spawn」。tmux 主 agent 仍走终端 `synapse` 起后绑定(spec §5.2 的 400 不变),env 由 CLI 注入。
 4. **Bash allow 规则** —— `daemon.ts` 的 `writeHookSettings()` 写的那份 settings 加 `permissions.allow: ["Bash(synapse agent:*)"]`(`--settings` 叠加,spec §3.1)。

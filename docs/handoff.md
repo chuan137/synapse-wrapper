@@ -15,19 +15,19 @@
 | 任务管理存储 | `backend/taskStore.ts` | ✅ 项目 / 任务 / agent 绑定 / 任务流事件,独立于 SessionManager |
 | HTTP/WS 服务 | `backend/server.ts` | ✅ token + Origin 校验、端口递增 |
 | 守护进程 | `backend/daemon.ts` | ✅ 双重健康检查、detached 拉起 |
-| wrapper CLI | `bin/wrapper` + `bin/wrapper.ts` | ✅ 端到端打通 |
+| synapse CLI | `bin/synapse` + `bin/synapse.ts` | ✅ 端到端打通 |
 | 两层 UI | `public/` | ✅ 浅色 macOS 风格 |
 
 规格见 `docs/spec.md`(已按实测校正)。注释规范见 `CLAUDE.md`。
 
-运行:`npm run dev`,或在 tmux 里直接 `wrapper`。
+运行:`npm run dev`,或在 tmux 里直接 `synapse`。
 
-## wrapper 的定位
+## synapse 的定位
 
 **「带前置准备的 claude」** —— claude 就在用户当前 pane 里启动,拉起后端与注册会话只是不可见的准备工作。不新建会话、不切换、不制造额外层级。
 
 ```
-$ wrapper
+$ synapse
 ● synapse-e2e · 网页端 http://127.0.0.1:3000/?token=…
 [claude 原生 TUI 就地打开]
 ```
@@ -102,7 +102,7 @@ tmux 会话的「终端输出」页签可用 `TmuxTransport.capture()` 做镜像
 
 **会话 ID 必须由 CLI 指定,不能事后推断。** 按转写文件 mtime 认领在同目录并存时会张冠李戴,批准请求随之路由到错误的会话(网页批准 A、实际放行 B)。CLI 生成 UUID 并经 `--session-id` 传给 claude。踩过一次,见 `docs/notes/implementation-lessons.md`。
 
-**`bin/wrapper`(重命名后 `bin/synapse`)必须是纯 JS。** 类型剥离只认 `.ts` 扩展名;版本闸门也必须留在薄壳里,否则低版本 Node 在 import 时就先崩了,提示永远显示不出来。
+**`bin/synapse` 薄壳必须是纯 JS。** 类型剥离只认 `.ts` 扩展名;版本闸门也必须留在薄壳里,否则低版本 Node 在 import 时就先崩了,提示永远显示不出来。
 
 ## 未决事项
 

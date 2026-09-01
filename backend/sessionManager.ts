@@ -24,13 +24,13 @@ import type { SessionEvent, SessionTransport } from './transport.ts';
 
 export type SessionState = 'starting' | 'ready' | 'busy' | 'waiting' | 'exited';
 
-/** 网页新建走 stream-json;wrapper CLI 走 tmux —— 后者可 attach 且存活于后端重启。 */
+/** 网页新建走 stream-json;synapse CLI 走 tmux —— 后者可 attach 且存活于后端重启。 */
 export type TransportKind = 'stream-json' | 'tmux';
 
 export interface CreateOptions {
   name?: string;
   transport?: TransportKind;
-  /** 仅 tmux:复用同名会话,使同一目录重复 wrapper 不会开出第二个。 */
+  /** 仅 tmux:复用同名会话,使同一目录重复 synapse 不会开出第二个。 */
   tmuxName?: string;
   /** 仅 tmux:接管用户已有的 pane,而非新建会话。 */
   paneId?: string;
@@ -42,7 +42,7 @@ export interface CreateOptions {
    * 追加到默认 system prompt 之后的一段文本(`claude --append-system-prompt`)。
    * 只在 claude 进程启动时读一次,无法作用于已在跑的会话 —— 调用方须在新建
    * 会话时就把最终内容拼好传进来。paneId 接管模式不生效:那条路径的 claude
-   * 由 wrapper CLI 自己启动,不经这里的 transport。
+   * 由 synapse CLI 自己启动,不经这里的 transport。
    */
   appendSystemPrompt?: string;
 }

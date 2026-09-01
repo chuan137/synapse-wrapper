@@ -6,12 +6,12 @@
  * 无从得知最终端口)。
  *
  * 按「请求端口」(调用方想要的目标端口,不是最终实际监听的端口)分目录 ——
- * 这是 Project List 落地后的新需求:不同 workspace 下开 wrapper 要能找到
+ * 这是 Project List 落地后的新需求:不同 workspace 下开 synapse 要能找到
  * 同一个生产 daemon,但测试环境指定另一个端口时不能读到/污染生产的状态文件。
  * 显式指定端口时不允许递增(见 server.ts),故「请求端口」与「实际监听端口」
  * 精确相等,目录名可预测。默认端口仍走原有递增容错,此时两者也相等 ——
  * 只有在默认端口已被其他服务占用时才会有出入,那种情况下写回的状态文件
- * 会把后续 wrapper 调用指向递增后的端口。本仓库自己的手动调试(`npm run
+ * 会把后续 synapse 调用指向递增后的端口。本仓库自己的手动调试(`npm run
  * dev`)因此固定用了另一个显式端口(见 package.json),避免它抢占默认端口
  * 触发递增、悄悄覆盖生产 daemon 的状态文件。
  *
@@ -101,7 +101,7 @@ export function writeHookSettings(requestedPort: number, actualPort: number): st
 export function writeState(requestedPort: number, state: DaemonState): void {
   if (state.port !== requestedPort) {
     // 请求端口被占用触发递增(见 server.ts listenWithRetry)—— 写回状态文件
-    // 会让后续所有 wrapper 调用改道到这个递增后的实例。这本该只在默认端口
+    // 会让后续所有 synapse 调用改道到这个递增后的实例。这本该只在默认端口
     // 撞上无关外部服务时发生;若撞上的是本仓库自己的另一个实例(比如忘了
     // 关的手动开发进程),不吭声地写回会悄悄劫持生产 daemon 的连接信息,
     // 且难以察觉 —— 所以在这里明确报出来,而不是任其静默发生。

@@ -5,7 +5,7 @@
  * 不往 Session 塞业务字段(见 docs/spec.md §1.1)。
  *
  * 落盘 ~/.synapse/tasks.json —— 不带端口,与 sessions.json 按端口分区不同:
- * Project List 要跨 workspace 聚合,而不传 --port 的 wrapper 都复用同一默认
+ * Project List 要跨 workspace 聚合,而不传 --port 的 synapse 都复用同一默认
  * daemon,任务视图理应在一个不随测试端口分裂的用户级命名空间里(见 spec §1.4)。
  * 测试用 SYNAPSE_TASKS_PATH 覆盖路径。
  */

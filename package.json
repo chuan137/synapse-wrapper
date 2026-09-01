@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "bin": {
-    "wrapper": "./bin/wrapper"
+    "synapse": "./bin/synapse"
   },
   "scripts": {
     "dev": "PORT=47190 tsx watch backend/server.ts",

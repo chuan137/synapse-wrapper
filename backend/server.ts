@@ -29,7 +29,7 @@ const ROOT = resolve(fileURLToPath(new URL('..', import.meta.url)));
 
 /**
  * 保护浏览器侧接口的会话令牌。同端口有残留 token(daemon.ts clearState 不删它,
- * 只清 pid/port)就复用,让 `wrapper daemon restart` 之后旧链接继续有效 ——
+ * 只清 pid/port)就复用,让 `synapse daemon restart` 之后旧链接继续有效 ——
  * 用户的浏览器书签、终端历史里存的都是这个 URL,链接跟着重启变会很烦人。
  * 全新安装或首次启动(没有残留文件)才随机生成。
  */
@@ -242,7 +242,7 @@ function pendingForBinding(b: AgentBinding): number {
 
 /**
  * 属于该 project 的工作区、仍活着、且没有 active binding 的会话。
- * `wrapper` 起的 tmux 会话进了 SessionManager 但不会自动成为任务 —— 任务视图
+ * `synapse` 起的 tmux 会话进了 SessionManager 但不会自动成为任务 —— 任务视图
  * 靠这个列表让它们可见,用户按需「转为任务」(见 spec §1.1)。
  */
 function unboundSessionsFor(project: Project): (SessionSummary & { pendingCount: number })[] {
@@ -536,8 +536,8 @@ app.post('/api/tasks/:id/agents/start', async (req, res) => {
   const workspace = resolve(String(b.workspace ?? ''));
 
   if (role === 'main' && transport === 'tmux') {
-    // 网页接管不了用户 pane —— 主 tmux agent 只能在终端用 wrapper 起,再绑定进来。
-    res.status(400).json({ error: '不能从网页启动 tmux 主 agent,请在终端用 wrapper 起会话后绑定' });
+    // 网页接管不了用户 pane —— 主 tmux agent 只能在终端用 synapse 起,再绑定进来。
+    res.status(400).json({ error: '不能从网页启动 tmux 主 agent,请在终端用 synapse 起会话后绑定' });
     return;
   }
   if (!workspace || !existsSync(workspace) || !statSync(workspace).isDirectory()) {
@@ -777,7 +777,7 @@ function listenWithRetry(port: number, triesLeft: number): void {
     // 默认端口被占用递增后二者不等,写错等同 fail-open(见 §2.3/§6)。
     writeHookSettings(PORT, port);
 
-    console.log(`\n  Synapse Wrapper`);
+    console.log(`\n  Synapse`);
     console.log(`  钩子超时: ${HOOK_TIMEOUT_S}s(后端 fail-closed 兜底更短)`);
     console.log(`\n  打开: http://${HOST}:${port}/?token=${AUTH_TOKEN}\n`);
 

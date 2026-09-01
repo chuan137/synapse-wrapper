@@ -21,7 +21,7 @@
 
 `bin/wrapper` → `bin/synapse`(无扩展名 JS 薄壳,§2.2 约束不变),`bin/wrapper.ts` → `bin/synapse.ts`,`package.json` 的 `bin` 键 `wrapper` → `synapse`。子命令分发在薄壳之后的实现里按 `argv[0]` 分:无参或路径 → 就地起 claude;`daemon` / `agent` → 各自的子模块。`agent` 子命令是 daemon HTTP 端点的瘦客户端(见 `docs/design/main-agent-orchestration.md`),不是单独的 binary。
 
-**代码重命名尚未执行** —— 本节先定约定,`bin/`、`backend/`、`package.json` 与各处注释里的 `wrapper` 字样待统一改。改的时候一次性 sweep,`npm run typecheck` 兜底。
+**代码重命名已执行** —— `bin/wrapper` → `bin/synapse`、`bin/wrapper.ts` → `bin/synapse.ts`、`package.json` 的 `bin` 键、`backend/` 与 `public/` 注释里的 `wrapper` 字样已一次性 sweep(`npm run typecheck` 通过)。`agent` 子命令分支尚未落地(见 `docs/design/main-agent-orchestration.md` 落地顺序第 2 步)。
 
 ### 0.2 Artifacts 路径:`~/.synapse/artifacts/<cwd 转写>-<sessionId 前缀>/`
 
@@ -66,7 +66,7 @@
         +----------------------------------------------------------+
         |  claude(--settings <hook 配置>)  × N                    |
         |    tmux 接管(长命):用户 pane 里的原生 TUI,进程独立于   |
-        |      后端存活,wrapper/synapse CLI 起                     |
+        |      后端存活,synapse CLI 起                              |
         |    stream-json(短命):后端 spawn 的子进程,后端退出即消失 |
         |      网页从任务里起的子 agent                             |
         +----------------------------------------------------------+
@@ -82,7 +82,7 @@
 | 后端重启 | claude 照跑,后端重启后重新探活接管(`notes/implementation-lessons.md`) | 随后端退出被带走(§7「崩溃恢复」) |
 | 终端 | 可 attach,用户能直接在 pane 里接手 | 无 TTY,`AskUserQuestion` 等交互工具会挂起(§5.1) |
 | 注入 / 观测 | paste-buffer 注入 + tail 转写文件 | stdin/stdout 双向 NDJSON |
-| 用在 | `wrapper`/`synapse` CLI 就地拉起的会话(用户要能在自己的 pane 里干活) | 网页从任务里启动的后台子 agent |
+| 用在 | `synapse` CLI 就地拉起的会话(用户要能在自己的 pane 里干活) | 网页从任务里启动的后台子 agent |
 
 两条路径共用一份转写解析逻辑(`backend/transcript.ts`,见 `notes/claude-code-behavior.md`)与同一套 hook 协议。
 
@@ -216,8 +216,8 @@ Node 22.6+ 直接执行 `.ts`(擦除类型标注,不做类型检查)。实测 No
 
 早期实现把 hook 追加进每个工作区的 `.claude/settings.local.json`。那是工作区级、非会话级的文件,代价:
 
-- 该目录里任何一个裸 `claude`(不经 wrapper)也会读到 hook,开始给后端发请求;
-- 同目录并存两个 wrapper 会话共用一份文件;
+- 该目录里任何一个裸 `claude`(不经 synapse)也会读到 hook,开始给后端发请求;
+- 同目录并存两个 synapse 会话共用一份文件;
 - 会话退出后 hook 条目留在文件里,下一个无关的 `claude` 打到可能已死的后端 —— 按 §2.2 是 fail-open。
 `#writeSettings` 里那套「写入前按 URL 剔除旧条目」的去重逻辑就是为了缓解最后一条,治标不治本。
 
@@ -322,9 +322,9 @@ daemon 每次监听成功后重写一遍(幂等)。**URL 里的端口必须是�
 
 启动用 `detached: true` + `stdio: 'ignore'` + `unref()`,三者缺一都会让 CLI 退出时带走后端。
 
-**端口。** 默认端口 `47100` —— `3000` 是 React/Next.js/Rails 等大量工具的默认端口,极易撞。`wrapper --port <n>`(或 `PORT` 环境变量)可覆盖,用于测试环境与日常使用的生产实例隔离。
+**端口。** 默认端口 `47100` —— `3000` 是 React/Next.js/Rails 等大量工具的默认端口,极易撞。`synapse --port <n>`(或 `PORT` 环境变量)可覆盖,用于测试环境与日常使用的生产实例隔离。
 
-状态目录按**请求端口**(调用方想要的目标端口,不是最终实际监听到的端口)分区。这是 Project List 落地后才有的需求:不同 workspace 下开 `wrapper` 不传 `--port` 时,都落在同一默认值上,天然复用同一个生产 daemon(`ensureDaemon()` 的健康检查通过就直接复用)—— Project List 能跨 workspace 聚合会话,前提正是这些会话本就活在同一个后端实例里。测试环境传入不同端口,则状态目录、daemon 实例、`sessions.json` 三者都完全隔离,不会读到/污染生产状态。
+状态目录按**请求端口**(调用方想要的目标端口,不是最终实际监听到的端口)分区。这是 Project List 落地后才有的需求:不同 workspace 下开 `synapse` 不传 `--port` 时,都落在同一默认值上,天然复用同一个生产 daemon(`ensureDaemon()` 的健康检查通过就直接复用)—— Project List 能跨 workspace 聚合会话,前提正是这些会话本就活在同一个后端实例里。测试环境传入不同端口,则状态目录、daemon 实例、`sessions.json` 三者都完全隔离,不会读到/污染生产状态。
 
 显式指定端口时**不允许递增重试**,占用即报错退出;只有默认端口才走原有的递增容错(`MAX_PORT_TRIES`)。这不是随意选择 —— 状态目录用「请求端口」命名的前提是它必须等于「实际监听端口」,否则下次启动按请求端口去读状态目录,读到的 `port` 字段会跟真实监听地址对不上,健康检查看着像活的,实际连不上。默认端口允许偏移是因为此时没人会显式记住"我要的是哪个端口",复用逻辑本就是"矬子里拔将军"——先看有没有活的,没有就在默认值附近另起一个。
 
@@ -335,11 +335,11 @@ daemon 每次监听成功后重写一遍(幂等)。**URL 里的端口必须是�
 - `stop` — 发 `SIGTERM`(而非 `SIGKILL`)给 daemon 进程,轮询 PID 消失确认退出。`SIGTERM` 触发 `server.ts` 的 `shutdown()`,走 `stopAll()` 收尾(会话状态落盘、drain 挂起的批准请求),direct kill -9 会跳过这些
 - `restart` = `stop` 后接 `ensureDaemon()`
 
-**重启 daemon 不影响正在跑的 claude 会话。** daemon 只是 tmux pane 的旁路观察者(接管模式下 `stop()` 无论如何都不销毁 pane,见 `notes/claude-code-behavior.md`),`wrapper daemon restart` 只终止/拉起后端进程本身,不碰任何 pane 或其中的 claude 进程。网页 WebSocket 连接会短暂断开(daemon 重启期间),刷新页面后重新连上;这段空窗期内若 claude 恰好发起需要批准的工具调用,钩子请求会打空 —— 按 §2.2 是 fail-open,工具照常执行,不算安全风险(重启是本机操作者主动发起的)。
+**重启 daemon 不影响正在跑的 claude 会话。** daemon 只是 tmux pane 的旁路观察者(接管模式下 `stop()` 无论如何都不销毁 pane,见 `notes/claude-code-behavior.md`),`synapse daemon restart` 只终止/拉起后端进程本身,不碰任何 pane 或其中的 claude 进程。网页 WebSocket 连接会短暂断开(daemon 重启期间),刷新页面后重新连上;这段空窗期内若 claude 恰好发起需要批准的工具调用,钩子请求会打空 —— 按 §2.2 是 fail-open,工具照常执行,不算安全风险(重启是本机操作者主动发起的)。
 
-**token 跨 restart 复用,不必换链接。** `AUTH_TOKEN` 原先每次进程启动都 `randomUUID()`(§6 的安全设计:token 不因绑定本机而形同虚设),但这让 `wrapper daemon restart` ——一个纯粹为了加载新代码、不代表用户想切身份的操作——也附带地址失效的副作用,浏览器书签、终端历史里存的链接全部作废。改为 `daemon.ts` 的 `readOrCreateToken()`:同请求端口的状态目录下若已有 `token` 文件就复用,没有才新生成;`clearState()` 相应地只删 `daemon.pid`/`port`,不再删 `token`(那两个字段才是「进程是否存活」的判定依据,token 只是凭据值,没有这层语义)。`shutdown()` 里的 `clearState(PORT)` 因此不会带走 token,新进程启动时能读到旧值。
+**token 跨 restart 复用,不必换链接。** `AUTH_TOKEN` 原先每次进程启动都 `randomUUID()`(§6 的安全设计:token 不因绑定本机而形同虚设),但这让 `synapse daemon restart` ——一个纯粹为了加载新代码、不代表用户想切身份的操作——也附带地址失效的副作用,浏览器书签、终端历史里存的链接全部作废。改为 `daemon.ts` 的 `readOrCreateToken()`:同请求端口的状态目录下若已有 `token` 文件就复用,没有才新生成;`clearState()` 相应地只删 `daemon.pid`/`port`,不再删 `token`(那两个字段才是「进程是否存活」的判定依据,token 只是凭据值,没有这层语义)。`shutdown()` 里的 `clearState(PORT)` 因此不会带走 token,新进程启动时能读到旧值。
 
-只有两种情况 token 仍会变:全新状态目录(首次启动,没有残留文件)、或磁盘 token 文件被手动删过。`wrapper daemon restart` 的输出因此从「token 已刷新」改为中性的「网页链接」,仍然打印出来兜底,而不是承诺"一定不变"。
+只有两种情况 token 仍会变:全新状态目录(首次启动,没有残留文件)、或磁盘 token 文件被手动删过。`synapse daemon restart` 的输出因此从「token 已刷新」改为中性的「网页链接」,仍然打印出来兜底,而不是承诺"一定不变"。
 
 实测(独立测试端口,不碰生产实例):`status` 对陈旧状态文件(PID 已死)正确报告「陈旧」而非「未运行」;`restart` 对陈旧状态走 `not-running` 分支直接拉新,对健康实例先打印「已停止旧进程」再拉新,新旧 PID 确认不同,token 前后一致;`stop` 幂等,重复调用不报错。
 
@@ -454,5 +454,5 @@ tmux agent 卡片:会话 `exited` 且 `transport === 'tmux'` 时状态标「pane
 - **任务 agent 的 worktree 隔离** — 设计见 §1.3,预检步见 §5.2;`backend/worktree.ts` 与 policy 存储层未实现,Phase 1 收尾时评估「多子 agent 并行」非近期需求而延后。
 - **Artifacts 采集** — §0.2 定了落盘路径规范,§5 的 Artifacts 页签在位,但后端未采集会话产出物,页签暂空。
 - **主 agent 调度** — 设计见 `docs/design/main-agent-orchestration.md`。`synapse agent wait` 的长轮询信号、子 agent 异常退出的退出码语义待实现时定。
-- **CLI 重命名** — §0.1:`wrapper` → `synapse`,子命令合并。约定已定,代码 sweep 待做。
+- **`synapse agent` 子命令** — §0.1 的 `agent` 分支(daemon HTTP 瘦客户端)。`wrapper` → `synapse` 的代码 sweep 已完成;`agent` 分发与端点见 `docs/design/main-agent-orchestration.md` 落地顺序。
 

@@ -45,7 +45,7 @@ export async function paneExists(paneId: string): Promise<boolean> {
  * 兜底手段:PersistedSession.paneId 字段是后加的(见 spec §2.16),旧数据落盘
  * 时该字段还不存在,读出来是 undefined。#loadPersisted 光靠磁盘记录补不全
  * 这批历史数据,只能反过来从操作系统当前状态推算 —— pane 的第一层子进程
- * 未必是 claude(wrapper 会先起一层 node 壳再 spawn claude),故用 sessionId
+ * 未必是 claude(synapse 会先起一层 node 壳再 spawn claude),故用 sessionId
  * 全局定位 claude 进程,再沿 ppid 链向上爬,看落在哪个 pane 的 pane_pid 下。
  */
 export async function findClaimedPanes(): Promise<Map<string, string>> {
@@ -96,7 +96,7 @@ export interface TmuxOptions {
   settingsPath: string;
   sessionName?: string;
   /**
-   * 接管已有 pane(如 %3)而非新建会话 —— wrapper 在用户当前 tmux 里就地启动
+   * 接管已有 pane(如 %3)而非新建会话 —— synapse 在用户当前 tmux 里就地启动
    * claude 时用它。给定时本类不创建也不销毁会话,只做注入与观察。
    */
   paneId?: string;
@@ -108,7 +108,7 @@ export interface TmuxOptions {
   sessionId?: string;
   /**
    * 透传给 claude CLI 的额外参数(如 --append-system-prompt)。
-   * 仅自建会话模式(sessionName)生效 —— 接管模式下 claude 由 wrapper CLI
+   * 仅自建会话模式(sessionName)生效 —— 接管模式下 claude 由 synapse CLI
    * 启动,不经本类。
    */
   extraArgs?: string[];
@@ -161,7 +161,7 @@ export class TmuxTransport extends EventEmitterBase implements SessionTransport 
     return this.#sessionId;
   }
 
-  /** wrapper CLI 用它 attach。 */
+  /** synapse CLI 用它 attach。 */
   get tmuxName(): string {
     return this.#tmuxName;
   }

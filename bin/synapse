@@ -1,10 +1,10 @@
 #!/usr/bin/env -S node --disable-warning=ExperimentalWarning
 /**
- * wrapper 的可执行入口 —— 只做版本闸门,实现在 wrapper.ts。
+ * synapse 的可执行入口 —— 只做版本闸门,实现在 synapse.ts。
  *
  * 本文件必须是纯 JS:Node 的类型剥离只对 .ts 扩展名生效,
  * 而可执行文件按惯例不带扩展名。版本检查也必须留在这里 ——
- * 低版本 Node 会在 import .ts 时直接抛语法错误,写在 wrapper.ts 里永远不会执行到。
+ * 低版本 Node 会在 import .ts 时直接抛语法错误,写在 synapse.ts 里永远不会执行到。
  */
 const MIN_NODE = 22;
 
@@ -15,6 +15,6 @@ if (Number(process.versions.node.split('.')[0]) < MIN_NODE) {
   process.exit(1);
 }
 
-const { main } = await import('./wrapper.ts');
+const { main } = await import('./synapse.ts');
 
 await main(process.argv.slice(2));

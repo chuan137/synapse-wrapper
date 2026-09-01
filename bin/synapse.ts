@@ -1,7 +1,7 @@
 /**
- * wrapper 的实现主体。
+ * synapse 的实现主体。
  *
- * 入口是同目录的 bin/wrapper(无扩展名的 JS 薄壳)—— Node 的类型剥离
+ * 入口是同目录的 bin/synapse(无扩展名的 JS 薄壳)—— Node 的类型剥离
  * 只对 .ts 扩展名生效,可执行文件本身不能直接写 TypeScript。
  *
  * 定位是「带前置准备的 claude」:claude 就在用户当前的 pane 里启动,
@@ -99,14 +99,14 @@ function parseArgv(argv: string[]): { dir: string | undefined; port: number } {
 }
 
 /**
- * wrapper 总是自带 --session-id(会话归属必须由调用方指定,见 §2.6),
+ * synapse 总是自带 --session-id(会话归属必须由调用方指定,见 §2.6),
  * 但 claude CLI 规定 --session-id 与 --continue/--resume 同时出现时
  * 必须再加 --fork-session,否则直接报错拒绝启动。
  *
  * 不能省略 --session-id 来避让这条限制:那样 claude 会继续写回旧会话的
  * 转写文件,而后端已经用新生成的 UUID 注册了这个会话 —— 转写路径对不上,
  * 批准请求无处路由。故自动补 --fork-session,让 resume 的历史被复制到
- * 新会话里延续,新内容仍落在 wrapper 注册的那个 UUID 下。
+ * 新会话里延续,新内容仍落在 synapse 注册的那个 UUID 下。
  */
 function withForkSession(claudeArgs: string[]): string[] {
   const wantsResume = claudeArgs.some((a) =>
@@ -118,8 +118,8 @@ function withForkSession(claudeArgs: string[]): string[] {
 export async function main(argv: string[]): Promise<void> {
   if (argv[0] === '-h' || argv[0] === '--help') {
     console.log(`
-用法: wrapper [目录] [--port <端口>] [-- <claude 参数...>]
-      wrapper daemon <start|status|restart|stop> [--port <端口>]
+用法: synapse [目录] [--port <端口>] [-- <claude 参数...>]
+      synapse daemon <start|status|restart|stop> [--port <端口>]
 
   在当前 tmux pane 里启动 claude,同时接入网页端监管。
   目录默认为当前目录;后端未运行时自动以守护进程拉起。
@@ -130,9 +130,9 @@ export async function main(argv: string[]): Promise<void> {
   传一个不同的端口即可,两边状态完全隔离。
 
   -- 之后的参数原样透传给 claude CLI(如 --model、--mcp-config 等),
-  wrapper 自身不解析;--settings 与 --session-id 已由 wrapper 管理,重复传入会被
+  synapse 自身不解析;--settings 与 --session-id 已由 synapse 管理,重复传入会被
   claude 自己的参数解析覆盖或报错。传入 --continue/-c 或 --resume/-r 时
-  wrapper 会自动补上 --fork-session(claude 的强制要求),历史对话会被复制到
+  synapse 会自动补上 --fork-session(claude 的强制要求),历史对话会被复制到
   新会话延续,而不是接着写回旧会话的转写文件。
 
   需在 tmux 会话中运行 —— 后端通过 pane 观察与注入。
@@ -169,7 +169,7 @@ export async function main(argv: string[]): Promise<void> {
     console.error(c.dim('\n  后端通过 tmux pane 观察与注入,这是它能在网页端同步的前提。'));
     console.error(c.dim('  先进入 tmux 再执行:\n'));
     console.error('    tmux new -s work');
-    console.error(`    wrapper ${argv[0] ?? ''}`.trimEnd());
+    console.error(`    synapse ${argv[0] ?? ''}`.trimEnd());
     console.error('');
     process.exit(1);
   }
@@ -214,7 +214,7 @@ export async function main(argv: string[]): Promise<void> {
  * daemon 子命令 —— 独立于「拉起 claude」的主流程,只管后端本身的生命周期。
  * restart 不影响已在跑的 tmux 会话:daemon 只是旁路观察者,pane 里的 claude
  * 进程独立于它存活(见 tmuxTransport.ts stop() 的接管模式说明)。改完后端
- * 代码后用它加载新版本,比手动 kill + 重新执行 wrapper 更不容易漏步骤。
+ * 代码后用它加载新版本,比手动 kill + 重新执行 synapse 更不容易漏步骤。
  */
 async function daemonCmd(argv: string[]): Promise<void> {
   // parseArgv 把非 --port 的位置参数当「目录」摘出来,子命令名恰好落在同一个槽位。
@@ -263,8 +263,8 @@ async function daemonCmd(argv: string[]): Promise<void> {
 /**
  * 以 claude 替换当前进程。
  *
- * 用 exec 语义而非子进程:pane 里不该留一个 wrapper 壳进程,
- * 否则 claude 退出后用户会莫名回到 wrapper 而不是 shell。
+ * 用 exec 语义而非子进程:pane 里不该留一个 synapse 壳进程,
+ * 否则 claude 退出后用户会莫名回到 synapse 而不是 shell。
  * Node 没有 execve,用 spawn + stdio inherit 后透传退出码是最接近的等价物。
  */
 function execClaude(cwd: string, settingsPath: string, sessionId: string, extraArgs: string[]): void {

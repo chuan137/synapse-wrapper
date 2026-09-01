@@ -44,7 +44,7 @@
 | 自建会话 | `sessionName` | `new-session -d` 建独立会话,后端持有其生命周期 |
 | 接管 pane | `paneId` | 不建也不销毁会话,只对给定 pane 注入与观察 |
 
-`wrapper`/`synapse` CLI 走接管模式:claude 在用户当前 pane 里启动,CLI 只做前置准备(拉起后端、写 settings),不制造额外的会话层级。因此 **CLI 必须在 tmux 内运行** —— pane 是后端寻址的唯一手段;裸终端下直接提示而非隐式建会话。
+`synapse` CLI 走接管模式:claude 在用户当前 pane 里启动,CLI 只做前置准备(拉起后端、写 settings),不制造额外的会话层级。因此 **CLI 必须在 tmux 内运行** —— pane 是后端寻址的唯一手段;裸终端下直接提示而非隐式建会话。
 
 `synapse daemon start` 是例外:只拉起 daemon 并打印网页链接,不创建会话、不接管 pane,不要求在 tmux 内。用于「只看任务面板,会话之后从网页里创建/绑定」的场景。`daemon <start|status|restart|stop>` 四个子命令都只管后端本身的生命周期。
 

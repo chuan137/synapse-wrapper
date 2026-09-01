@@ -39,7 +39,7 @@ const state = {
   projects: [],          // GET /api/projects 的结果
   taskProjectId: null,   // 当前选中的 project
   taskList: [],          // 当前 project 的任务列表(带聚合)
-  unboundSessions: [],   // 当前 project 工作区下、未绑定任何任务的活跃会话(wrapper 起的 tmux 会话主要落这里)
+  unboundSessions: [],   // 当前 project 工作区下、未绑定任何任务的活跃会话(synapse 起的 tmux 会话主要落这里)
   taskId: null,          // 当前打开的任务
   taskDetail: null,      // GET /api/tasks/:id
   taskError: '',         // 最近一次任务操作的错误(409/400/404 等),渲染在详情顶部
@@ -1198,7 +1198,7 @@ function renderProjectNav() {
     </div>`;
   }).join('');
   $('nav').innerHTML = `<div class="nav-sect">项目</div>${rows ||
-    '<div class="nav-empty">还没有项目。项目按会话的工作区自动生成 —— 切到<b>会话</b>视图新建一个会话,或在终端跑 <code>wrapper</code>。</div>'}`;
+    '<div class="nav-empty">还没有项目。项目按会话的工作区自动生成 —— 切到<b>会话</b>视图新建一个会话,或在终端跑 <code>synapse</code>。</div>'}`;
   for (const el of $('nav').querySelectorAll('.proj-row')) {
     el.onclick = () => selectProject(el.dataset.id);
   }
@@ -1235,7 +1235,7 @@ function renderTaskList() {
     }).join('');
   }
 
-  // 未绑定会话:wrapper 起的 tmux 会话进了 SessionManager 但没有 binding,
+  // 未绑定会话:synapse 起的 tmux 会话进了 SessionManager 但没有 binding,
   // 任务列表看不到它们。在这里单列一区,「转为任务」= 建任务 + 挂为 main agent。
   let unbound = '';
   if (proj && state.unboundSessions.length) {
