@@ -44,7 +44,7 @@
 ```
         +----------------------------------------------------------+
         |                       浏览器 UI                           |
-        |  任务视图:项目 / 任务 / 任务详情(Phase 1 默认)          |
+        |  任务视图:项目 / 任务 / 任务详情(默认)                  |
         |  会话视图:优先级流 + 单会话详情                           |
         |    详情页签:改动文件 / Artifacts / 对话 / 终端输出        |
         +---------------------------+------------------------------+
@@ -86,15 +86,15 @@
 
 两条路径共用一份转写解析逻辑(`backend/transcript.ts`,见 `notes/claude-code-behavior.md`)与同一套 hook 协议。
 
-### 1.1 首选方向:Claude 下的任务管理
+### 1.1 Claude 下的任务管理
 
-当前首选演进方向是先在 Claude Code 体系内实现任务管理,形成 **项目 -> 任务 -> agents** 的层级。
+在 Claude Code 体系内实现任务管理,形成 **项目 -> 任务 -> agents** 的层级(Phase 1,已实现 —— 历史方案见 `docs/phase1-task-management.md`)。
 
 - 项目(Project):对应一个工作区或一组相关工作区,承载目标、上下文、会话列表与任务集合。
 - 任务(Task):项目内可追踪的工作单元,记录目标、状态、优先级、负责人/参与 agent、关联会话、产物与验收结果。
 - agents:执行任务的 Claude Code 会话。一个任务可以绑定一个主 agent,也可以挂多个辅助 agent;agent 的运行状态、权限请求、最终回复和中间执行过程都归入所属任务。
 
-第一阶段不引入跨 CLI 执行者,只把现有 Claude 会话纳入任务视图:用户先选项目,在项目下创建或选择任务,再把一个或多个 Claude 会话挂到任务上。UI 顶层从“会话列表”演进为“项目 / 任务 / agents”三层导航,但底层仍复用现有 SessionManager、PermissionEngine 与 SessionTransport。
+不引入跨 CLI 执行者,只把 Claude 会话纳入任务视图:用户先选项目,在项目下创建或选择任务,再把一个或多个 Claude 会话挂到任务上。UI 顶层是「项目 / 任务 / agents」三层导航,底层复用 SessionManager、PermissionEngine 与 SessionTransport。
 
 任务管理状态应独立于 SessionManager。SessionManager 继续只负责会话生命周期、传输与运行时统计;Project/Task/AgentBinding 由新的任务存储维护,通过 localId/claudeId 引用现有会话,不要把项目、任务、验收等业务字段塞进 Session 对象。
 
@@ -113,9 +113,11 @@ Synapse 后端提供 agent bus,而不是依赖某个 CLI 内部的 session 间�
 
 若未来选择由 Synapse 实现,这层 bus 应作为 Synapse 自有能力:第一版只需要支持 Claude -> Codex 的单向调度和结果回收,不要把生产路径押在 Codex 内部 experimental collab/subagent 协议上。Codex app-server 暴露的 `collabAgentToolCall`、`spawnAgent`、`sendInput` 等事件可以展示和研究,但暂不作为稳定控制面。
 
-### 1.3 任务 agent 的 worktree 隔离(Phase 1 设计)
+### 1.3 任务 agent 的 worktree 隔离(设计,未实现)
 
-Phase 1 从任务启动子 agent 时,默认让 agent 在一个独立的 `git worktree` 上工作,而非直接进主工作区 —— 多个子 agent 并行改同一个仓库、或用户自己正在主库里操作时,不互相踩。这一节定死这个机制在「主库 dirty」下的行为。
+> **状态**:`backend/worktree.ts` 与 policy 存储层**尚未落地**。Phase 1 收尾时评估「多子 agent 并行」不是近期需求,连同 §7 的未决项一起延后。当前从任务启动的子 agent 直接在传入 workspace 上跑(见 §5.2)。本节是待实现时的设计约束。
+
+从任务启动子 agent 时,让 agent 在一个独立的 `git worktree` 上工作,而非直接进主工作区 —— 多个子 agent 并行改同一个仓库、或用户自己正在主库里操作时,不互相踩。这一节定死这个机制在「主库 dirty」下的行为。
 
 **`git worktree add` 不要求主库 clean。** 它从某个 commit(默认 `HEAD`)拉一个新目录,主库的未提交改动留在原地、不跟过去。所以「建不建得出来」不是问题;真正的问题是**主库那些未提交改动 agent 看不到** —— 新 worktree 拿到的是干净的 `HEAD`。
 
@@ -150,17 +152,17 @@ interface WorktreeSpec {
 async function createWorktree(spec: WorktreeSpec): Promise<{ path: string; cleanup: () => Promise<void> }>;
 ```
 
-主 agent(tmux,用户 pane)不套 worktree —— 用户在自己的 pane 里,换目录不合适(呼应 §3.1 结论:wrapper 的 tmux 会话不套 policy)。
+主 agent(tmux,用户 pane)不套 worktree —— 用户在自己的 pane 里,换目录不合适(呼应 §3.1 结论:`synapse` 的 tmux 会话不套 policy)。
 
-### 1.4 任务数据的存储位置(Phase 1)
+### 1.4 任务数据的存储位置
 
-`sessions.json` 按 `~/.synapse/<请求端口>/` 分区,因为会话跟着 daemon 实例走(见 §4「端口」段、store.ts 头注释)。任务数据不同:Project List 要跨 workspace 聚合,而不传 `--port` 的 wrapper 都复用同一默认 daemon —— 任务视图同样应活在一个不随测试端口分裂的用户级命名空间里。
+`sessions.json` 按 `~/.synapse/<请求端口>/` 分区,因为会话跟着 daemon 实例走(见 §4「端口」段、store.ts 头注释)。任务数据不同:Project List 要跨 workspace 聚合,而不传 `--port` 的 `synapse` 都复用同一默认 daemon —— 任务视图同样应活在一个不随测试端口分裂的用户级命名空间里。
 
 故 `tasks.json` 落 `~/.synapse/tasks.json`,**不带端口**。测试用环境变量 `SYNAPSE_TASKS_PATH` 覆盖以隔离生产数据。文件权限 `0600`,写入原子(临时文件 + chmod + rename)且串行化,JSON 解析失败不静默覆盖(重命名为 `tasks.json.corrupt-<ts>` 后新建空结构)。数据结构见 `docs/phase1-task-management.md`。
 
 ### 1.5 任务主 agent 与子 agent 的调度
 
-设计移出本文件 —— 见 `docs/design/main-agent-orchestration.md`(主 agent 四项职责、`synapse agent` 子命令、`synapse-tasks` 共享文档库、文档端点)。落地步骤见 `docs/phase1-implementation-plan.md` Step 8。
+设计移出本文件 —— 见 `docs/design/main-agent-orchestration.md`(主 agent 四项职责、`synapse agent` 子命令、`synapse-tasks` 共享文档库、文档端点、9 步落地顺序)。Phase 1 之后的方向,尚未实现。
 
 一句话:调度用 `synapse agent {context,spawn,wait,doc}` 子命令(daemon HTTP 的瘦客户端),不引入 MCP;主 agent 沉淀的 handoff / progress / changelog 落一个独立 git repo。
 
@@ -326,9 +328,9 @@ daemon 每次监听成功后重写一遍(幂等)。**URL 里的端口必须是�
 
 显式指定端口时**不允许递增重试**,占用即报错退出;只有默认端口才走原有的递增容错(`MAX_PORT_TRIES`)。这不是随意选择 —— 状态目录用「请求端口」命名的前提是它必须等于「实际监听端口」,否则下次启动按请求端口去读状态目录,读到的 `port` 字段会跟真实监听地址对不上,健康检查看着像活的,实际连不上。默认端口允许偏移是因为此时没人会显式记住"我要的是哪个端口",复用逻辑本就是"矬子里拔将军"——先看有没有活的,没有就在默认值附近另起一个。
 
-**`wrapper daemon <start|status|restart|stop>` 子命令。** 改完后端代码想让它生效,原先只能手动 `kill` 旧进程再随便跑一次 `wrapper` 触发 `ensureDaemon()` 的自愈——容易漏步骤(比如忘了确认旧进程真退出就拉新的,或者 kill -9 跳过收尾)。四个子命令都基于既有的 `readState`/`checkHealth`/`ensureDaemon`,不是另起一套逻辑:
+**`synapse daemon <start|status|restart|stop>` 子命令。** 改完后端代码想让它生效,原先只能手动 `kill` 旧进程再随便跑一次 `synapse` 触发 `ensureDaemon()` 的自愈——容易漏步骤(比如忘了确认旧进程真退出就拉新的,或者 kill -9 跳过收尾)。四个子命令都基于既有的 `readState`/`checkHealth`/`ensureDaemon`,不是另起一套逻辑:
 
-- `start` — `ensureDaemon()` + 打印网页链接,随即退出。不创建会话、不接管 pane、不要求在 tmux 内 —— 只看任务面板时用(Phase 1)。已在跑就复用(健康检查通过即直接返回)
+- `start` — `ensureDaemon()` + 打印网页链接,随即退出。不创建会话、不接管 pane、不要求在 tmux 内 —— 只看任务面板时用。已在跑就复用(健康检查通过即直接返回)
 - `status` — 读状态文件 + 健康检查,报告运行中/陈旧/未运行
 - `stop` — 发 `SIGTERM`(而非 `SIGKILL`)给 daemon 进程,轮询 PID 消失确认退出。`SIGTERM` 触发 `server.ts` 的 `shutdown()`,走 `stopAll()` 收尾(会话状态落盘、drain 挂起的批准请求),direct kill -9 会跳过这些
 - `restart` = `stop` 后接 `ensureDaemon()`
@@ -361,7 +363,7 @@ onEvent(fn)  订阅事件流
 `extraArgs`)。这是「把工作区约定 / 子 agent 模板固化进 system prompt」的最小能力,
 只在进程启动时读一次 —— **无法作用于已在跑的会话**(运行时改 system prompt 没有通道,
 唯一干净的注入点是启动前;详见 §7)。paneId 接管模式不生效:那条路径的 claude 由
-wrapper CLI 自己启动。存储层、worktree、预检 UI 等留待 Phase 1 子 agent 场景验证后再建。
+`synapse` CLI 自己启动。worktree 隔离与 policy 存储层未实现,见 §1.3。
 
 ---
 
@@ -369,8 +371,8 @@ wrapper CLI 自己启动。存储层、worktree、预检 UI 等留待 Phase 1 �
 
 左上角切换两个模式,偏好存 localStorage:
 
-- **任务**(Phase 1 默认)— 项目 / 任务 / 任务详情三栏。左栏(复用 aside)列项目,带任务数、运行中 agent 数、待批准数;中栏列任务,带状态点、agent 数、待批准数;右栏是任务详情:目标 / 验收、agent 卡片(transport / state / context / cost / pending,主 agent 绿底)、任务流事件(newest-first)。项目按 name `localeCompare`、任务按 `createdAt` 固定排序,不随状态跳动(理由见 `notes/implementation-lessons.md`「左栏排序固定」)。交互:创建 / 编辑任务、绑定已有会话为主/子 agent、解绑(不关会话)、点 agent 卡片「打开会话」跳到会话模式的该会话详情。任务流首次拉取(`GET /api/tasks/:id`)与 WS 增量(`task_event` 消息)push 进同一个 `events` 数组、同一套渲染(「服务端归约与前端增量必须对齐」的老问题,见 `notes/implementation-lessons.md`)。
-  - **未绑定会话区。** `wrapper` 起的 tmux 会话进了 `SessionManager` 但不会自动成为任务 —— 若只渲染有 binding 的 agent,这些会话在任务视图里完全不可见。故中栏任务列表上方单列一区:属于当前项目 `workspaceRoots`、`state !== 'exited'`、且无 active binding 的会话,由 `GET /api/projects/:id/tasks` 的 `unboundSessions` 字段给出(服务端按 binding 算,前端无从本地推导 —— 新会话出现或 tmux 会话 `exited` 时前端重取该接口)。每行一个「转为任务」按钮,调 `POST /api/tasks/from-session`:以会话 `title || name` 建任务、立即把该会话挂为 main agent,一步到位。点会话行本身跳到会话模式查看。
+- **任务**(默认)— 项目 / 任务 / 任务详情三栏。左栏(复用 aside)列项目,带任务数、运行中 agent 数、待批准数;中栏列任务,带状态点、agent 数、待批准数;右栏是任务详情:目标 / 验收、agent 卡片(transport / state / context / cost / pending,主 agent 绿底)、任务流事件(newest-first)。项目按 name `localeCompare`、任务按 `createdAt` 固定排序,不随状态跳动(理由见 `notes/implementation-lessons.md`「左栏排序固定」)。交互:创建 / 编辑任务、绑定已有会话为主/子 agent、解绑(不关会话)、点 agent 卡片「打开会话」跳到会话模式的该会话详情。任务流首次拉取(`GET /api/tasks/:id`)与 WS 增量(`task_event` 消息)push 进同一个 `events` 数组、同一套渲染(「服务端归约与前端增量必须对齐」的老问题,见 `notes/implementation-lessons.md`)。
+  - **未绑定会话区。** `synapse` 起的 tmux 会话进了 `SessionManager` 但不会自动成为任务 —— 若只渲染有 binding 的 agent,这些会话在任务视图里完全不可见。故中栏任务列表上方单列一区:属于当前项目 `workspaceRoots`、`state !== 'exited'`、且无 active binding 的会话,由 `GET /api/projects/:id/tasks` 的 `unboundSessions` 字段给出(服务端按 binding 算,前端无从本地推导 —— 新会话出现或 tmux 会话 `exited` 时前端重取该接口)。每行一个「转为任务」按钮,调 `POST /api/tasks/from-session`:以会话 `title || name` 建任务、立即把该会话挂为 main agent,一步到位。点会话行本身跳到会话模式查看。
 - **会话** — 下面描述的原有两层结构,能力不变。
 
 **顶层 — 优先级流。** 左栏按 workspace 分组(Project List),组内按「需要你 / 进行中 / 静默」排序;主区是跨会话的事件流,同样按「谁最需要你」排序。待批准项排最前并按等待时长排序,可就地批准无需进入会话。每项附风险说明(如「递归删除」「会直接改动线上基础设施」),而非仅展示命令原文。
@@ -382,7 +384,7 @@ Project 分组默认展开,用户手动收起的记入 localStorage(键存收起
 | 页签 | 内容 |
 |---|---|
 | 改动文件 | 文件列表带增删统计,点开看 diff |
-| Artifacts | 会话产出物网格,文件落 `~/.synapse/artifacts/...`(路径规范见 §0.2;后端采集待做) |
+| Artifacts | 会话产出物网格,文件落 `~/.synapse/artifacts/...`(路径规范见 §0.2)。**后端采集未实现** —— 页签暂空,见 §7 |
 | 对话 | 按轮次分组,过程折叠,详见下 |
 | 终端输出 | 命令输出按次分卡,带退出码与耗时 |
 
@@ -410,18 +412,18 @@ Project 分组默认展开,用户手动收起的记入 localStorage(键存收起
 - **不算失败。** Claude Code 把这次 `deny` 等同工具失败,`tool_result` 的 `is_error` 为 `true`。但这是协议限制下的正常回传,不是真的出错 —— 归约逻辑(`reduceEvent` 与前端 `onSessionEvent` 的 `tool_result` 分支)对 `AskUserQuestion` 强制把 `isError` 记为 `false`,「N 步」折叠摘要与单步图标因此不会把提交回答/跳过标成失败。
 - **会话状态要收回。** `onApprovalRequested` 触发时会话被标 `waiting`(§4 PermissionEngine),但早期实现只在挂起时置位,没有对应的复位 —— `#settle` 落定决策后无人把 `s.state` 改回去,只能靠前端 `pendingFor()` 派生值动态覆盖显示,凡是直接读 `s.state` 原始字面量的地方都会一直显示"等待批准"。现在 `ResolveListener` 额外带上 `sessionId`,`onApprovalResolved` 里若该会话已无其它待批准项,按 `pendingTurns` 决定收回到 `busy` 还是 `ready`。
 
-### 5.2 从任务启动子 agent 的预检步(Phase 1 设计)
+### 5.2 从任务启动子 agent 的预检步
 
-从任务启动子 agent 前插入一步确认 —— system prompt、cwd/worktree、`--add-dir`、model 全是启动参数,启动后不可变(见 §7 与 §4 `CreateOptions.appendSystemPrompt`),既然如此就在唯一能真正生效的时刻让用户确认。这一步同时决定 §1.3 的 worktree `dirtyStrategy`。
+从任务启动子 agent 前插入一步确认 —— system prompt、cwd/worktree、`--add-dir`、model 全是启动参数,启动后不可变(见 §7 与 §4 `CreateOptions.appendSystemPrompt`),既然如此就在唯一能真正生效的时刻让用户确认。
 
-对话框展示:目标工作区、`git status --porcelain` 结果(dirty 时高亮)、worktree 策略选择(`require-clean` / `ignore` / `carry-stash`)、要注入 system prompt 的最终文本(可预览)、model、`--add-dir` 列表。默认值来自工作区 / project 的 policy(policy 存储层本身留待验证后再建,见 §4 与 §3.1);改动只作用于这一次,除非用户勾「设为该工作区默认」。
+**已实现。** `POST /api/tasks/:id/agents/start` 复用 `manager.create()` 起一个 stream-json 子 agent、写 `agent_started` 事件、按模板(项目 / 工作区 / 任务 / 目标 / 验收 / 子任务 / 收尾格式)拼 prompt 后 `send()`。`role:'main' + transport:'tmux'` 返回 400 —— 网页接管不了用户 pane。预检对话框展示工作区、`GET /api/git-status` 的 `git status --porcelain` 结果(**信息用途,不阻断**)、system prompt 最终文本预览、model。
+
+**未实现。** worktree 隔离(`dirtyStrategy` 三策略)与 policy 存储层 —— 子 agent 目前直接在传入工作区上跑,见 §1.3 / §7。对话框里的 worktree 策略选择、`--add-dir` 列表、「设为该工作区默认」也随之留白。
 
 运行中的会话不进入这个流程 —— 无法改 system prompt,唯一「动态」的手段是往对话里 `send()` 一条要求消息,效果弱且会污染时间线,不作为正式路径。
 
-**已落地范围(Phase 1 · 7a)。** `POST /api/tasks/:id/agents/start` 复用 `manager.create()` 起一个 stream-json 子 agent、写 `agent_started` 事件、按方案模板(项目 / 工作区 / 任务 / 目标 / 验收 / 子任务 / 收尾格式)拼 prompt 后 `send()`。`role:'main' + transport:'tmux'` 返回 400 —— 网页接管不了用户 pane。预检对话框展示工作区、`GET /api/git-status` 的 `git status --porcelain` 结果(**信息用途,7a 不阻断**)、system prompt 最终文本预览、model。**worktree 隔离(`dirtyStrategy` 三策略)与 policy 存储层是 7b,尚未落地** —— 子 agent 目前直接在传入工作区上跑,见 §1.3 / §7。
-
-**Phase 1 手动验证(测试端口,独立 `SYNAPSE_TASKS_PATH`,真实 claude 会话):**
-`wrapper daemon start` 起面板不附带会话;现有会话按 workspace 自动归入默认 project;创建 / 编辑任务即时落盘、刷新保留;绑定 tmux 会话为主 agent 后详情页绿底卡片显示 state / context / cost;从任务启动 stream-json 子 agent,子 agent timeline 出现完整模板 prompt 并回复,任务流按序出现 `agent_started` / `turn_completed`;同一会话绑第二个 task 返回 409,详情页顶部红色错误条显示原因;kill 承载 pane → 存活巡检把会话判 `exited`,任务流出现 `agent_exited`,binding `endedAt` 落上;点 agent 卡片「打开会话」切到会话视图并打开该会话四页签;切回会话视图旧 overview 功能不变;1400px / 480px 宽度均无横向溢出。`GET /api/sessions` 与非 `serve` 的 `wrapper` 行为回归无变化。
+**手动验证过(测试端口,独立 `SYNAPSE_TASKS_PATH`,真实 claude 会话):**
+`synapse daemon start` 起面板不附带会话;现有会话按 workspace 自动归入默认 project;创建 / 编辑任务即时落盘、刷新保留;绑定 tmux 会话为主 agent 后详情页绿底卡片显示 state / context / cost;从任务启动 stream-json 子 agent,子 agent timeline 出现完整模板 prompt 并回复,任务流按序出现 `agent_started` / `turn_completed`;同一会话绑第二个 task 返回 409,详情页顶部红色错误条显示原因;kill 承载 pane → 存活巡检把会话判 `exited`,任务流出现 `agent_exited`,binding `endedAt` 落上;点 agent 卡片「打开会话」切到会话视图并打开该会话四页签;切回会话视图旧 overview 功能不变;1400px / 480px 宽度均无横向溢出。`GET /api/sessions` 与非 daemon 子命令的 `synapse` 行为回归无变化。
 
 tmux agent 卡片:会话 `exited` 且 `transport === 'tmux'` 时状态标「pane 已失效」而非「已退出」——claude 进程可能还活着,只是网页失去了观察通道。binding 被存活巡检自动 `endedAt` 后卡片转「已解绑」,历史留在任务流的 `agent_exited` 事件里。
 
@@ -449,7 +451,8 @@ tmux agent 卡片:会话 `exited` 且 `transport === 'tmux'` 时状态标「pane
 - **中断能力** — `interrupt()` 目前发 SIGINT,stream-json 下的正确中断方式尚未实测确认,可能会终止整个会话。
 - **崩溃恢复** — 后端退出会带走所有子进程。`--resume <session_id>` 可恢复对话上下文,但不恢复进行中的轮次。恢复流程尚未设计。
 - **stream-json 会话的进程存活** — tmux 会话在后端重启后可重新探活接管(`notes/implementation-lessons.md`),stream-json 子进程随后端退出而消失(见「崩溃恢复」),这层还没补。
-- **任务 agent 的 worktree 隔离** — 设计见 §1.3,预检步见 §5.2;`backend/worktree.ts` 与 policy 存储层待 Phase 1 子 agent 场景验证后落地。
+- **任务 agent 的 worktree 隔离** — 设计见 §1.3,预检步见 §5.2;`backend/worktree.ts` 与 policy 存储层未实现,Phase 1 收尾时评估「多子 agent 并行」非近期需求而延后。
+- **Artifacts 采集** — §0.2 定了落盘路径规范,§5 的 Artifacts 页签在位,但后端未采集会话产出物,页签暂空。
 - **主 agent 调度** — 设计见 `docs/design/main-agent-orchestration.md`。`synapse agent wait` 的长轮询信号、子 agent 异常退出的退出码语义待实现时定。
 - **CLI 重命名** — §0.1:`wrapper` → `synapse`,子命令合并。约定已定,代码 sweep 待做。
 

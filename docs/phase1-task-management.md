@@ -1,5 +1,10 @@
 # Phase 1:Claude 任务管理实施方案
 
+> **状态(2026-09-01):Phase 1 已结束。** Step 1–7a + polish 已实现并手动验证(见 `phase1-implementation-plan.md` 各步验收、spec §5.2)。
+> 未纳入:7b worktree 隔离(`backend/worktree.ts` + policy 存储)、Artifacts 后端采集 —— 评估非近期需求,延后,见 spec §7。
+> 主 agent 受限编排(「后续演进」)另立设计:`docs/design/main-agent-orchestration.md`。
+> 本文件保留为历史方案记录,当前行为以 `spec.md` 为准。
+
 ## 目标
 
 Phase 1 的目标是在现有 Claude Code wrapper 之上增加任务管理层,形成 **项目 -> 任务 -> agents** 的工作视图。

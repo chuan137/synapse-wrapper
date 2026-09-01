@@ -1,5 +1,9 @@
 # Phase 1 实施计划 —— spec-driven
 
+> **状态(2026-09-01):Phase 1 已结束。** Step 1–6、Step 7a、Step 8(polish)已实现并按各步「验收」验证。
+> Step 7b(worktree 隔离 + policy 存储)未做 —— 收尾时评估「多子 agent 并行」非近期需求,延后(spec §7)。
+> 本文件保留为历史执行记录。下一步方向见 `docs/design/main-agent-orchestration.md`。
+
 本文件是 `docs/phase1-task-management.md`(方案)与 `docs/spec.md`(权威规格)之上的**执行层**:
 把方案拆成可独立提交、可独立验证的步骤,每一步都绑定它所依据的 spec 章节和验收条件。
 

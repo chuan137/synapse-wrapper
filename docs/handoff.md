@@ -48,62 +48,26 @@ $ wrapper
 
 若选择 Synapse 实现,第一步做自有 agent bus:注册 Codex worker、支持 Claude -> Codex 的 `send_message`、等待执行者 turn 完成并回收最终回复与执行过程摘要。不要把生产路径押在 Codex app-server 里的 experimental collab/subagent 控制面上。
 
+## Phase 1 已完成(2026-09-01)
+
+**Claude 下的任务管理**,层级 **项目 -> 任务 -> agents**(spec §1.1)。已实现并手动验证:
+
+- `TaskStore`(`backend/taskStore.ts`),独立于 `SessionManager`,落 `~/.synapse/tasks.json`。`Project` / `Task` / `AgentBinding` / `TaskEvent`。
+- 只读 API:`GET /api/projects`、`GET /api/projects/:id/tasks`(带 `unboundSessions`)、`GET /api/tasks/:id`。现有 sessions 按 workspace 自动归入默认 project。
+- 写 API:`POST /api/tasks`、`POST /api/tasks/:id/agents`(绑定)、`POST /api/tasks/from-session`(转为任务)、`PATCH /api/tasks/:id`、`DELETE /api/tasks/:id/agents/:bindingId`(解绑不关会话)、`POST /api/tasks/:id/agents/start`(启动 stream-json 子 agent + 预检对话框,见 spec §5.2)。
+- UI 三栏:项目 / 任务 / 任务详情。「未绑定会话」区 + 「转为任务」。列表行选中态收敛(`.nav-item.on` / `.proj-row.on` / `.task-row.on` 共用一条规则)。旧会话 overview 入口保留。
+- 任务流事件:`GET /api/tasks/:id` 首拉与 WS `task_event` 增量同一套渲染。
+- tmux 死会话卡片标「pane 已失效」;binding 被存活巡检 `endedAt` 后转「已解绑」。
+
+**未纳入 Phase 1**(收尾评估非近期需求,延后 —— spec §7):
+
+- worktree 隔离:`backend/worktree.ts` + `dirtyStrategy` 三策略 + policy 存储(spec §1.3 / §5.2)。子 agent 目前直接在传入 workspace 上跑。
+- Artifacts 后端采集(spec §0.2 定了路径,页签暂空)。
+- 删除任务的端点 —— 误转的任务只能改 status 为 archived 隐藏。
+
 ## 待做
 
-### 1. Claude 下的任务管理
-
-首选方向是先实现 Claude Code 体系内的任务管理,层级为 **项目 -> 任务 -> agents**。见 spec §1.1。
-
-推荐按以下顺序实现,避免一次性重写现有会话页:
-
-1. **数据模型与存储**
-   - 新增 `TaskStore`,独立于 `SessionManager`。
-   - 本地持久化先落 `~/.synapse/tasks.json`,权限 `0600`。
-   - `Project`:id、name、workspaceRoots、goal、createdAt、updatedAt。
-   - `Task`:id、projectId、title、goal、status、priority、acceptance、createdAt、updatedAt、archivedAt。
-   - `AgentBinding`:id、taskId、localId、role(`main`/`sub`)、transportKind(`tmux`/`stream-json`)、createdAt、endedAt。
-
-2. **只读 API**
-   - `GET /api/projects`:项目列表,带任务数量、运行中 agent 数、待批准数。
-   - `GET /api/projects/:id/tasks`:任务列表,聚合所属 agent 状态。
-   - `GET /api/tasks/:id`:任务详情,包含 agent bindings、关联会话摘要、任务流事件。
-   - 先从现有 sessions 按 workspace 自动生成默认 project,不要要求用户先建项目。
-
-3. **基础写 API**
-   - `POST /api/tasks`:在项目下创建任务。
-   - `POST /api/tasks/:id/agents`:把现有会话绑定为 main/sub agent。
-   - `PATCH /api/tasks/:id`:改 title、goal、status、priority、acceptance。
-   - `DELETE /api/tasks/:id/agents/:bindingId`:解除绑定,不关闭底层会话。
-
-4. **UI 骨架**
-   - 以 `public/task-mock.html` 为视觉参考,把现有首页重组为三栏:项目、任务、任务详情。
-   - 第一版保留原会话详情页能力,只是在任务详情里嵌入/链接对应会话。
-   - 任务详情展示主 agent、子 agent、状态、pending approval、context、cost、最近输出。
-
-5. **从任务启动 agent**
-   - 主 agent 默认用 `tmux` transport,对应用户可接管的 Claude TUI。
-   - 子 agent 默认用 `stream-json` transport,作为后台执行 worker。
-   - 新建子 agent 时复用 `POST /api/sessions`,再创建 `AgentBinding` 归入任务。
-
-6. **任务流事件**
-   - 新增 task event log:task_created、agent_attached、agent_started、approval_requested、turn_completed、agent_finished、task_status_changed。
-   - 事件来自 TaskStore 写操作和 SessionManager/PermissionEngine 的现有事件聚合。
-   - 不在第一版解析完整 diff/artifacts,先记录文件名、工具名、最终回复摘要。
-
-7. **收敛与清理**
-   - 给老的纯会话 overview 保留入口,直到任务视图稳定。
-   - 补 tmux 死会话标记后,任务 agent 卡片同步显示 `pane 已失效`。
-   - 再考虑任务归档、验收结果、批量启动子 agent。
-   - ✅ 未绑定会话可见性:`wrapper` 起的 tmux 会话不再只能靠手动绑定进任务视图。
-     中栏任务列表上方加了「未绑定会话」区(`GET /api/projects/:id/tasks` 的
-     `unboundSessions` 字段),每行一个「转为任务」按钮 → `POST /api/tasks/from-session`
-     建任务 + 挂为 main agent。见 spec §5「任务」条目。
-     待做:目前没有删除任务的端点,误转的任务只能改 status 为 archived 隐藏。
-   - ✅ 列表行样式收敛:`.nav-item.on` / `.proj-row.on` / `.task-row.on` 三处选中态
-     原本略有出入,现共用一条规则;`.unbound-row` 并入 `.task-row.unbound`。
-     布局(会话单栏 vs 任务两栏)不动 —— 两者取舍不同,见 spec §5。
-
-### 1b. 任务主 agent 调度 + 共享文档库(Phase 1 之后)
+### 主 agent 调度 + 共享文档库(下一步)
 
 设计与 9 步落地顺序:`docs/design/main-agent-orchestration.md`。命名统一见 spec §0.1。
 
@@ -112,19 +76,15 @@ $ wrapper
 瘦客户端),**不用 MCP**;沉淀的文档落独立 git repo `synapse-tasks`,仿 `~/gb/kit3588-plan`。
 `plan §411 / §534` 明确把这块划在 Phase 1 之外。
 
-### 2. UI 适配 tmux 会话
+### UI 适配 tmux 会话
 
 tmux 会话的「终端输出」页签可用 `TmuxTransport.capture()` 做镜像,目前未接。
 
 会话标识已完成:显示名优先用 claude 的 ai-title(说明会话在做什么),标题生成前退回 pane ID。见 `docs/notes/claude-code-behavior.md`「ai-title」。
 
-### 3. 注入残留
+### 注入残留
 
 实测见到过输入框残留上一次未提交的文本(`❯ show me app.js`)。`#inject` 开头有 `C-u` 清理,但时机可能不够稳。会话忙碌时注入的行为需要再验。
-
-### 4. 死会话在网页端的呈现
-
-按决定,pane 消失后的会话**不自动清理**,留给网页集中管理。`TmuxTransport.alive()` 已可查询承载体是否还在,但尚未接进会话摘要 —— UI 需要据此标出「pane 已失效」并提供关闭入口。
 
 ## 关键约束(改代码前必读)
 
