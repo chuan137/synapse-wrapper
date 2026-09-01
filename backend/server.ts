@@ -18,8 +18,11 @@ import { PermissionEngine, HOOK_TIMEOUT_S, type PendingApproval } from './permis
 import { TaskStore, tasksPath, type AgentBinding, type Project, type Task } from './taskStore.ts';
 import {
   writeState, clearState, readOrCreateToken, writeHookSettings, hookSettingsPath,
-  DEFAULT_PORT, MAX_PORT_TRIES,
+  migrateLegacyStateDir, DEFAULT_PORT, MAX_PORT_TRIES,
 } from './daemon.ts';
+
+// 旧版按端口分子目录,现在扁平放数据目录根 —— 升级后首次启动搬一次(见 daemon.ts)。
+migrateLegacyStateDir();
 
 const HOST = '127.0.0.1';
 /** 显式通过 PORT 环境变量指定过端口,还是用的默认值 —— 决定要不要允许递增重试。 */
@@ -28,28 +31,25 @@ const PORT = Number(process.env.PORT ?? DEFAULT_PORT);
 const ROOT = resolve(fileURLToPath(new URL('..', import.meta.url)));
 
 /**
- * 保护浏览器侧接口的会话令牌。同端口有残留 token(daemon.ts clearState 不删它,
+ * 保护浏览器侧接口的会话令牌。数据目录有残留 token(daemon.ts clearState 不删它,
  * 只清 pid/port)就复用,让 `synapse daemon restart` 之后旧链接继续有效 ——
  * 用户的浏览器书签、终端历史里存的都是这个 URL,链接跟着重启变会很烦人。
  * 全新安装或首次启动(没有残留文件)才随机生成。
  */
-const AUTH_TOKEN = readOrCreateToken(PORT);
+const AUTH_TOKEN = readOrCreateToken();
 
 /**
  * 实际监听端口 —— 默认端口占用时会递增(见 listenWithRetry)。
- * 显式指定端口时不允许递增(见 §「端口」),此时恒等于 PORT ——
- * 测试/生产各自传入不同端口时,才能保证「请求端口」与「实际监听端口」
- * 精确相等,持久化目录名(daemon.ts stateDir)才可预测。
+ * 显式指定端口时不允许递增(见 §「端口」),此时恒等于 PORT。
  * Origin 校验与钩子 URL 都必须用它,用 PORT 会在端口递增后全线失配。
  */
 let activePort = PORT;
 
-// hook 配置文件路径可提前推导(仅依赖请求端口),文件本身在 listenWithRetry
-// 里等实际监听端口确定后才写。会话启动都在监听成功之后,读到的一定是新版本。
-const manager = new SessionManager(PORT, hookSettingsPath(PORT));
+// hook 配置文件路径固定在数据目录下,文件本身在 listenWithRetry 里等实际
+// 监听端口确定后才写。会话启动都在监听成功之后,读到的一定是新版本。
+const manager = new SessionManager(hookSettingsPath());
 const permissions = new PermissionEngine();
-// 任务存储落 ~/.synapse/tasks.json —— 不按端口分区(见 spec §1.4),
-// 与 sessions.json 不同:Project List 要跨 workspace/daemon 聚合。
+// 任务存储落 <数据目录>/tasks.json —— 和 sessions.json 同目录(见 spec §1.4)。
 const tasks = new TaskStore(tasksPath());
 const stopLivenessWatch = manager.startLivenessWatch();
 
@@ -748,11 +748,9 @@ permissions.onApprovalResolved((toolUseId, decision, reason, sessionId) => {
  * 端口递增重试必须在这里做,不能交给 CLI:守护进程是 detached 起的,
  * 父进程读不到 stdout,只能靠本进程把最终端口写进状态文件。
  *
- * 仅默认端口走递增:显式指定端口(测试环境常用来避免撞生产)时,
- * 「请求端口」必须精确等于「实际监听端口」,否则持久化目录(按请求端口
- * 分目录,见 daemon.ts)会对不上实际服务监听的地址,daemon.ts 的健康检查
- * 也会因为读到的 port 字段与真实监听端口不一致而失真。故占用即报错退出,
- * 不静默换port。
+ * 仅默认端口走递增:显式指定端口时,占用即报错退出,不静默换端口 ——
+ * 用户显式记住的是哪个端口就该监听哪个,悄悄改道只会让人对着旧地址干等。
+ * 无论哪种情况,最终监听端口都写进 <数据目录>/port,健康检查与 CLI 据此寻址。
  */
 function listenWithRetry(port: number, triesLeft: number): void {
   const onError = (err: NodeJS.ErrnoException) => {
@@ -772,10 +770,10 @@ function listenWithRetry(port: number, triesLeft: number): void {
     server.removeListener('error', onError);
     activePort = port;
 
-    writeState(PORT, { pid: process.pid, port, token: AUTH_TOKEN });
+    writeState({ pid: process.pid, port, token: AUTH_TOKEN });
     // 钩子 URL 必须用实际监听端口(port),不是请求端口(PORT)——
     // 默认端口被占用递增后二者不等,写错等同 fail-open(见 §2.3/§6)。
-    writeHookSettings(PORT, port);
+    writeHookSettings(port);
 
     console.log(`\n  Synapse`);
     console.log(`  钩子超时: ${HOOK_TIMEOUT_S}s(后端 fail-closed 兜底更短)`);
@@ -798,7 +796,7 @@ listenWithRetry(PORT, PORT_EXPLICIT ? 0 : MAX_PORT_TRIES);
 async function shutdown(): Promise<void> {
   console.log('\n正在关闭...');
   stopLivenessWatch();
-  clearState(PORT);
+  clearState();
   permissions.drain();
   // stopAll 而非 closeAll —— 会话记录要留着,下次启动时左栏仍能看到(持久化的意义)。
   await manager.stopAll();

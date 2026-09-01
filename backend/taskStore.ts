@@ -4,10 +4,9 @@
  * SessionManager 只管会话生命周期;这里通过 localId / claudeId 单向引用会话,
  * 不往 Session 塞业务字段(见 docs/spec.md §1.1)。
  *
- * 落盘 ~/.synapse/tasks.json —— 不带端口,与 sessions.json 按端口分区不同:
- * Project List 要跨 workspace 聚合,而不传 --port 的 synapse 都复用同一默认
- * daemon,任务视图理应在一个不随测试端口分裂的用户级命名空间里(见 spec §1.4)。
- * 测试用 SYNAPSE_TASKS_PATH 覆盖路径。
+ * 落盘 <数据目录>/tasks.json,和 sessions.json 同目录(见 spec §1.4)。
+ * 数据目录默认 ~/.synapse,SYNAPSE_DATA_DIR 覆盖;单测直接给构造函数传路径,
+ * SYNAPSE_TASKS_PATH 是更细一层的独立覆盖(只挪 tasks.json)。
  */
 import {
   mkdirSync,
@@ -126,7 +125,7 @@ function emptyFile(): TasksFile {
   return { version: 1, projects: [], tasks: [], agentBindings: [], events: [] };
 }
 
-/** 默认路径:SYNAPSE_TASKS_PATH 优先(测试隔离用),否则 ~/.synapse/tasks.json。 */
+/** 默认路径:SYNAPSE_TASKS_PATH 优先(测试隔离用),否则 <数据目录>/tasks.json。 */
 export function tasksPath(): string {
   return process.env.SYNAPSE_TASKS_PATH || join(SYNAPSE_DIR, 'tasks.json');
 }

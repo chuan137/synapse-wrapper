@@ -33,7 +33,7 @@
 
 - `<cwd 路径转写>` 与 Claude Code 转写目录同一套规则:斜杠转连字符,前导斜杠保留成前导连字符(如 `/Users/me/proj` → `-Users-me-proj`)。**不要自行推算**能拿到的路径 —— 能从钩子/事件载荷取到就取(见 `docs/notes/claude-code-behavior.md`)。
 - `<sessionId 前 8 位>`:裸 UUID 的前 8 个字符,同目录并存的多个会话据此分开,不必写全长。
-- 与 `worktrees/`(§1.3)、`tasks.json`(§1.4)、`<port>/`(§4)平级,都在 `~/.synapse/` 下;artifacts 按会话分、不按端口分(产出物跟会话走,不跟 daemon 实例走)。
+- 与 `worktrees/`(§1.3)、`tasks.json`(§1.4)、daemon 状态文件(§4)平级,都在数据目录(默认 `~/.synapse/`,`SYNAPSE_DATA_DIR` 覆盖)下;artifacts 按会话分。
 
 目录不自动清理(呼应 §1.3 worktree、接管模式下 tmux pane 归用户的处置原则)—— 里面是会话的产出。UI 提供显式删除入口。
 
@@ -156,9 +156,9 @@ async function createWorktree(spec: WorktreeSpec): Promise<{ path: string; clean
 
 ### 1.4 任务数据的存储位置
 
-`sessions.json` 按 `~/.synapse/<请求端口>/` 分区,因为会话跟着 daemon 实例走(见 §4「端口」段、store.ts 头注释)。任务数据不同:Project List 要跨 workspace 聚合,而不传 `--port` 的 `synapse` 都复用同一默认 daemon —— 任务视图同样应活在一个不随测试端口分裂的用户级命名空间里。
+daemon 的所有文件(`sessions.json`、`token`、`daemon.pid`/`port`、`hooks.settings.json`、`daemon.log`)与 `tasks.json` 都直接落在数据目录根下(默认 `~/.synapse/`,`SYNAPSE_DATA_DIR` 覆盖),不再按端口分子目录 —— 一个数据目录对应至多一个 daemon 实例。测试要跟日常实例隔离就指定一个临时 `SYNAPSE_DATA_DIR`。
 
-故 `tasks.json` 落 `~/.synapse/tasks.json`,**不带端口**。测试用环境变量 `SYNAPSE_TASKS_PATH` 覆盖以隔离生产数据。文件权限 `0600`,写入原子(临时文件 + chmod + rename)且串行化,JSON 解析失败不静默覆盖(重命名为 `tasks.json.corrupt-<ts>` 后新建空结构)。数据结构见 `docs/phase1-task-management.md`。
+`tasks.json` 权限 `0600`,写入原子(临时文件 + chmod + rename)且串行化,JSON 解析失败不静默覆盖(重命名为 `tasks.json.corrupt-<ts>` 后新建空结构)。单测直接给 `TaskStore` 构造函数传路径;`SYNAPSE_TASKS_PATH` 是更细一层的独立覆盖(只挪 `tasks.json`,不动其余文件)。数据结构见 `docs/phase1-task-management.md`。
 
 ### 1.5 任务主 agent 与子 agent 的调度
 
@@ -223,9 +223,9 @@ Node 22.6+ 直接执行 `.ts`(擦除类型标注,不做类型检查)。实测 No
 
 **实测 + 官方文档确认:`claude --settings <path|json>` 是叠加而非覆盖。** 优先级从高到低:企业级 → `--settings`(CLI)→ `.claude/settings.local.json` → `.claude/settings.json` → `~/.claude/settings.json`。`--settings` 里写的键覆盖同名文件键、省略的键保留文件值;`hooks` 按**事件名 + matcher** 求并集,各来源的 hook 全部生效,互不遮蔽。
 
-因此 hook 配置改由 `daemon.ts` 的 `writeHookSettings()` 写一份 `~/.synapse/<请求端口>/hooks.settings.json`(`0600`),内容只有 `hooks`。所有会话(`TmuxTransport` 与 `StreamJsonTransport` 都是 `--settings <这个路径>`)共用它,并与各自工作区自己的 `.claude/settings*.json` 由 Claude Code 求并集 —— 不必把用户的 model / permissions 拷进来,也不写用户仓库里的任何文件。
+因此 hook 配置改由 `daemon.ts` 的 `writeHookSettings()` 写一份 `<数据目录>/hooks.settings.json`(`0600`),内容只有 `hooks`。所有会话(`TmuxTransport` 与 `StreamJsonTransport` 都是 `--settings <这个路径>`)共用它,并与各自工作区自己的 `.claude/settings*.json` 由 Claude Code 求并集 —— 不必把用户的 model / permissions 拷进来,也不写用户仓库里的任何文件。
 
-daemon 每次监听成功后重写一遍(幂等)。**URL 里的端口必须是实际监听端口**(默认端口被占用时会递增,见 §4),写错等同 fail-open,故 `writeHookSettings(请求端口, 实际端口)` 两个端口分开传:前者定文件路径,后者进 URL。文件路径仅依赖请求端口,可在监听前推导出来传给 `SessionManager`;文件本身等实际端口确定后才写,而会话启动都在监听成功之后,读到的一定是最新版本。
+daemon 每次监听成功后重写一遍(幂等)。**URL 里的端口必须是实际监听端口**(默认端口被占用时会递增,见 §4),写错等同 fail-open,故 `writeHookSettings(实际端口)` 收实际监听端口进 URL。文件路径固定在数据目录下、监听前就能拿到传给 `SessionManager`;文件本身等实际端口确定后才写,而会话启动都在监听成功之后,读到的一定是最新版本。
 
 ```json
 {
@@ -257,7 +257,7 @@ daemon 每次监听成功后重写一遍(幂等)。**URL 里的端口必须是�
 
 `PreToolUse` 的 `matcher` 由 `daemon.ts` 的 `ENABLE_FULL_APPROVAL` 开关控制,见 §2.1(开关随 hook 配置一起搬到了 `daemon.ts`)。`Stop`/`SessionEnd` 不参与权限判断,`handleHookRequest` 里非 `PreToolUse` 事件一律立即放行 —— `SessionEnd` 额外触发退出回调(退出检测双通道见 `notes/implementation-lessons.md`),`Stop` 目前只是占位。
 
-**副作用:hook 配置不再出现在工作区的 `.claude/settings.local.json` 里。** 那个文件通常是用户 gitignore 掉、用来查「Synapse 对我的仓库做了什么」的地方;现在要查得看 `~/.synapse/<端口>/hooks.settings.json`。实测(独立测试端口):stream-json 会话拿到的 `settingsPath` 正确指向该文件,`claude` 加载无报错;`ENABLE_FULL_APPROVAL=true` 下发一条需要 `Bash` 的提示词,后端 pending 表按 `tool_use_id` 挂起该调用、会话转 `waiting`、`deadlineAt` 就位 —— hook 全链路生效。
+**副作用:hook 配置不再出现在工作区的 `.claude/settings.local.json` 里。** 那个文件通常是用户 gitignore 掉、用来查「Synapse 对我的仓库做了什么」的地方;现在要查得看 `<数据目录>/hooks.settings.json`。实测(独立 `SYNAPSE_DATA_DIR`):stream-json 会话拿到的 `settingsPath` 正确指向该文件,`claude` 加载无报错;`ENABLE_FULL_APPROVAL=true` 下发一条需要 `Bash` 的提示词,后端 pending 表按 `tool_use_id` 挂起该调用、会话转 `waiting`、`deadlineAt` 就位 —— hook 全链路生效。
 
 ### 3.2 PreToolUse 钩子载荷(Claude Code → 后端)
 
@@ -316,17 +316,17 @@ daemon 每次监听成功后重写一遍(幂等)。**URL 里的端口必须是�
 
 ### 守护进程(`backend/daemon.ts`)
 
-状态存 `~/.synapse/<port>/`(`daemon.pid` / `port` / `token` / `hooks.settings.json` / `sessions.json` / `daemon.log`,均 `0600`),由后端监听成功后自己写入 —— 端口递增发生在服务端,detached 启动的父进程读不到 stdout,无从得知最终端口。`hooks.settings.json` 是所有会话共用的 hook 配置,见 §3.1;`daemon.pid`/`port` 是「进程是否存活」的判定依据,`clearState()` 只清这两个,其余保留。
+状态存**数据目录根**(默认 `~/.synapse/`,`SYNAPSE_DATA_DIR` 覆盖):`daemon.pid` / `port` / `token` / `hooks.settings.json` / `sessions.json` / `daemon.log`,均 `0600`,由后端监听成功后自己写入 —— 端口递增发生在服务端,detached 启动的父进程读不到 stdout,无从得知最终端口,只能靠 `port` 文件回传。`hooks.settings.json` 是所有会话共用的 hook 配置,见 §3.1;`daemon.pid`/`port` 是「进程是否存活」的判定依据,`clearState()` 只清这两个,其余保留。
+
+**不再按端口分子目录。** 一个数据目录对应至多一个 daemon 实例,`sessions.json` / `token` 各只有一份。旧版按 `~/.synapse/<请求端口>/` 分区来隔离测试与生产;现在测试要隔离改用独立的 `SYNAPSE_DATA_DIR`,daemon 文件全部扁平放根下。`daemon.ts` 的 `migrateLegacyStateDir()` 在 daemon 启动路径跑一次:旧 `<默认端口>/` 子目录存在、且其 `daemon.pid` 不指向活进程时,把 `token` / `sessions.json` / `hooks.settings.json` 搬到根下(根下已有则不覆盖),用户手里的链接和历史会话不因升级而丢。旧进程还活着就整体跳过 —— 它用旧代码,仍往子目录写,等它经 `synapse daemon restart` 退出后下次启动再搬。
 
 健康检查必须 **PID 存活 + HTTP 探活且 token 相符** 双过:PID 可能已被系统回收并分配给无关进程,单看 PID 会误认;端口可能被别的程序占着,单看 HTTP 会把陌生服务当成自己人。任一不过即清理陈旧文件重启。
 
 启动用 `detached: true` + `stdio: 'ignore'` + `unref()`,三者缺一都会让 CLI 退出时带走后端。
 
-**端口。** 默认端口 `47100` —— `3000` 是 React/Next.js/Rails 等大量工具的默认端口,极易撞。`synapse --port <n>`(或 `PORT` 环境变量)可覆盖,用于测试环境与日常使用的生产实例隔离。
+**端口。** 默认端口 `47100` —— `3000` 是 React/Next.js/Rails 等大量工具的默认端口,极易撞。`synapse --port <n>`(或 `PORT` 环境变量)只在需要**新起** daemon 时决定监听端口;已有健康实例总是直接复用(`readState()` 读数据目录里记录的 `port`,不按端口区分)。`synapse daemon restart` 落回旧实例记录的同一端口(停之前先读一次 `port`)。
 
-状态目录按**请求端口**(调用方想要的目标端口,不是最终实际监听到的端口)分区。这是 Project List 落地后才有的需求:不同 workspace 下开 `synapse` 不传 `--port` 时,都落在同一默认值上,天然复用同一个生产 daemon(`ensureDaemon()` 的健康检查通过就直接复用)—— Project List 能跨 workspace 聚合会话,前提正是这些会话本就活在同一个后端实例里。测试环境传入不同端口,则状态目录、daemon 实例、`sessions.json` 三者都完全隔离,不会读到/污染生产状态。
-
-显式指定端口时**不允许递增重试**,占用即报错退出;只有默认端口才走原有的递增容错(`MAX_PORT_TRIES`)。这不是随意选择 —— 状态目录用「请求端口」命名的前提是它必须等于「实际监听端口」,否则下次启动按请求端口去读状态目录,读到的 `port` 字段会跟真实监听地址对不上,健康检查看着像活的,实际连不上。默认端口允许偏移是因为此时没人会显式记住"我要的是哪个端口",复用逻辑本就是"矬子里拔将军"——先看有没有活的,没有就在默认值附近另起一个。
+显式指定端口时**不允许递增重试**,占用即报错退出;只有默认端口才走递增容错(`MAX_PORT_TRIES`)—— 用户显式记住的是哪个端口就该监听哪个,悄悄改道只会让人对着旧地址干等。无论哪种情况,最终监听端口都写进 `<数据目录>/port`,健康检查与 CLI 据此寻址。
 
 **`synapse daemon <start|status|restart|stop>` 子命令。** 改完后端代码想让它生效,原先只能手动 `kill` 旧进程再随便跑一次 `synapse` 触发 `ensureDaemon()` 的自愈——容易漏步骤(比如忘了确认旧进程真退出就拉新的,或者 kill -9 跳过收尾)。四个子命令都基于既有的 `readState`/`checkHealth`/`ensureDaemon`,不是另起一套逻辑:
 
@@ -337,11 +337,11 @@ daemon 每次监听成功后重写一遍(幂等)。**URL 里的端口必须是�
 
 **重启 daemon 不影响正在跑的 claude 会话。** daemon 只是 tmux pane 的旁路观察者(接管模式下 `stop()` 无论如何都不销毁 pane,见 `notes/claude-code-behavior.md`),`synapse daemon restart` 只终止/拉起后端进程本身,不碰任何 pane 或其中的 claude 进程。网页 WebSocket 连接会短暂断开(daemon 重启期间),刷新页面后重新连上;这段空窗期内若 claude 恰好发起需要批准的工具调用,钩子请求会打空 —— 按 §2.2 是 fail-open,工具照常执行,不算安全风险(重启是本机操作者主动发起的)。
 
-**token 跨 restart 复用,不必换链接。** `AUTH_TOKEN` 原先每次进程启动都 `randomUUID()`(§6 的安全设计:token 不因绑定本机而形同虚设),但这让 `synapse daemon restart` ——一个纯粹为了加载新代码、不代表用户想切身份的操作——也附带地址失效的副作用,浏览器书签、终端历史里存的链接全部作废。改为 `daemon.ts` 的 `readOrCreateToken()`:同请求端口的状态目录下若已有 `token` 文件就复用,没有才新生成;`clearState()` 相应地只删 `daemon.pid`/`port`,不再删 `token`(那两个字段才是「进程是否存活」的判定依据,token 只是凭据值,没有这层语义)。`shutdown()` 里的 `clearState(PORT)` 因此不会带走 token,新进程启动时能读到旧值。
+**token 跨 restart 复用,不必换链接。** `AUTH_TOKEN` 原先每次进程启动都 `randomUUID()`(§6 的安全设计:token 不因绑定本机而形同虚设),但这让 `synapse daemon restart` ——一个纯粹为了加载新代码、不代表用户想切身份的操作——也附带地址失效的副作用,浏览器书签、终端历史里存的链接全部作废。改为 `daemon.ts` 的 `readOrCreateToken()`:数据目录下若已有 `token` 文件就复用,没有才新生成;`clearState()` 相应地只删 `daemon.pid`/`port`,不再删 `token`(那两个字段才是「进程是否存活」的判定依据,token 只是凭据值,没有这层语义)。`shutdown()` 里的 `clearState()` 因此不会带走 token,新进程启动时能读到旧值。
 
-只有两种情况 token 仍会变:全新状态目录(首次启动,没有残留文件)、或磁盘 token 文件被手动删过。`synapse daemon restart` 的输出因此从「token 已刷新」改为中性的「网页链接」,仍然打印出来兜底,而不是承诺"一定不变"。
+只有两种情况 token 仍会变:全新数据目录(首次启动,没有残留文件)、或磁盘 token 文件被手动删过。`synapse daemon restart` 的输出因此从「token 已刷新」改为中性的「网页链接」,仍然打印出来兜底,而不是承诺"一定不变"。
 
-实测(独立测试端口,不碰生产实例):`status` 对陈旧状态文件(PID 已死)正确报告「陈旧」而非「未运行」;`restart` 对陈旧状态走 `not-running` 分支直接拉新,对健康实例先打印「已停止旧进程」再拉新,新旧 PID 确认不同,token 前后一致;`stop` 幂等,重复调用不报错。
+实测(独立 `SYNAPSE_DATA_DIR`,不碰生产实例):daemon 文件扁平落在数据目录根、无端口子目录;`status`/`stop` 只认数据目录里记录的实例,忽略 `--port`;`restart` 不带 `--port` 也落回原端口,新旧 PID 不同、token 前后一致;`migrateLegacyStateDir` 对死 pid 的旧子目录搬迁、对活 pid 跳过、根下已有 token 时不覆盖。
 
 ### SessionTransport(抽象)
 

@@ -16,7 +16,8 @@ import { randomUUID } from 'node:crypto';
 import { existsSync, statSync, realpathSync } from 'node:fs';
 import { resolve, basename } from 'node:path';
 import {
-  ensureDaemon, stopDaemon, readState, checkHealth, urlFor, HOST, DEFAULT_PORT,
+  ensureDaemon, stopDaemon, readState, checkHealth, urlFor, migrateLegacyStateDir,
+  HOST, DEFAULT_PORT,
 } from '../backend/daemon.ts';
 import { TmuxTransport } from '../backend/tmuxTransport.ts';
 
@@ -73,9 +74,9 @@ async function warnExisting(
 
 /**
  * 从 argv 中摘出 --port(及其值)与位置参数(目录)。
- * --port 决定要连接/拉起哪个 daemon 实例 —— 默认值下不同 workspace 都
- * 落在同一个生产 daemon(Project List 能跨 workspace 聚合正是靠这个);
- * 测试环境传入其他端口则完全隔离,见 daemon.ts 的状态目录分区。
+ * --port 只在需要新起 daemon 时决定监听端口 —— 已有健康实例总是直接复用
+ * (一个数据目录至多一个 daemon,不按端口区分)。测试要隔离改用独立的
+ * SYNAPSE_DATA_DIR,不靠换端口,见 daemon.ts 的 SYNAPSE_DIR。
  */
 function parseArgv(argv: string[]): { dir: string | undefined; port: number } {
   const rest: string[] = [];
@@ -116,6 +117,9 @@ function withForkSession(claudeArgs: string[]): string[] {
 }
 
 export async function main(argv: string[]): Promise<void> {
+  // 旧版按端口分子目录 —— 升级后首次跑任何子命令时搬一次(见 daemon.ts)。
+  migrateLegacyStateDir();
+
   if (argv[0] === '-h' || argv[0] === '--help') {
     console.log(`
 用法: synapse [目录] [--port <端口>] [-- <claude 参数...>]
@@ -124,10 +128,9 @@ export async function main(argv: string[]): Promise<void> {
   在当前 tmux pane 里启动 claude,同时接入网页端监管。
   目录默认为当前目录;后端未运行时自动以守护进程拉起。
 
-  --port 指定要连接/拉起的后端端口(默认 ${DEFAULT_PORT},也可用 PORT 环境变量)。
-  不同 workspace 下不传 --port 会连到同一个后端 —— 这是 Project List 能跨
-  workspace 聚合会话的前提。测试环境想避免和日常使用的实例混在一起,
-  传一个不同的端口即可,两边状态完全隔离。
+  --port 指定新起后端时监听的端口(默认 ${DEFAULT_PORT},也可用 PORT 环境变量);
+  已有健康后端总是直接复用,不管它监听哪个端口。所有 daemon 文件落在
+  SYNAPSE_DATA_DIR(默认 ~/.synapse),测试想跟日常实例隔离就指定一个临时目录。
 
   -- 之后的参数原样透传给 claude CLI(如 --model、--mcp-config 等),
   synapse 自身不解析;--settings 与 --session-id 已由 synapse 管理,重复传入会被
@@ -218,6 +221,8 @@ export async function main(argv: string[]): Promise<void> {
  */
 async function daemonCmd(argv: string[]): Promise<void> {
   // parseArgv 把非 --port 的位置参数当「目录」摘出来,子命令名恰好落在同一个槽位。
+  // status / stop / restart 只认数据目录里记录的实例,--port 仅在需要新起进程时
+  // (start / restart)决定监听端口。
   const { dir: sub, port } = parseArgv(argv);
 
   // start —— 只拉起 daemon + 打印网页链接,不附带会话、不要求在 tmux 内。
@@ -230,8 +235,8 @@ async function daemonCmd(argv: string[]): Promise<void> {
   }
 
   if (sub === 'status') {
-    const state = readState(port);
-    if (!state) { console.log(`${c.dim('○')} 端口 ${port}: 未运行`); return; }
+    const state = readState();
+    if (!state) { console.log(`${c.dim('○')} 未运行`); return; }
     const healthy = await checkHealth(state);
     const mark = healthy ? c.blue('●') : c.red('✗');
     const label = healthy ? '运行中' : '陈旧(PID 或 HTTP 探活未过)';
@@ -241,17 +246,20 @@ async function daemonCmd(argv: string[]): Promise<void> {
   }
 
   if (sub === 'stop') {
-    const result = await stopDaemon(port).catch((err) => die(String(err?.message ?? err)));
+    const result = await stopDaemon().catch((err) => die(String(err?.message ?? err)));
     console.log(result === 'stopped' ? `${c.blue('●')} 已停止` : `${c.dim('○')} 本就没在跑`);
     return;
   }
 
   if (sub === 'restart') {
-    const before = await stopDaemon(port).catch((err) => die(String(err?.message ?? err)));
+    // 在停之前读一次:重启要落回同一个端口,而不是命令行没给 --port 时的默认值。
+    const prev = readState();
+    const relaunchPort = prev?.port ?? port;
+    const before = await stopDaemon().catch((err) => die(String(err?.message ?? err)));
     if (before === 'stopped') console.log(`${c.dim('…')} 已停止旧进程,正在拉起新的`);
-    const state = await ensureDaemon(port).catch((err) => die(String(err?.message ?? err)));
+    const state = await ensureDaemon(relaunchPort).catch((err) => die(String(err?.message ?? err)));
     // token 通常跟前一次相同(daemon.ts readOrCreateToken 复用磁盘残留),
-    // 但仍打印链接兜底 —— 全新状态目录、或磁盘 token 文件被手动清过时会拿到新值。
+    // 但仍打印链接兜底 —— 全新数据目录、或磁盘 token 文件被手动清过时会拿到新值。
     console.log(`${c.blue('●')} 端口 ${state.port} 已就绪 (PID ${state.pid})`);
     console.log(`${c.dim('网页链接:')}\n${urlFor(state)}`);
     return;

@@ -10,24 +10,25 @@
  * 写盘走 debounce:#absorb 里几乎每条 transcript 行都会触发一次状态变化,
  * 逐条同步写盘在长对话里是明显的 I/O 负担。
  *
- * 落盘路径按端口分目录(见 daemon.ts 的 stateDir)——会话数据跟着 daemon 实例走,
- * 不同端口是不同的 daemon 实例,不该共享同一份 sessions.json。
+ * 落盘 <数据目录>/sessions.json(见 daemon.ts 的 SYNAPSE_DIR)—— 一个数据目录
+ * 对应至多一个 daemon 实例,sessions.json 只有一份。测试要隔离用独立的
+ * SYNAPSE_DATA_DIR。
  */
 import { mkdirSync, writeFileSync, readFileSync, existsSync, renameSync } from 'node:fs';
 import { join } from 'node:path';
-import { stateDir } from './daemon.ts';
+import { SYNAPSE_DIR } from './daemon.ts';
 import type { PersistedSession } from './sessionManager.ts';
 
 const DEBOUNCE_MS = 500;
+const STORE_PATH = join(SYNAPSE_DIR, 'sessions.json');
 
-export function loadSessions(port: number): PersistedSession[] {
-  const storePath = join(stateDir(port), 'sessions.json');
-  if (!existsSync(storePath)) return [];
+export function loadSessions(): PersistedSession[] {
+  if (!existsSync(STORE_PATH)) return [];
   try {
-    const data = JSON.parse(readFileSync(storePath, 'utf8'));
+    const data = JSON.parse(readFileSync(STORE_PATH, 'utf8'));
     return Array.isArray(data) ? data : [];
   } catch {
-    console.warn(`[store] ${storePath} 解析失败,当作没有历史记录`);
+    console.warn(`[store] ${STORE_PATH} 解析失败,当作没有历史记录`);
     return [];
   }
 }
@@ -35,10 +36,9 @@ export function loadSessions(port: number): PersistedSession[] {
 export class SessionStore {
   #timer: NodeJS.Timeout | null = null;
   #getAll: () => PersistedSession[];
-  #storePath: string;
+  #storePath = STORE_PATH;
 
-  constructor(port: number, getAll: () => PersistedSession[]) {
-    this.#storePath = join(stateDir(port), 'sessions.json');
+  constructor(getAll: () => PersistedSession[]) {
     this.#getAll = getAll;
   }
 

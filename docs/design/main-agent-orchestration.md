@@ -20,7 +20,7 @@ Phase 1 的 Step 7a(见 `../phase1-implementation-plan.md`)让子 agent 由**用
 
 本项目的架构已经是「CLI(`synapse`)+ HTTP daemon」两层,主 agent 调度子 agent 的本质是「发命令 + 等结果」,HTTP 请求 + 长轮询就够 —— 不需要 MCP 的双向流、常驻进程和第三种协议表面。
 
-给 `synapse` 加一组 `agent` 子命令(命名见 spec §0.1),复用 `bin/synapse` 这个无扩展名 JS 薄壳、实现在 `bin/synapse.ts` 的 `agent` 分支(spec §2.2 —— 类型剥离只认 `.ts`)。这组子命令是 daemon HTTP 端点的瘦客户端,从 `~/.synapse/<请求端口>/`(`port` / `token`)拿地址与凭据,不自己持有任何状态。
+给 `synapse` 加一组 `agent` 子命令(命名见 spec §0.1),复用 `bin/synapse` 这个无扩展名 JS 薄壳、实现在 `bin/synapse.ts` 的 `agent` 分支(spec §2.2 —— 类型剥离只认 `.ts`)。这组子命令是 daemon HTTP 端点的瘦客户端,从数据目录(默认 `~/.synapse/`,`SYNAPSE_DATA_DIR` 覆盖)的 `port` / `token` 文件拿地址与凭据,不自己持有任何状态。
 
 主 agent 启动时 `manager.create()` 注入两个环境变量:`SYNAPSE_TASK_ID`(本任务 id)、`SYNAPSE_AGENT_BINDING`(主 agent 自己的 binding id)。`synapse agent` 的每个子命令据此定位任务,主 agent 不必手动传 id。
 
@@ -99,7 +99,7 @@ repo 不存在时 `backend/taskDocs.ts` 首次写入前 `git init` + 放一份 `
 每步可独立验证,不重写现有会话页:
 
 1. ~~**`wrapper` → `synapse` 重命名 sweep**(spec §0.1)~~ —— ✅ 已完成。`bin/wrapper*` → `bin/synapse*`、`package.json` 的 `bin` 键、`backend/` 与 `public/` 注释、living docs(spec / handoff / notes)里的 `wrapper` 字样已一次性改,`npm run typecheck` 通过。子命令分发挂在 `bin/synapse` → `bin/synapse.ts` 的 `main()` 上。
-2. **`synapse agent context` 骨架** —— `bin/synapse.ts` 的子命令分发加 `agent` 分支,先只做 `context`:读 `~/.synapse/<port>/`(port/token)+ `SYNAPSE_TASK_ID` 环境变量 → `GET /api/tasks/:id` → 打印 work dir / 目标 / 验收 / 子 agent 列表。
+2. **`synapse agent context` 骨架** —— `bin/synapse.ts` 的子命令分发加 `agent` 分支,先只做 `context`:读数据目录的 `port`/`token` 文件 + `SYNAPSE_TASK_ID` 环境变量 → `GET /api/tasks/:id` → 打印 work dir / 目标 / 验收 / 子 agent 列表。
 3. **主 agent 启动路径** —— `POST /api/tasks/:id/agents/start` 的 `role:'main'` 分支:`manager.create()` 注入 `SYNAPSE_TASK_ID` / `SYNAPSE_AGENT_BINDING`(`CreateOptions` 加 `env?: Record<string,string>`,透传进 transport 的 spawn),`appendSystemPrompt` 拼调度者职责 + `synapse agent` 用法 + 「先 handoff 再 spawn」。tmux 主 agent 仍走终端 `synapse` 起后绑定(spec §5.2 的 400 不变),env 由 CLI 注入。
 4. **Bash allow 规则** —— `daemon.ts` 的 `writeHookSettings()` 写的那份 settings 加 `permissions.allow: ["Bash(synapse agent:*)"]`(`--settings` 叠加,spec §3.1)。
 5. **`synapse agent spawn` + `wait`** —— `spawn` 调现有 sub 分支,`--handoff <file>` 内容进子 agent 首轮 prompt(替换 `subAgentPrompt()` 的硬编码模板)。`wait <bindingId>` 长轮询 `GET /api/tasks/:id`,盯 `turn_completed` / `agent_exited`。`AgentBinding` 加 `parentBindingId`,任务流加 `subagent_dispatched` / `subagent_returned`。

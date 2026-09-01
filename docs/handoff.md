@@ -90,11 +90,11 @@ tmux 会话的「终端输出」页签可用 `TmuxTransport.capture()` 做镜像
 
 **钩子超时是 fail-open。** 默认约 600 秒,超时后工具照常执行。后端必须自管截止时间:settings 配 `HOOK_TIMEOUT_S=300`,内部 `DECISION_TIMEOUT_MS=280_000` 到点主动 deny。绝不能依赖钩子超时。
 
-**钩子 URL 必须用实际监听端口。** 端口占用时后端递增重试,若 hook 配置里写死初始端口,钩子会打到无人监听处而失败 —— 等同于 fail-open,所有工具无审批执行。故 `writeHookSettings(请求端口, 实际端口)` 两个端口分开传,URL 用实际端口。
+**钩子 URL 必须用实际监听端口。** 端口占用时后端递增重试,若 hook 配置里写死初始端口,钩子会打到无人监听处而失败 —— 等同于 fail-open,所有工具无审批执行。故 `writeHookSettings(实际端口)` 收实际监听端口进 URL(文件路径固定在数据目录下)。
 
 **pending 表必须以 `tool_use_id` 为键。** 同一会话可能多个工具并发等待,仅按 `session_id` 索引会串。
 
-**hook 配置写 daemon 级文件,不碰用户仓库。** `daemon.ts` 的 `writeHookSettings()` 写一份 `~/.synapse/<端口>/hooks.settings.json`(`0600`),内容只有 `hooks`;所有会话 `--settings` 指向它,由 Claude Code 与用户自己的 `.claude/settings*.json` 按事件名 + matcher 求并集(`--settings` 是叠加不是覆盖,实测 + 官方文档确认)。**不要**再往工作区的 `.claude/settings.local.json` 里写东西 —— 那样裸 `claude` 也会读到 hook、两个会话共用一份、退出后残留打死后端。见 spec §3.1。
+**hook 配置写 daemon 级文件,不碰用户仓库。** `daemon.ts` 的 `writeHookSettings()` 写一份 `<数据目录>/hooks.settings.json`(`0600`),内容只有 `hooks`;所有会话 `--settings` 指向它,由 Claude Code 与用户自己的 `.claude/settings*.json` 按事件名 + matcher 求并集(`--settings` 是叠加不是覆盖,实测 + 官方文档确认)。**不要**再往工作区的 `.claude/settings.local.json` 里写东西 —— 那样裸 `claude` 也会读到 hook、两个会话共用一份、退出后残留打死后端。见 spec §3.1。
 
 **信任对话框无法用钩子处理** —— 信任发生在钩子加载之前。已用 `TmuxTransport.ensureTrusted()` 预置解决。这是代用户作安全决定,CLI 在首次信任某目录时明确告知(该方法返回 true 表示本次新写入)。
 

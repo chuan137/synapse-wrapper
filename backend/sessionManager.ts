@@ -427,17 +427,14 @@ export class SessionManager {
   #store: SessionStore;
 
   /**
-   * requestedPort 是持久化目录的 key(见 daemon.ts stateDir),必须用「请求
-   * 端口」而非「实际监听端口」,否则默认端口偶尔因占用而偏移时,上次启动写的
-   * sessions.json 会因为目录名对不上而读不到。
-   *
    * hookSettingsPath 指向 daemon 级 hook 配置文件,所有会话经 --settings 共用 ——
    * 文件内容(含实际监听端口)由 daemon.ts 在监听成功后写,这里只需要路径。
+   * sessions.json 落在数据目录下(见 store.ts),不再按端口分。
    */
-  constructor(requestedPort: number, hookSettingsPath: string) {
+  constructor(hookSettingsPath: string) {
     this.#hookSettingsPath = hookSettingsPath;
-    this.#store = new SessionStore(requestedPort, () => this.#persistedAll());
-    this.#loadPersisted(requestedPort);
+    this.#store = new SessionStore(() => this.#persistedAll());
+    this.#loadPersisted();
     // 构造函数不能是 async,先同步把全部历史记录标 exited 让 SessionManager
     // 立刻可用,tmux 接管会话的重新探活异步补上(见 #reclaimTmuxSessions)。
     // 空窗期内这些会话在网页上短暂显示"已退出" —— 存活巡检对 exited 会话
@@ -501,8 +498,8 @@ export class SessionManager {
   }
 
   /** 启动时把历史记录接回内存,标 exited(进程已经不在,只是记录还在)。 */
-  #loadPersisted(requestedPort: number): void {
-    for (const p of loadSessions(requestedPort)) {
+  #loadPersisted(): void {
+    for (const p of loadSessions()) {
       if (this.#sessions.has(p.localId)) continue;  // 理论上不会撞,防御一下
       const session: Session = {
         localId: p.localId,

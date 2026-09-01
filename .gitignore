@@ -2,6 +2,9 @@ node_modules/
 .claude/settings.local.json
 *.log
 
+# npm run dev 的隔离数据目录(见 package.json)
+.dev-data/
+
 # 全局 gitignore 把 bin/ 当编译产物排除,但这里是源码(CLI 入口)。
 # 忽略目录时 Git 不会进入目录内部,子路径的 ! 单独写没用,须先取消目录本身。
 !bin/
