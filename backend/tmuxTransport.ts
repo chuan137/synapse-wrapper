@@ -27,6 +27,38 @@ function normalizeNewlines(text: string): string {
 }
 
 /**
+ * 抓屏结果里是否已有可注入的输入框。逐行判断而非整串 trimEnd ——
+ * claude 流式输出时底部会挂忙碌指示行(spinner / `esc to interrupt` /
+ * `↓ N tokens`),整串尾部就不是提示符行了,但输入框本身仍是干净的
+ * `❯ ` 且 tmux paste 在忙碌时照样进输入队列,所以这些不该判为「未就绪」。
+ *
+ * 就绪 = 存在一行「提示符(`❯` 或 `>` 变体)后除占位符文案外为空」。
+ * 提示符可能带前导装饰(边框 `│`、空格),提示符后允许:
+ *   - 完全为空
+ *   - 仅剩关闭引号的占位符 `Try "…"` / `Ask …`(claude 的输入提示)
+ * 有实际残留文本(`❯ show me app.js`)时不匹配 —— 但该场景现在由
+ * `#inject` 先发 `C-u` 兜底,这里不强求。
+ */
+export function screenLooksReady(screen: string): boolean {
+  for (const raw of screen.split('\n')) {
+    // 提示符可能带前导边框/空格装饰;取提示符之后的内容判断
+    const m = raw.match(/[❯>]([^\n]*)$/);
+    if (!m) continue;
+    // 去掉尾部的边框字符(claude 的输入框有 `│ ❯ … │` 这种收边)
+    const rest = m[1]!.replace(/[│┃|]\s*$/, '').trim();
+    if (rest === '' || /^(Try ".*"?|Ask [^\n]*|Type [^\n]*|\/ for commands[^\n]*)$/i.test(rest)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/** 抓屏内容是否是工作区信任对话框(就绪判断之前要先识别,否则提示词会粘进对话框丢失)。 */
+export function screenIsTrustDialog(screen: string): boolean {
+  return /trust this folder|trust the files|Security guide/i.test(screen);
+}
+
+/**
  * 指定 pane 是否还在 tmux 里。独立于任何 TmuxTransport 实例 —— 后端重启后
  * 重新加载持久化会话时,要先判断值不值得重建 TmuxTransport,此时实例还不存在。
  */
@@ -145,6 +177,12 @@ export class TmuxTransport extends EventEmitterBase implements SessionTransport 
   #title: string | null = null;
   #stopped = false;
   /**
+   * 就绪探测单飞。turn_end 分支与 #inject 可能几乎同时想等就绪,两个轮询
+   * 循环各自 capture-pane 会放大 tmux 高负载下的瞬时抓屏失败率。已有一个
+   * 在跑就复用它的结果。
+   */
+  #readyWaiter: Promise<boolean> | null = null;
+  /**
    * send() 注入的文本迟早会作为普通 user 行出现在转写文件里 —— 在 tmux
    * 层面它和用户手动敲键盘完全等价,没有字段能区分来源。不去重的话,
    * 网页发的每条消息都会被 #handleLine 当作"终端直接输入"再入一次账,
@@ -210,7 +248,9 @@ export class TmuxTransport extends EventEmitterBase implements SessionTransport 
 
     // 接管模式:claude 由 CLI 在用户自己的 pane 里启动,这里只等它就绪并开始观察
     if (this.#opts.paneId) {
-      await this.#waitReady();
+      if (!(await this.#waitReady())) {
+        this.emit({ kind: 'error', message: `TUI 启动超时 —— 可能需手动处理(登录或信任提示)` });
+      }
       this.#discoverTranscript();
       this.emit({ kind: 'status', state: 'ready' });
       return;
@@ -237,13 +277,31 @@ export class TmuxTransport extends EventEmitterBase implements SessionTransport 
       await this.#describe();
     }
 
-    await this.#waitReady();
+    if (!(await this.#waitReady())) {
+      this.emit({ kind: 'error', message: `TUI 启动超时 —— 可能需手动处理(登录或信任提示)` });
+    }
     this.#discoverTranscript();
     this.emit({ kind: 'status', state: 'ready' });
   }
 
-  /** 等 TUI 可输入。启动路径上可能先出现欢迎屏或信任对话框,都发 Enter 推进。 */
-  async #waitReady(timeoutMs = 45_000): Promise<void> {
+  /**
+   * 等 TUI 可输入。启动路径上可能先出现欢迎屏或信任对话框,都发 Enter 推进。
+   *
+   * 返回 `true` = 探到就绪;`false` = 超时。超时**不代表**注入会失败(实测输入框
+   * 残留会误触发超时、而注入其实照常成功),故这里不 emit error —— 报错语义
+   * 交给调用点按自己的场景决定(`start()` 报「TUI 启动超时」,`#inject` 降级放行)。
+   * 详见 docs/notes/implementation-lessons.md。
+   */
+  #waitReady(timeoutMs = 45_000): Promise<boolean> {
+    if (this.#readyWaiter) return this.#readyWaiter;
+    const p = this.#waitReadyLoop(timeoutMs).finally(() => {
+      if (this.#readyWaiter === p) this.#readyWaiter = null;
+    });
+    this.#readyWaiter = p;
+    return p;
+  }
+
+  async #waitReadyLoop(timeoutMs: number): Promise<boolean> {
     const deadline = Date.now() + timeoutMs;
     let nudged = 0;
     let last: Awaited<ReturnType<typeof this.capture>> = { ok: true, screen: '' };
@@ -257,7 +315,7 @@ export class TmuxTransport extends EventEmitterBase implements SessionTransport 
       // 否则提示词会被粘进对话框而丢失。默认高亮是「No, exit」,直接 Enter
       // 会让 claude 退出、自建会话随之消失 —— 先 Down 移到「Yes, I trust」再确认。
       // 正常路径 ensureTrusted 已预置信任、根本不会走到这里,这是兜底。
-      if (/trust this folder|trust the files|Security guide/i.test(screen)) {
+      if (screenIsTrustDialog(screen)) {
         await exec('tmux', ['send-keys', '-t', this.#target, 'Down']).catch(() => {});
         await sleep(200);
         await exec('tmux', ['send-keys', '-t', this.#target, 'Enter']).catch(() => {});
@@ -265,7 +323,7 @@ export class TmuxTransport extends EventEmitterBase implements SessionTransport 
         continue;
       }
 
-      if (/❯\s*(Try "|$)/m.test(screen) || /❯\s*$/m.test(screen.trimEnd())) return;
+      if (screenLooksReady(screen)) return true;
 
       if (nudged < 3 && /Welcome back|Tips for getting started/i.test(screen)) {
         await exec('tmux', ['send-keys', '-t', this.#target, 'Enter']).catch(() => {});
@@ -281,7 +339,7 @@ export class TmuxTransport extends EventEmitterBase implements SessionTransport 
       ? `末次屏幕内容:${JSON.stringify(last.screen.slice(0, 500))}`
       : `末次抓屏失败:${last.error}`;
     console.error(`[tmux] #waitReady 超时(target=${this.#target})。${evidence}`);
-    this.emit({ kind: 'error', message: `TUI 启动超时 —— 可能需手动处理(登录或信任提示)` });
+    return false;
   }
 
   /** 状态栏标明身份与退出方式,否则 attach 进来看不出这是什么会话。 */
@@ -459,9 +517,20 @@ export class TmuxTransport extends EventEmitterBase implements SessionTransport 
       exec('tmux', ['send-keys', '-t', this.#target, k]);
 
     try {
-      await this.#waitReady(20_000);
-      await keys('C-u').catch(() => {});  // 清掉上次失败注入的残留
+      // 先清残留再判就绪:输入框残留上次未提交文本(`❯ show me app.js`)时
+      // 就绪正则不匹配,会白等满超时。C-u 提到 #waitReady 之前,这个失败模式消失。
+      await keys('C-u').catch(() => {});
       await sleep(150);
+
+      // 超时不再是失败:探不到就绪但 pane 还在,就照常注入(tmux paste 会进
+      // 输入队列)—— 实测残留误触发的超时后注入其实成功。见 implementation-lessons.md。
+      if (!(await this.#waitReady(45_000))) {
+        if (!(await this.alive())) {
+          this.emit({ kind: 'error', message: `注入失败:承载 pane 已消失` });
+          return;
+        }
+        console.error(`[tmux] #inject 就绪探测超时,pane 仍在,照常注入(target=${this.#target})`);
+      }
 
       await writeFile(tmp, text, { mode: 0o600 });  // 提示词可能含敏感内容
       await exec('tmux', ['load-buffer', '-b', bufName, tmp]);

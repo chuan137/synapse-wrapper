@@ -132,6 +132,23 @@ CLI 把中断写成一条 `type: "user"` 消息,`content` 是纯文本块(`[Requ
 
 修复:比对前对两侧都过一遍 `normalizeNewlines()`(`\r\n?` 统一换成 `\n`)。`#inject()` 实际写入 tmux 的仍是原始 `text` —— 归一化只用于回显比对这一步。
 
+## 就绪判定必须先清残留,超时不能当失败
+
+锚点:`tmuxTransport.ts` `#inject` / `#waitReady` / `screenLooksReady`。
+
+第一版 `#inject` 的顺序是:先 `await #waitReady(20_000)` 判就绪,再发 `C-u` 清残留。就绪判定用整串正则 `/❯\s*(Try "|$)/m || /❯\s*$/m.test(screen.trimEnd())`。两个问题叠加:
+
+1. **顺序反了。** 输入框残留上一次未提交文本(`❯ show me app.js`)时,两个分支都不匹配,`#waitReady` 空转满 20s 超时 —— 而清残留的 `C-u` 恰恰排在这之后。实测:即使 claude 正在流式输出(底部挂 `✶ …(22s · ↓ 603 tokens)`),输入框本身仍是干净的 `❯ ` 行、正则照常匹配,所以「TUI 忙」不是误判来源,「输入框有残留」才是。
+2. **超时被当成失败。** `#waitReady` 超时直接 `emit({kind:'error', message:'TUI 启动超时 …'})` 然后正常返回,`#inject` 继续注入 —— 而这步**通常真的成功**(tmux paste 在忙碌时也进输入队列)。于是网页显示「发送失败」、重试即成功,首条消息其实也送达了。`sessionManager.ts` 的 error 分支还会先 `pendingTurns--`,之后真正的 `turn_end` 再减一次,状态机瞬时错乱。
+
+修正:
+
+- `#inject` 把 `C-u` + `sleep(150)` 提到 `#waitReady` **之前**,残留不再能拖垮就绪判定。
+- `#waitReady` 改签名 `Promise<boolean>`(true=探到就绪,false=超时),**内部不再 emit error**。报错语义交调用点:`start()` 的两处收到 false 显式报「TUI 启动超时」;`#inject` 收到 false 时 `alive()` 为真就照常注入(只 `console.error` 一条 debug),为假才报「注入失败:承载 pane 已消失」;`turn_end` 分支忽略返回值。
+- 就绪正则换成逐行的 `screenLooksReady()`(纯函数,`tmuxTransport.test.ts` 覆盖):存在「提示符行 + 除占位符文案外为空」即算就绪,忙碌指示存在时仍算可注入。
+- `#inject` 的超时预算 `20_000` → `45_000`(与默认一致);配合上面超时不再是失败,加长无副作用。
+- `#waitReady` 加 `#readyWaiter` 单飞:`turn_end` 与 `#inject` 几乎同时等就绪时复用同一个轮询循环,不再各自 `capture-pane` 放大 tmux 高负载下的瞬时抓屏失败。
+
 ## 网页启动 tmux 自建会话:work dir 必须 realpathSync,否则撞信任对话框
 
 锚点:`server.ts` `POST /api/tasks/:id/agents/start` 的 `role:'main'` 分支,`tmuxTransport.ts` `#waitReady` 的信任框分支。

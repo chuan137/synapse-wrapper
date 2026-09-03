@@ -82,9 +82,9 @@ tmux 会话的「终端输出」页签可用 `TmuxTransport.capture()` 做镜像
 
 会话标识已完成:显示名优先用 claude 的 ai-title(说明会话在做什么),标题生成前退回 pane ID。见 `docs/notes/claude-code-behavior.md`「ai-title」。
 
-### 注入残留
+### 注入残留(已解决)
 
-实测见到过输入框残留上一次未提交的文本(`❯ show me app.js`)。`#inject` 开头有 `C-u` 清理,但时机可能不够稳。会话忙碌时注入的行为需要再验。
+曾偶发:网页发消息报「TUI 启动超时」、重试即成功。根因是 `#inject` 先判就绪再发 `C-u` 清残留(顺序反了),输入框残留 `❯ show me app.js` 让就绪正则不匹配、空转到超时,而超时被当成错误上报 —— 注入其实照常成功。已改为「先 `C-u` 清残留再判就绪 + 就绪正则逐行健壮化 + 超时降级为照常注入不报错」。详见 `docs/notes/implementation-lessons.md`「就绪判定必须先清残留,超时不能当失败」,实现锚在 `tmuxTransport.ts` `#inject` / `#waitReady` / `screenLooksReady`。
 
 ## 关键约束(改代码前必读)
 
