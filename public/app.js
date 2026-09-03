@@ -1305,28 +1305,41 @@ function renderTaskDetail() {
   const errBar = state.taskError
     ? `<div class="td-err">${esc(state.taskError)}<button id="tdErrX" title="关闭">✕</button></div>` : '';
 
-  const brief = `<div class="td-brief">
-    <dl>
-      <div><dt>目标</dt><dd>${task.goal ? esc(task.goal) : '<span class="muted">未填写</span>'}</dd></div>
-      <div><dt>验收</dt><dd>${task.acceptance ? esc(task.acceptance) : '<span class="muted">未填写</span>'}</dd></div>
-    </dl>
+  // 目标 / 验收降为头部副标题 —— 它们是任务的定义,不是要用户反复读的一块内容。
+  const sub = (label, val) => val
+    ? `<span class="td-sub-item"><b>${label}</b>${esc(val)}</span>`
+    : `<span class="td-sub-item muted"><b>${label}</b>未填写</span>`;
+  const subhead = `<div class="td-subhead">${sub('目标', task.goal)}${sub('验收', task.acceptance)}</div>`;
+
+  const mainAgent = agents.find((a) => a.binding.role === 'main' && a.binding.endedAt === null);
+  const subAgents = agents.filter((a) => !(a.binding.role === 'main' && a.binding.endedAt === null));
+
+  // 启动子 agent / 主 agent 的默认工作区:优先 project 的第一个 root。
+  const defaultWs = project?.workspaceRoots?.[0] ?? '';
+
+  // 主操作区:没有主 agent 时,这是「开始任务」的入口 —— 起一个主 agent
+  // 去拆解、调度。有了主 agent 后收起,它的卡片在 Agents 区里。
+  const startBlock = mainAgent ? '' : `<div class="td-start">
+    <div class="td-start-copy">
+      <strong>开始任务</strong>
+      <p>启动一个主 agent —— 它确定 work dir、把任务拆成子任务、分派子 agent、跟踪进度。自己不改代码。</p>
+    </div>
+    <button class="btn pri lg" id="startMain">▶ 启动主 agent</button>
   </div>`;
 
-  const agentCards = agents.length ? agents.map((a) => agentCard(a)).join('') :
-    `<div class="muted" style="padding:4px 0">还没有 agent。「启动子 agent」在后台起一个,或「绑定已有会话」把手头的会话挂进来。</div>`;
+  const agentCards = subAgents.length || mainAgent
+    ? [...(mainAgent ? [mainAgent] : []), ...subAgents].map((a) => agentCard(a)).join('')
+    : `<div class="muted" style="padding:4px 0">还没有子 agent。「启动子 agent」在后台起一个,或「绑定已有会话」把手头的会话挂进来。</div>`;
 
   const bindOpts = [...state.sessions.values()]
     .filter((s) => s.state !== 'exited')
     .map((s) => `<option value="${s.localId}">${esc(s.name)}${s.title ? ' · ' + esc(s.title) : ''} (${s.transport})</option>`)
     .join('');
 
-  // 启动子 agent 的默认工作区:优先 project 的第一个 root。
-  const defaultWs = project?.workspaceRoots?.[0] ?? '';
-
   const agentsBlock = `<div class="td-agents">
     <div class="td-sect-head"><h3>Agents</h3>
       <div class="bind-row">
-        <button class="btn pri" id="startSub">启动子 agent</button>
+        <button class="btn" id="startSub">启动子 agent</button>
         <select id="bindSel"><option value="">绑定已有会话…</option>${bindOpts}</select>
         <select id="bindRole"><option value="sub">子 agent</option><option value="main">主 agent</option></select>
         <button class="btn" id="bindBtn">绑定</button>
@@ -1355,8 +1368,9 @@ function renderTaskDetail() {
           <button class="btn" id="editTask">编辑</button>
         </div>
       </div>
+      ${subhead}
     </div>
-    <div class="td-body">${brief}${agentsBlock}${timeline}</div>`;
+    <div class="td-body">${startBlock}${agentsBlock}${timeline}</div>`;
 
   const errX = $('tdErrX');
   if (errX) errX.onclick = () => { state.taskError = ''; renderTaskDetail(); };
@@ -1371,6 +1385,8 @@ function renderTaskDetail() {
   };
   $('editTask').onclick = () => openEditTaskModal(task);
   $('startSub').onclick = () => openStartAgentModal(task, project, defaultWs);
+  const startMainBtn = $('startMain');
+  if (startMainBtn) startMainBtn.onclick = () => openStartMainAgentModal(task, project, defaultWs);
   $('bindBtn').onclick = async () => {
     const localId = $('bindSel').value;
     const role = $('bindRole').value;
@@ -1382,6 +1398,18 @@ function renderTaskDetail() {
   };
   for (const el of $('colDetail').querySelectorAll('[data-open-session]')) {
     el.onclick = () => { switchMode('sessions'); navigate(el.dataset.openSession); };
+  }
+  for (const el of $('colDetail').querySelectorAll('[data-attach-tmux]')) {
+    el.onclick = async () => {
+      const cmd = `tmux attach -t ${el.dataset.attachTmux}`;
+      try {
+        await navigator.clipboard.writeText(cmd);
+        el.textContent = '已复制';
+        setTimeout(() => { el.textContent = 'attach'; }, 1500);
+      } catch {
+        prompt('在终端运行:', cmd);
+      }
+    };
   }
   for (const el of $('colDetail').querySelectorAll('[data-detach]')) {
     el.onclick = async () => {
@@ -1399,6 +1427,12 @@ function renderTaskDetail() {
         await api(`/api/sessions/${el.dataset.stopSession}/stop`, { method: 'POST' });
         afterMutation();
       } catch (err) { showTaskError(err.message); }
+    };
+  }
+  // <a role="button"> 的次要操作:Enter / Space 也触发,补齐键盘可达性。
+  for (const el of $('colDetail').querySelectorAll('.agent-acts a[role="button"]')) {
+    el.onkeydown = (e) => {
+      if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); el.click(); }
     };
   }
 }
@@ -1434,6 +1468,9 @@ function agentCard(a) {
   // 会话还在跑(未解绑、进程未退出)才给「停止」—— stream-json 子 agent 卡住或
   // 跑偏时用它收回进程,记录保留标 exited。
   const canStop = !ended && s && s.state !== 'exited';
+  // 网页自建的 tmux 主 agent 会话:给一个「attach」动作,把 tmux attach 命令
+  // 递到用户手边(网页仍不能替用户切终端焦点,和 TmuxTransport.focus() 同界)。
+  const ownTmux = !ended && s && s.tmuxName && s.tmuxName.startsWith('synapse-main-');
   return `<article class="agent ${b.role === 'main' ? 'primary-agent' : ''} ${stateCls === 'wait' ? 'waiting' : ''}">
     <div class="agent-top">
       <span class="transport ${transport}">${transport}</span>
@@ -1443,10 +1480,13 @@ function agentCard(a) {
     <p>${s && s.title ? esc(s.title) : (s ? esc(s.workspace) : '会话已不存在,可解绑')}</p>
     ${pend}
     <footer>
-      <span>${[ctx, cost].filter(Boolean).join(' · ') || b.transportKind}</span>
-      ${s ? `<button data-open-session="${s.localId}">打开会话</button>` : ''}
-      ${canStop ? `<button data-stop-session="${s.localId}">停止</button>` : ''}
-      ${!ended ? `<button data-detach="${b.id}">解绑</button>` : ''}
+      ${(ctx || cost) ? `<span class="agent-meta">${[ctx, cost].filter(Boolean).join(' · ')}</span>` : ''}
+      <div class="agent-acts">
+        ${s ? `<button class="pri" data-open-session="${s.localId}">打开会话</button>` : ''}
+        ${ownTmux ? `<a role="button" tabindex="0" data-attach-tmux="${esc(s.tmuxName)}">attach</a>` : ''}
+        ${canStop ? `<a role="button" tabindex="0" title="终止进程,记录保留" data-stop-session="${s.localId}">停止</a>` : ''}
+        ${!ended ? `<a role="button" tabindex="0" title="不关会话" data-detach="${b.id}">解绑</a>` : ''}
+      </div>
     </footer>
   </article>`;
 }
@@ -1572,6 +1612,63 @@ function openStartAgentModal(task, project, defaultWs) {
           workspace,
           prompt: promptInput.value.trim() || undefined,
           model: bg.querySelector('#saModel').value || undefined,
+        }),
+      });
+      close();
+      loadTaskDetail(task.id);
+      loadTasks(state.taskProjectId);
+    } catch (e) {
+      err.textContent = e.message; err.style.display = 'block'; ok.disabled = false;
+    }
+  };
+}
+
+/**
+ * 从任务启动主 agent 的对话框(spec §5.2)。主 agent 走 tmux 自建会话
+ * (synapse-main-<taskId>,长命、扛 daemon restart),网页直接起。
+ * 第 3 步:受限 permissions 预览留待第 4 步。
+ */
+function openStartMainAgentModal(task, project, defaultWs) {
+  const bg = document.createElement('div');
+  bg.className = 'modal-bg';
+  bg.innerHTML = `<div class="modal">
+    <h3>启动主 agent</h3>
+    <p>主 agent 是调度者 —— 拆解任务、分派子 agent、跟踪进度,自己不改代码。
+       用 tmux 自建会话运行(<code>synapse-main-${esc(task.id)}</code>),后端重启不打断。</p>
+    <label for="maWs">work dir</label>
+    <input id="maWs" value="${esc(defaultWs)}" spellcheck="false">
+    <label for="maModel">模型</label>
+    <select id="maModel">
+      <option value="">默认(跟随 CLI / settings.json)</option>
+      <option value="claude-opus-5">Opus 5</option>
+      <option value="claude-sonnet-5">Sonnet 5</option>
+      <option value="claude-haiku-4-5-20251001">Haiku 4.5</option>
+    </select>
+    <div class="err" id="maErr" style="display:none"></div>
+    <div class="modal-act">
+      <button class="btn" id="maCancel">取消</button>
+      <button class="btn pri" id="maOk">启动</button>
+    </div>
+  </div>`;
+  document.body.append(bg);
+  const close = () => bg.remove();
+  bg.querySelector('#maCancel').onclick = close;
+  bg.onclick = (e) => { if (e.target === bg) close(); };
+
+  bg.querySelector('#maOk').onclick = async () => {
+    const workspace = bg.querySelector('#maWs').value.trim();
+    const err = bg.querySelector('#maErr');
+    if (!workspace) { bg.querySelector('#maWs').focus(); return; }
+    const ok = bg.querySelector('#maOk');
+    ok.disabled = true;
+    try {
+      await api(`/api/tasks/${task.id}/agents/start`, {
+        method: 'POST',
+        body: JSON.stringify({
+          role: 'main',
+          transport: 'tmux',
+          workspace,
+          model: bg.querySelector('#maModel').value || undefined,
         }),
       });
       close();

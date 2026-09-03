@@ -11,3 +11,4 @@ node_modules/
 bin/*
 !bin/synapse.ts
 !bin/synapse
+!bin/agent.ts

@@ -607,22 +607,37 @@ textarea:focus { outline: 2px solid var(--blue); outline-offset: -1px; backgroun
   border-bottom: 1px solid var(--hair); padding: 14px 22px 12px; flex: none;
 }
 .crumb { color: var(--ink-3); font-size: 12px; margin-bottom: 7px; }
-.td-head-main { display: flex; align-items: flex-start; gap: 16px; }
-.td-head-main h2 { margin: 0; font-size: 19px; flex: 1; min-width: 0; }
+.td-head-main { display: flex; align-items: flex-start; gap: 12px 16px; flex-wrap: wrap; }
+.td-head-main h2 { margin: 0; font-size: 19px; flex: 1 1 240px; min-width: 0; }
 .td-head-act { display: flex; gap: 8px; flex: none; }
 .td-head-act select {
   border: 1px solid var(--hair); background: var(--surface); border-radius: 7px;
   padding: 5px 9px; font: 12.5px var(--sans); color: var(--ink); cursor: pointer;
 }
+/* 目标 / 验收:头部副标题一行,不占独立块 */
+.td-subhead {
+  margin-top: 9px; display: flex; flex-wrap: wrap; gap: 6px 18px;
+  font-size: 12.5px; color: var(--ink-2); line-height: 1.5;
+}
+.td-sub-item { min-width: 0; }
+.td-sub-item b {
+  font-weight: 700; color: var(--ink-3); margin-right: 6px;
+  font-size: 11px; text-transform: uppercase; letter-spacing: .03em;
+}
 .td-body { overflow-y: auto; padding: 16px 22px 30px; display: grid; gap: 14px; }
-.td-brief, .td-agents, .td-timeline {
+.td-agents, .td-timeline {
   background: var(--surface); border: 1px solid var(--hair); border-radius: 10px; padding: 14px;
 }
-.td-brief dl {
-  display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin: 0;
+/* 开始任务:没有主 agent 时的主操作区 */
+.td-start {
+  display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+  background: linear-gradient(180deg, var(--green-soft), var(--surface) 70%);
+  border: 1px solid rgba(52,168,83,.32); border-radius: 10px; padding: 16px 18px;
 }
-.td-brief dt { font-size: 12px; font-weight: 700; color: var(--ink-3); }
-.td-brief dd { margin: 4px 0 0; color: var(--ink-2); }
+.td-start-copy { flex: 1; min-width: 200px; }
+.td-start-copy strong { font-size: 14px; }
+.td-start-copy p { margin: 4px 0 0; font-size: 12.5px; color: var(--ink-2); }
+.btn.lg { font-size: 13.5px; padding: 9px 16px; flex: none; }
 .muted { color: var(--ink-3); }
 
 .td-sect-head { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 12px; }
@@ -652,13 +667,20 @@ textarea:focus { outline: 2px solid var(--blue); outline-offset: -1px; backgroun
 .agent-state.idle { background: var(--hair-soft); color: var(--ink-2); }
 .agent p { margin: 0; font-size: 12.5px; color: var(--ink-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .approval-line { font-size: 12px; color: var(--amber); background: var(--amber-soft); border-radius: 6px; padding: 7px 8px; }
-.agent footer { display: flex; align-items: center; gap: 8px; color: var(--ink-3); font: 11px var(--mono); }
-.agent footer button {
-  font: 12px var(--sans); border: 1px solid var(--hair); background: var(--surface);
-  border-radius: 6px; padding: 3px 8px; cursor: pointer;
+.agent footer { display: flex; flex-direction: column; align-items: flex-start; gap: 8px; }
+.agent-meta { color: var(--ink-3); font: 11px var(--mono); }
+/* 一行:主操作是按钮,attach/停止/解绑是弱化的文字链接 */
+.agent-acts { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.agent-acts a {
+  font: 12px var(--sans); color: var(--ink-3); cursor: pointer; white-space: nowrap;
 }
-.agent footer button:first-of-type { margin-left: auto; }
-.agent footer button:hover { background: #fafafb; }
+.agent-acts a:hover { color: var(--ink); text-decoration: underline; }
+.agent-acts a[data-detach]:hover { color: var(--red); }
+.agent-acts button.pri {
+  font: 12px var(--sans); border: 1px solid var(--blue); color: var(--blue);
+  background: var(--surface); border-radius: 6px; padding: 3px 10px; cursor: pointer; white-space: nowrap;
+}
+.agent-acts button.pri:hover { background: var(--blue-soft); }
 
 .td-timeline ol { list-style: none; padding: 0; margin: 12px 0 0; display: grid; gap: 12px; }
 .td-timeline li {
@@ -671,6 +693,7 @@ textarea:focus { outline: 2px solid var(--blue); outline-offset: -1px; backgroun
 
 @media (max-width: 900px) {
   .col-tasks { width: 260px; }
-  .td-brief dl { grid-template-columns: 1fr; }
   .bind-row { margin-left: 0; }
+  .td-start { flex-direction: column; align-items: stretch; }
+  .btn.lg { width: 100%; }
 }

@@ -45,6 +45,12 @@ export interface CreateOptions {
    * 由 synapse CLI 自己启动,不经这里的 transport。
    */
   appendSystemPrompt?: string;
+  /**
+   * 仅 tmux 自建会话:注入 claude 进程的额外环境变量(主 agent 的
+   * SYNAPSE_TASK_ID / SYNAPSE_AGENT_BINDING / SYNAPSE_DATA_DIR)。
+   * 接管模式不生效 —— 那条路径的 claude 由 synapse CLI 启动,继承 CLI 的环境。
+   */
+  env?: Record<string, string>;
 }
 
 /** 会话内累积的一次文件改动。 */
@@ -694,8 +700,9 @@ export class SessionManager {
             sessionName: opts.tmuxName,
             paneId: opts.paneId,
             sessionId: opts.sessionId,
-            // paneId 接管模式下 claude 由 CLI 启动,这个参数只对自建会话生效。
+            // paneId 接管模式下 claude 由 CLI 启动,这两个参数只对自建会话生效。
             extraArgs: sys,
+            env: opts.env,
           })
         : new StreamJsonTransport({
             cwd: workspace,

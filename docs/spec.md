@@ -21,7 +21,7 @@
 
 `bin/wrapper` → `bin/synapse`(无扩展名 JS 薄壳,§2.2 约束不变),`bin/wrapper.ts` → `bin/synapse.ts`,`package.json` 的 `bin` 键 `wrapper` → `synapse`。子命令分发在薄壳之后的实现里按 `argv[0]` 分:无参或路径 → 就地起 claude;`daemon` / `agent` → 各自的子模块。`agent` 子命令是 daemon HTTP 端点的瘦客户端(见 `docs/design/main-agent-orchestration.md`),不是单独的 binary。
 
-**代码重命名已执行** —— `bin/wrapper` → `bin/synapse`、`bin/wrapper.ts` → `bin/synapse.ts`、`package.json` 的 `bin` 键、`backend/` 与 `public/` 注释里的 `wrapper` 字样已一次性 sweep(`npm run typecheck` 通过)。`agent` 子命令分支尚未落地(见 `docs/design/main-agent-orchestration.md` 落地顺序第 2 步)。
+**代码重命名已执行** —— `bin/wrapper` → `bin/synapse`、`bin/wrapper.ts` → `bin/synapse.ts`、`package.json` 的 `bin` 键、`backend/` 与 `public/` 注释里的 `wrapper` 字样已一次性 sweep(`npm run typecheck` 通过)。`agent` 分支已落地 `context`(`bin/agent.ts`,daemon HTTP 瘦客户端);`spawn`/`poll`/`await`/`doc` 见 `docs/design/main-agent-orchestration.md` 落地顺序第 3 步起。
 
 ### 0.2 Artifacts 路径:`~/.synapse/artifacts/<cwd 转写>-<sessionId 前缀>/`
 
@@ -152,7 +152,7 @@ interface WorktreeSpec {
 async function createWorktree(spec: WorktreeSpec): Promise<{ path: string; cleanup: () => Promise<void> }>;
 ```
 
-主 agent(tmux,用户 pane)不套 worktree —— 用户在自己的 pane 里,换目录不合适(呼应 §3.1 结论:`synapse` 的 tmux 会话不套 policy)。
+主 agent 不套 worktree —— 它是调度者,只 `Read` 代码 + 跑只读 git,不直接改文件(改动全由它 spawn 的子 agent 在各自 worktree 里做)。给它套 worktree 只会让它看到的和子 agent 改的对不上。见 `docs/design/main-agent-orchestration.md`「约束主 agent 的行为」。
 
 ### 1.4 任务数据的存储位置
 
@@ -164,7 +164,7 @@ daemon 的所有文件(`sessions.json`、`token`、`daemon.pid`/`port`、`hooks.
 
 设计移出本文件 —— 见 `docs/design/main-agent-orchestration.md`(主 agent 四项职责、`synapse agent` 子命令、`synapse-tasks` 共享文档库、文档端点、9 步落地顺序)。Phase 1 之后的方向,尚未实现。
 
-一句话:调度用 `synapse agent {context,spawn,wait,doc}` 子命令(daemon HTTP 的瘦客户端),不引入 MCP;主 agent 沉淀的 handoff / progress / changelog 落一个独立 git repo。
+一句话:调度用 `synapse agent {context,spawn,poll,await,doc}` 子命令(daemon HTTP 的瘦客户端,每次调用是一次短请求、不 hang 长连接,轮询逻辑在 CLI 侧),不引入 MCP;主 agent 沉淀的 handoff / progress / changelog 落一个独立 git repo。**主 agent 由网页直接启动**,走 `TmuxTransport` 自建会话(`synapse-main-<taskId>`,长命、扛 `daemon restart`);行为靠 Claude Code settings 层 `permissions` 约束(Bash 白名单、无 Write/Edit、`deny` Task),不靠 system prompt。交接文件的写法不进 Synapse 代码 —— harness 只钉死路径 / 通道 / 标记区,推荐结构放 `synapse-tasks` repo 里的 `synapse-handoff` skill,项目 CLAUDE.md 可覆盖。
 
 ---
 
@@ -371,7 +371,7 @@ onEvent(fn)  订阅事件流
 
 左上角切换两个模式,偏好存 localStorage:
 
-- **任务**(默认)— 项目 / 任务 / 任务详情三栏。左栏(复用 aside)列项目,带任务数、运行中 agent 数、待批准数;中栏列任务,带状态点、agent 数、待批准数;右栏是任务详情:目标 / 验收、agent 卡片(transport / state / context / cost / pending,主 agent 绿底)、任务流事件(newest-first)。项目按 name `localeCompare`、任务按 `createdAt` 固定排序,不随状态跳动(理由见 `notes/implementation-lessons.md`「左栏排序固定」)。交互:创建 / 编辑任务、绑定已有会话为主/子 agent、解绑(不关会话)、点 agent 卡片「打开会话」跳到会话模式的该会话详情。任务流首次拉取(`GET /api/tasks/:id`)与 WS 增量(`task_event` 消息)push 进同一个 `events` 数组、同一套渲染(「服务端归约与前端增量必须对齐」的老问题,见 `notes/implementation-lessons.md`)。
+- **任务**(默认)— 项目 / 任务 / 任务详情三栏。左栏(复用 aside)列项目,带任务数、运行中 agent 数、待批准数;中栏列任务,带状态点、agent 数、待批准数;右栏是任务详情:头部(标题 + 状态 + 编辑,目标 / 验收作副标题一行);无活跃主 agent 时一块「开始任务」主操作区(启动主 agent);Agents 区(主 agent 卡片排在子 agent 前,transport / state / context / cost / pending,主 agent 绿底,自建 tmux 主 agent 卡片带 attach 动作);任务流事件(newest-first)。项目按 name `localeCompare`、任务按 `createdAt` 固定排序,不随状态跳动(理由见 `notes/implementation-lessons.md`「左栏排序固定」)。交互:创建 / 编辑任务、绑定已有会话为主/子 agent、解绑(不关会话)、点 agent 卡片「打开会话」跳到会话模式的该会话详情。任务流首次拉取(`GET /api/tasks/:id`)与 WS 增量(`task_event` 消息)push 进同一个 `events` 数组、同一套渲染(「服务端归约与前端增量必须对齐」的老问题,见 `notes/implementation-lessons.md`)。
   - **未绑定会话区。** `synapse` 起的 tmux 会话进了 `SessionManager` 但不会自动成为任务 —— 若只渲染有 binding 的 agent,这些会话在任务视图里完全不可见。故中栏任务列表上方单列一区:属于当前项目 `workspaceRoots`、`state !== 'exited'`、且无 active binding 的会话,由 `GET /api/projects/:id/tasks` 的 `unboundSessions` 字段给出(服务端按 binding 算,前端无从本地推导 —— 新会话出现或 tmux 会话 `exited` 时前端重取该接口)。每行一个「转为任务」按钮,调 `POST /api/tasks/from-session`:以会话 `title || name` 建任务、立即把该会话挂为 main agent,一步到位。点会话行本身跳到会话模式查看。
 - **会话** — 下面描述的原有两层结构,能力不变。
 
@@ -412,13 +412,15 @@ Project 分组默认展开,用户手动收起的记入 localStorage(键存收起
 - **不算失败。** Claude Code 把这次 `deny` 等同工具失败,`tool_result` 的 `is_error` 为 `true`。但这是协议限制下的正常回传,不是真的出错 —— 归约逻辑(`reduceEvent` 与前端 `onSessionEvent` 的 `tool_result` 分支)对 `AskUserQuestion` 强制把 `isError` 记为 `false`,「N 步」折叠摘要与单步图标因此不会把提交回答/跳过标成失败。
 - **会话状态要收回。** `onApprovalRequested` 触发时会话被标 `waiting`(§4 PermissionEngine),但早期实现只在挂起时置位,没有对应的复位 —— `#settle` 落定决策后无人把 `s.state` 改回去,只能靠前端 `pendingFor()` 派生值动态覆盖显示,凡是直接读 `s.state` 原始字面量的地方都会一直显示"等待批准"。现在 `ResolveListener` 额外带上 `sessionId`,`onApprovalResolved` 里若该会话已无其它待批准项,按 `pendingTurns` 决定收回到 `busy` 还是 `ready`。
 
-### 5.2 从任务启动子 agent 的预检步
+### 5.2 从任务启动 agent 的预检步
 
-从任务启动子 agent 前插入一步确认 —— system prompt、cwd/worktree、`--add-dir`、model 全是启动参数,启动后不可变(见 §7 与 §4 `CreateOptions.appendSystemPrompt`),既然如此就在唯一能真正生效的时刻让用户确认。
+从任务启动 agent 前插入一步确认 —— system prompt、cwd/worktree、`--add-dir`、model、`permissions` 全是启动参数,启动后不可变(见 §7 与 §4 `CreateOptions.appendSystemPrompt`),既然如此就在唯一能真正生效的时刻让用户确认。
 
-**已实现。** `POST /api/tasks/:id/agents/start` 复用 `manager.create()` 起一个 stream-json 子 agent、写 `agent_started` 事件、按模板(项目 / 工作区 / 任务 / 目标 / 验收 / 子任务 / 收尾格式)拼 prompt 后 `send()`。`role:'main' + transport:'tmux'` 返回 400 —— 网页接管不了用户 pane。预检对话框展示工作区、`GET /api/git-status` 的 `git status --porcelain` 结果(**信息用途,不阻断**)、system prompt 最终文本预览、model。
+**子 agent(已实现)。** `POST /api/tasks/:id/agents/start` 复用 `manager.create()` 起一个 stream-json 子 agent、写 `agent_started` 事件、按模板(项目 / 工作区 / 任务 / 目标 / 验收 / 子任务 / 收尾格式)拼 prompt 后 `send()`。预检对话框展示工作区、`GET /api/git-status` 的 `git status --porcelain` 结果(**信息用途,不阻断**)、system prompt 最终文本预览、model。
 
-**未实现。** worktree 隔离(`dirtyStrategy` 三策略)与 policy 存储层 —— 子 agent 目前直接在传入工作区上跑,见 §1.3 / §7。对话框里的 worktree 策略选择、`--add-dir` 列表、「设为该工作区默认」也随之留白。
+**主 agent(启动路径已实现,受限 settings 未做 —— 见 `docs/design/main-agent-orchestration.md` 落地顺序第 3/4 步)。** 网页直接启动 tmux 主 agent,走 `TmuxTransport` **自建会话**模式(会话名 `synapse-main-<taskId>`),**不是**接管用户 pane —— 早期「`role:'main' + transport:'tmux'` 返回 400」的约束只针对接管模式,自建会话放开。`POST /api/tasks/:id/agents/start` 的 `role:'main'` 分支:`realpathSync` work dir(避开自建会话的信任对话框坑)、已有活跃 main binding → 409、`manager.create()` 注入 `SYNAPSE_TASK_ID` / `SYNAPSE_AGENT_BINDING` / `SYNAPSE_DATA_DIR` + 基线调度者 `appendSystemPrompt`、`agent_started` 事件、`send()` 首轮 prompt。详情页「启动主 agent」对话框(work dir + model)+ 绿卡「attach」动作(复制 `tmux attach -t synapse-main-<taskId>`)。**待做**:受限 `permissions`(第 4 步 —— 当前主 agent 有全套工具)、预检框的 `permissions` 预览、解绑 `tmux kill-session`、daemon 重启按会话名扫回。
+
+**未实现(子 agent + 主 agent 共通)。** worktree 隔离(`dirtyStrategy` 三策略)与 policy 存储层 —— agent 目前直接在传入工作区上跑,见 §1.3 / §7。对话框里的 worktree 策略选择、`--add-dir` 列表、「设为该工作区默认」也随之留白。
 
 运行中的会话不进入这个流程 —— 无法改 system prompt,唯一「动态」的手段是往对话里 `send()` 一条要求消息,效果弱且会污染时间线,不作为正式路径。
 
@@ -453,6 +455,6 @@ tmux agent 卡片:会话 `exited` 且 `transport === 'tmux'` 时状态标「pane
 - **stream-json 会话的进程存活** — tmux 会话在后端重启后可重新探活接管(`notes/implementation-lessons.md`),stream-json 子进程随后端退出而消失(见「崩溃恢复」),这层还没补。
 - **任务 agent 的 worktree 隔离** — 设计见 §1.3,预检步见 §5.2;`backend/worktree.ts` 与 policy 存储层未实现,Phase 1 收尾时评估「多子 agent 并行」非近期需求而延后。
 - **Artifacts 采集** — §0.2 定了落盘路径规范,§5 的 Artifacts 页签在位,但后端未采集会话产出物,页签暂空。
-- **主 agent 调度** — 设计见 `docs/design/main-agent-orchestration.md`。`synapse agent wait` 的长轮询信号、子 agent 异常退出的退出码语义待实现时定。
+- **主 agent 调度** — 设计见 `docs/design/main-agent-orchestration.md`(交互协议已定:每次 `synapse agent` 调用是短请求,`poll --since <seq>` 拿增量事件,`await` 的轮询在 CLI 侧、退出码 `0/10/11/20`)。待实现:`TaskEvent.seq` 自增、`turn_end` 的结论/改动文件带进 `TaskEvent.data`、daemon 重启窗口内漏记 turn 的对账。
 - **`synapse agent` 子命令** — §0.1 的 `agent` 分支(daemon HTTP 瘦客户端)。`wrapper` → `synapse` 的代码 sweep 已完成;`agent` 分发与端点见 `docs/design/main-agent-orchestration.md` 落地顺序。
 

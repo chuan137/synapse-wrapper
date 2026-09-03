@@ -89,6 +89,31 @@ test('attachAgent({role:"main"}) 两次 → 旧 binding 被结束', async () => 
   }
 });
 
+test('attachAgent 接受预生成的 binding id', async () => {
+  const { path, cleanup } = tmpTasksPath();
+  try {
+    const store = new TaskStore(path);
+    const project = store.ensureProjectForWorkspace('/tmp/repo-a');
+    const task = store.createTask({ projectId: project.id, title: 't' });
+    const preId = 'fixed-binding-id-123';
+    const b = store.attachAgent({
+      taskId: task.id,
+      id: preId,
+      localId: 'sess-1',
+      role: 'main',
+      transportKind: 'tmux',
+    });
+    assert.equal(b.id, preId);
+    // 同 id 再 attach 另一个会话 → 抛错(不静默复用)。
+    assert.throws(() =>
+      store.attachAgent({ taskId: task.id, id: preId, localId: 'sess-2', role: 'sub', transportKind: 'tmux' }),
+    );
+    await store.flush();
+  } finally {
+    cleanup();
+  }
+});
+
 test('同一 localId 第二次 attachAgent 到另一个 task → 抛错', () => {
   const { path, cleanup } = tmpTasksPath();
   try {
@@ -158,6 +183,58 @@ test('ensureProjectForWorkspace 幂等 —— 同路径不重复建', () => {
     const p2 = store.ensureProjectForWorkspace('/tmp/repo-a');
     assert.equal(p1.id, p2.id);
     assert.equal(store.listProjects().length, 1);
+  } finally {
+    cleanup();
+  }
+});
+
+test('appendEvent 的 seq 严格递增,重启后不回退', async () => {
+  const { path, cleanup } = tmpTasksPath();
+  try {
+    const s1 = new TaskStore(path);
+    const project = s1.ensureProjectForWorkspace('/tmp/repo-a');
+    const t = s1.createTask({ projectId: project.id, title: 't' });
+
+    const e1 = s1.appendEvent({ taskId: t.id, kind: 'task_created', message: 'a' });
+    const e2 = s1.appendEvent({ taskId: t.id, kind: 'task_updated', message: 'b' });
+    const e3 = s1.appendEvent({ taskId: t.id, kind: 'task_updated', message: 'c' });
+    assert.ok(e1.seq < e2.seq && e2.seq < e3.seq, 'seq 应严格递增');
+    await s1.flush();
+
+    // 重启 —— 从 tasks.json 重新读,下一条 seq 必须比重启前的最大值大。
+    const s2 = new TaskStore(path);
+    const e4 = s2.appendEvent({ taskId: t.id, kind: 'task_updated', message: 'd' });
+    assert.ok(e4.seq > e3.seq, `重启后 seq 不能回退:${e4.seq} 应 > ${e3.seq}`);
+  } finally {
+    cleanup();
+  }
+});
+
+test('eventsForBinding --since 只返回 seq 更大的事件', async () => {
+  const { path, cleanup } = tmpTasksPath();
+  try {
+    const store = new TaskStore(path);
+    const project = store.ensureProjectForWorkspace('/tmp/repo-a');
+    const t = store.createTask({ projectId: project.id, title: 't' });
+    const b = store.attachAgent({
+      taskId: t.id,
+      localId: 'sess-1',
+      role: 'sub',
+      transportKind: 'stream-json',
+    });
+    const e1 = store.appendEvent({ taskId: t.id, agentBindingId: b.id, kind: 'turn_completed', message: '1' });
+    store.appendEvent({ taskId: t.id, kind: 'task_updated', message: '别的 binding' });
+    const e3 = store.appendEvent({ taskId: t.id, agentBindingId: b.id, kind: 'turn_completed', message: '3' });
+
+    assert.deepEqual(
+      store.eventsForBinding(b.id).map((e) => e.seq),
+      [e1.seq, e3.seq],
+    );
+    assert.deepEqual(
+      store.eventsForBinding(b.id, e1.seq).map((e) => e.seq),
+      [e3.seq],
+    );
+    assert.deepEqual(store.eventsForBinding(b.id, e3.seq), []);
   } finally {
     cleanup();
   }

@@ -131,3 +131,16 @@ CLI 把中断写成一条 `type: "user"` 消息,`content` 是纯文本块(`[Requ
 `claude` 收到粘贴内容后,把消息内部换行符落盘成 `\r`(如 `"...状态\r从 Manila API..."`),而网页 `<textarea>` 的 `value` 里 Shift+Enter 产生的是标准 `\n`。`send()` 传入 `#pendingEchoes` 的是原始 `\n` 版本,`#handleLine` 解析出的 `ev.text` 是 `\r` 版本,`indexOf` 精确匹配永远不命中 —— 回显消不掉,`emit(ev)` 照常发出,叠加前端自己已经通过 `user_message` 展示的那条,网页上同一条多行消息显示两遍。单行消息不受影响。
 
 修复:比对前对两侧都过一遍 `normalizeNewlines()`(`\r\n?` 统一换成 `\n`)。`#inject()` 实际写入 tmux 的仍是原始 `text` —— 归一化只用于回显比对这一步。
+
+## 网页启动 tmux 自建会话:work dir 必须 realpathSync,否则撞信任对话框
+
+锚点:`server.ts` `POST /api/tasks/:id/agents/start` 的 `role:'main'` 分支,`tmuxTransport.ts` `#waitReady` 的信任框分支。
+
+网页起 tmux 主 agent(自建会话)是第一条从 web 端拉起真实 claude TUI 的路径。第一版直接用 `resolve(req.body.workspace)` 当 cwd,claude 起来后卡在工作区信任对话框、`#waitReady` 发 `Enter` —— 而对话框默认高亮是「No, exit」,claude 随即退出,自建 tmux 会话没有别的 pane 也跟着消失,网页看到的是 binding 刚建就 `exited`。
+
+两个原因叠加:
+
+1. `resolve()` 不解符号链接,`TmuxTransport.ensureTrusted()` 写进 `~/.claude.json` 的键是传入的 cwd,但 claude 自己按**真实路径**查信任标记。macOS 下 `/tmp/x` vs `/private/tmp/x`、或任何软链工作区,预置的信任就对不上。CLI 路径(`bin/synapse.ts`)一直有 `realpathSync(given)` 这一步,web 端漏了 —— 端点改成 `realpathSync(given)` 对齐。
+2. `#waitReady` 的信任框兜底原本发裸 `Enter`(选中默认项)。正常路径 `ensureTrusted` 预置信任、根本走不到这里,但真走到了(`~/.claude.json` 不可写等)裸 Enter 会选「No, exit」。改成先 `Down` 再 `Enter`,移到「Yes, I trust」。
+
+stream-json 子 agent 不受影响 —— 那条路径 claude headless 跑,没有信任 TUI。

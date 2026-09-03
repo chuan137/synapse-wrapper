@@ -112,6 +112,13 @@ export interface TmuxOptions {
    * 启动,不经本类。
    */
   extraArgs?: string[];
+  /**
+   * 注入新建会话的环境变量(`tmux new-session -e KEY=VAL`)。
+   * 仅自建会话模式生效。主 agent 的 SYNAPSE_TASK_ID / SYNAPSE_AGENT_BINDING /
+   * SYNAPSE_DATA_DIR 走这里 —— claude 及其子进程(`synapse agent` 调用)据此
+   * 定位任务与 daemon。
+   */
+  env?: Record<string, string>;
 }
 
 /**
@@ -210,12 +217,20 @@ export class TmuxTransport extends EventEmitterBase implements SessionTransport 
     }
 
     if (!(await this.#sessionExists())) {
+      // -e KEY=VAL 设会话环境,claude 及其子进程(主 agent 里的 `synapse agent`)
+      // 都继承。需要 tmux 3.2+;更早的版本这些变量不会注入,主 agent 的
+      // `synapse agent` 会因缺 SYNAPSE_TASK_ID 而明确报错(不是静默跑偏)。
+      const envArgs = Object.entries(this.#opts.env ?? {}).flatMap(([k, v]) => ['-e', `${k}=${v}`]);
+      // 会话归属由调用方指定,不事后按 mtime 猜(见 spec §2.6 / #discoverTranscript)。
+      const idArgs = this.#opts.sessionId ? ['--session-id', this.#opts.sessionId] : [];
       await exec('tmux', [
         'new-session', '-d',
         '-s', this.#tmuxName,
         '-x', '200', '-y', '50',
         '-c', this.#opts.cwd,
+        ...envArgs,
         'claude', '--settings', this.#opts.settingsPath,
+        ...idArgs,
         ...(this.#opts.extraArgs ?? []),
       ]);
       await sleep(2500);  // 等首屏渲染,否则 capture 拿到空屏
@@ -239,8 +254,12 @@ export class TmuxTransport extends EventEmitterBase implements SessionTransport 
       const screen = last.screen;
 
       // 信任对话框的选项前也带 ❯,必须在就绪判断之前识别,
-      // 否则提示词会被粘进对话框而丢失。
+      // 否则提示词会被粘进对话框而丢失。默认高亮是「No, exit」,直接 Enter
+      // 会让 claude 退出、自建会话随之消失 —— 先 Down 移到「Yes, I trust」再确认。
+      // 正常路径 ensureTrusted 已预置信任、根本不会走到这里,这是兜底。
       if (/trust this folder|trust the files|Security guide/i.test(screen)) {
+        await exec('tmux', ['send-keys', '-t', this.#target, 'Down']).catch(() => {});
+        await sleep(200);
         await exec('tmux', ['send-keys', '-t', this.#target, 'Enter']).catch(() => {});
         await sleep(2000);
         continue;

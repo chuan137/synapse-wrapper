@@ -10,15 +10,16 @@ import express from 'express';
 import { WebSocketServer, type WebSocket } from 'ws';
 import { createServer } from 'node:http';
 import { execFile } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import { resolve } from 'node:path';
-import { existsSync, statSync } from 'node:fs';
+import { existsSync, statSync, realpathSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { SessionManager, replayTranscriptTimeline, mergedTodos, type ManagerEvent, type SessionSummary } from './sessionManager.ts';
 import { PermissionEngine, HOOK_TIMEOUT_S, type PendingApproval } from './permissions.ts';
 import { TaskStore, tasksPath, type AgentBinding, type Project, type Task } from './taskStore.ts';
 import {
   writeState, clearState, readOrCreateToken, writeHookSettings, hookSettingsPath,
-  migrateLegacyStateDir, DEFAULT_PORT, MAX_PORT_TRIES,
+  migrateLegacyStateDir, DEFAULT_PORT, MAX_PORT_TRIES, SYNAPSE_DIR,
 } from './daemon.ts';
 
 // 旧版按端口分子目录,现在扁平放数据目录根 —— 升级后首次启动搬一次(见 daemon.ts)。
@@ -338,6 +339,64 @@ app.get('/api/tasks/:id', (req, res) => {
   res.json(detail);
 });
 
+/**
+ * 主 agent 的唯一真相源 —— `synapse agent context` 的后端。
+ *
+ * 每次决策前主 agent 拉一次:目标 / work dir / 验收 是任务的静态定义;
+ * 子 agent 状态行是动态的(每个非 main binding 的会话状态 + 最近一次
+ * turn_completed 的摘要 + pending 批准数)。handoff 文档要等落地顺序第 7 步
+ * (`backend/taskDocs.ts` + `synapse-tasks` repo),这一步先回 null。
+ */
+function agentContext(taskId: string) {
+  const task = tasks.getTask(taskId);
+  if (!task) return null;
+  const project = tasks.getProject(task.projectId) ?? null;
+  const bindings = tasks.listBindings(taskId);
+  const main = bindings.find((b) => b.role === 'main' && b.endedAt === null);
+
+  // work dir:handoff 文档定稿前,主 agent 会话的工作区就是权威值;它还没起来
+  // 时退回 project 的首个 workspaceRoot。
+  const mainSession = main ? sessionView(main.localId) : null;
+  const workDir = mainSession?.workspace ?? project?.workspaceRoots[0] ?? null;
+
+  const subAgents = bindings
+    .filter((b) => b.role === 'sub')
+    .map((b) => {
+      const session = sessionView(b.localId);
+      const events = tasks.eventsForBinding(b.id);
+      const lastTurn = [...events].reverse().find((e) => e.kind === 'turn_completed') ?? null;
+      const exited = events.some((e) => e.kind === 'agent_exited') || b.endedAt !== null;
+      return {
+        bindingId: b.id,
+        workspace: session?.workspace ?? null,
+        // running / idle / exited —— 主 agent 据此判断能不能派下一个子任务。
+        state: exited ? 'exited' : session && RUNNING_STATES.has(session.state) ? 'running' : 'idle',
+        lastTurnAt: lastTurn?.createdAt ?? null,
+        lastTurnSummary: lastTurn?.message ?? null,
+        pendingApprovals: pendingForBinding(b),
+      };
+    });
+
+  return {
+    task: { id: task.id, title: task.title, goal: task.goal, acceptance: task.acceptance, status: task.status },
+    project: project ? { id: project.id, name: project.name } : null,
+    workDir,
+    mainAgent: main ? { bindingId: main.id, state: mainSession?.state ?? 'unknown' } : null,
+    handoff: null as string | null,
+    subAgents,
+  };
+}
+
+app.get('/api/tasks/:id/agent-context', (req, res) => {
+  if (!checkOrigin(req, res)) return;
+  const ctx = agentContext(String(req.params.id));
+  if (!ctx) {
+    res.status(404).json({ error: 'task 不存在' });
+    return;
+  }
+  res.json(ctx);
+});
+
 app.post('/api/tasks', (req, res) => {
   if (!checkOrigin(req, res)) return;
   const projectId = String(req.body?.projectId ?? '');
@@ -506,6 +565,34 @@ function subAgentPrompt(
   ].join('\n');
 }
 
+/**
+ * 主 agent 的 system prompt 基线(落地顺序第 3 步:只讲「该怎么做」)。
+ *
+ * 这段只是倾向 —— 真正兜住「不能做什么」的受限 permissions 是第 4 步。
+ * 第 4 步落地后这里会补上受限说明和 `synapse agent doc` 流程。
+ */
+function mainAgentPrompt(project: Project | undefined, task: Task): string {
+  return [
+    '你是这个任务的主 agent —— 一个调度者,不是执行者。',
+    '',
+    `项目:${project?.name ?? '(未命名)'}`,
+    `任务:${task.title}`,
+    `目标:${task.goal || '(未填写)'}`,
+    `验收:${task.acceptance || '(未填写)'}`,
+    '',
+    '你的职责:确定 work dir、把任务拆成子任务、分派给子 agent、跟踪进度。',
+    '你自己不改代码 —— 所有文件改动交给你 spawn 的子 agent。',
+    '',
+    '调度用 `synapse agent` 子命令(daemon HTTP 的瘦客户端,任务 id 已通过',
+    '环境变量注入,无需手动传):',
+    '  synapse agent context   —— 打印 work dir / 目标 / 验收 / 每个子 agent 的状态。',
+    '                             每次决策前先拉一次,这是你的唯一真相源。',
+    '  (spawn / poll / await / doc 后续开放)',
+    '',
+    '现在:先跑 `synapse agent context` 看清任务全貌,再规划子任务拆解。',
+  ].join('\n');
+}
+
 /** 预检用:目标工作区的 git 状态(信息用途,7a 不据此阻断)。 */
 app.get('/api/git-status', (req, res) => {
   if (!checkOrigin(req, res)) return;
@@ -533,18 +620,79 @@ app.post('/api/tasks/:id/agents/start', async (req, res) => {
   const b = req.body ?? {};
   const role = b.role === 'main' ? 'main' : 'sub';
   const transport = b.transport === 'tmux' ? 'tmux' : 'stream-json';
-  const workspace = resolve(String(b.workspace ?? ''));
+  const given = resolve(String(b.workspace ?? ''));
+  const model =
+    typeof b.model === 'string' && b.model.trim() ? b.model.trim() : undefined;
 
-  if (role === 'main' && transport === 'tmux') {
-    // 网页接管不了用户 pane —— 主 tmux agent 只能在终端用 synapse 起,再绑定进来。
-    res.status(400).json({ error: '不能从网页启动 tmux 主 agent,请在终端用 synapse 起会话后绑定' });
-    return;
-  }
-  if (!workspace || !existsSync(workspace) || !statSync(workspace).isDirectory()) {
+  if (!given || !existsSync(given) || !statSync(given).isDirectory()) {
     res.status(400).json({ error: '工作目录不存在' });
     return;
   }
+  // 解析符号链接后再用 —— claude 的信任检查(TmuxTransport.ensureTrusted 写的
+  // ~/.claude.json)按真实路径匹配,tmux 主 agent 自建会话会撞信任对话框,
+  // 默认选项是「No, exit」,claude 一退 tmux 会话就没了。CLI 路径也这么做
+  // (bin/synapse.ts realpathSync)。
+  const workspace = realpathSync(given);
+  const project = tasks.getProject(task.projectId);
 
+  if (role === 'main') {
+    // 网页启动的主 agent 只走 tmux 自建会话(长命、扛 daemon restart)。stream-json
+    // 主 agent(纯后台一次性)不从这个端点起 —— 用户在终端用 synapse 起再绑定。
+    if (transport !== 'tmux') {
+      res.status(400).json({ error: '网页启动的主 agent 只支持 tmux(自建会话)' });
+      return;
+    }
+    // 一个任务至多一个活跃主 agent —— 名字 synapse-main-<taskId> 因此唯一,
+    // 也是 daemon 重启后扫回的锚点(重启扫回见落地顺序第 4 步)。
+    if (tasks.listBindings(task.id).some((x) => x.role === 'main' && x.endedAt === null)) {
+      res.status(409).json({ error: '该任务已有活跃主 agent' });
+      return;
+    }
+
+    const sessionName = `synapse-main-${task.id}`;
+    // binding id 要在 spawn 前作为 SYNAPSE_AGENT_BINDING 注入 —— 先生成,
+    // 再带着同一个 id attach(见 taskStore AttachAgentInput.id)。
+    const bindingId = randomUUID();
+    const sessionId = randomUUID();
+
+    try {
+      const s = await manager.create(workspace, {
+        transport: 'tmux',
+        tmuxName: sessionName,
+        sessionId,
+        model,
+        appendSystemPrompt: mainAgentPrompt(project, task),
+        env: {
+          SYNAPSE_TASK_ID: task.id,
+          SYNAPSE_AGENT_BINDING: bindingId,
+          SYNAPSE_DATA_DIR: SYNAPSE_DIR,
+        },
+      });
+      const binding = tasks.attachAgent({
+        taskId: task.id,
+        id: bindingId,
+        localId: s.localId,
+        claudeId: s.claudeId,
+        role: 'main',
+        transportKind: s.transportKind,
+      });
+      tasks.appendEvent({
+        taskId: task.id,
+        agentBindingId: binding.id,
+        kind: 'agent_started',
+        message: `启动主 agent(tmux ${sessionName})于 ${workspace}`,
+      });
+      // 自建会话默认没人 attach —— 发一句首轮 prompt 让主 agent 立刻开始规划,
+      // 否则会话起来后干等,用户 attach 进去看到的是个空会话。
+      manager.send(s.localId, '开始:先 `synapse agent context` 看清任务,再规划子任务拆解并逐个 spawn 子 agent。');
+      res.json(taskDetail(task.id));
+    } catch (err) {
+      res.status(500).json({ error: String(err instanceof Error ? err.message : err) });
+    }
+    return;
+  }
+
+  // ── 子 agent(stream-json,现有路径)──
   // 留空则回退到任务目标 —— 不带子任务启动会让子 agent 起来后干等,没有触发轮次的输入。
   const userPrompt =
     (typeof b.prompt === 'string' && b.prompt.trim() ? b.prompt.trim() : '') || task.goal.trim();
@@ -552,7 +700,6 @@ app.post('/api/tasks/:id/agents/start', async (req, res) => {
     res.status(400).json({ error: '需要子任务描述(或先给任务填写目标)' });
     return;
   }
-  const project = tasks.getProject(task.projectId);
   const appendSystemPrompt =
     typeof b.appendSystemPrompt === 'string' && b.appendSystemPrompt.trim()
       ? b.appendSystemPrompt
@@ -561,21 +708,21 @@ app.post('/api/tasks/:id/agents/start', async (req, res) => {
   try {
     const s = await manager.create(workspace, {
       transport,
-      model: typeof b.model === 'string' && b.model.trim() ? b.model.trim() : undefined,
+      model,
       appendSystemPrompt,
     });
     const binding = tasks.attachAgent({
       taskId: task.id,
       localId: s.localId,
       claudeId: s.claudeId,
-      role,
+      role: 'sub',
       transportKind: s.transportKind,
     });
     tasks.appendEvent({
       taskId: task.id,
       agentBindingId: binding.id,
       kind: 'agent_started',
-      message: `启动 ${role} agent(${transport})于 ${workspace}`,
+      message: `启动子 agent(${transport})于 ${workspace}`,
     });
     manager.send(s.localId, subAgentPrompt(project, task, workspace, userPrompt));
     res.json(taskDetail(task.id));

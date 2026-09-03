@@ -78,6 +78,9 @@ export interface TaskEvent {
   message: string;
   data: unknown;
   createdAt: number;
+  // store 级单调递增序号。createdAt 是毫秒戳,并发 append 会撞;poll --since
+  // 要靠一个严格递增、不回退的游标切分「已见 / 未见」,那必须是 seq 不是时间。
+  seq: number;
 }
 
 export interface CreateTaskInput {
@@ -103,6 +106,12 @@ export interface AttachAgentInput {
   claudeId?: string | null;
   role: AgentRole;
   transportKind: AgentTransportKind;
+  /**
+   * 预生成的 binding id。主 agent 启动时 daemon 要把 binding id 作为
+   * SYNAPSE_AGENT_BINDING 注入 claude 进程环境,而进程在 attachAgent 之前
+   * 就已 spawn —— 调用方先生成 id、注入、再带着同一个 id attach。
+   */
+  id?: string;
 }
 
 export interface AppendTaskEventInput {
@@ -119,10 +128,13 @@ interface TasksFile {
   tasks: Task[];
   agentBindings: AgentBinding[];
   events: TaskEvent[];
+  // 已发过的最大事件 seq。落盘,重启后 append 从这里续,不从 events 长度推
+  // (事件将来可能裁剪 / 归档,长度会缩,seq 不能跟着回退)。
+  eventSeq: number;
 }
 
 function emptyFile(): TasksFile {
-  return { version: 1, projects: [], tasks: [], agentBindings: [], events: [] };
+  return { version: 1, projects: [], tasks: [], agentBindings: [], events: [], eventSeq: 0 };
 }
 
 /** 默认路径:SYNAPSE_TASKS_PATH 优先(测试隔离用),否则 <数据目录>/tasks.json。 */
@@ -152,12 +164,16 @@ export class TaskStore {
     }
     try {
       const parsed = JSON.parse(raw) as Partial<TasksFile>;
+      const events = parsed.events ?? [];
       return {
         version: 1,
         projects: parsed.projects ?? [],
         tasks: parsed.tasks ?? [],
         agentBindings: parsed.agentBindings ?? [],
-        events: parsed.events ?? [],
+        events,
+        // 旧文件没有 eventSeq —— 从已有事件的最大 seq 恢复(升级前的事件没 seq
+        // 字段,按 0 计);之后每次 append 都 +1 并落盘,不再回落到这条路径。
+        eventSeq: parsed.eventSeq ?? events.reduce((m, e) => Math.max(m, e.seq ?? 0), 0),
       };
     } catch {
       // 不静默覆盖:损坏文件留一份现场,再新建空结构继续跑。
@@ -300,8 +316,11 @@ export class TaskStore {
         }
       }
     }
+    if (input.id && this.getBinding(input.id)) {
+      throw new Error(`binding ${input.id} 已存在`);
+    }
     const binding: AgentBinding = {
-      id: randomUUID(),
+      id: input.id ?? randomUUID(),
       taskId: input.taskId,
       localId: input.localId,
       claudeId: input.claudeId ?? null,
@@ -334,6 +353,7 @@ export class TaskStore {
       message: input.message,
       data: input.data ?? null,
       createdAt: Date.now(),
+      seq: ++this.#data.eventSeq,
     };
     this.#data.events.push(event);
     this.#save();
@@ -342,5 +362,15 @@ export class TaskStore {
 
   listEvents(taskId: string): TaskEvent[] {
     return this.#data.events.filter((e) => e.taskId === taskId);
+  }
+
+  /**
+   * 某 binding 自 `sinceSeq`(不含)以来的事件,按 seq 升序。poll --since 的后端。
+   * sinceSeq 省略 → 从头。
+   */
+  eventsForBinding(bindingId: string, sinceSeq = 0): TaskEvent[] {
+    return this.#data.events
+      .filter((e) => e.agentBindingId === bindingId && e.seq > sinceSeq)
+      .sort((a, b) => a.seq - b.seq);
   }
 }
