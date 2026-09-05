@@ -77,10 +77,16 @@ async function warnExisting(
  * --port 只在需要新起 daemon 时决定监听端口 —— 已有健康实例总是直接复用
  * (一个数据目录至多一个 daemon,不按端口区分)。测试要隔离改用独立的
  * SYNAPSE_DATA_DIR,不靠换端口,见 daemon.ts 的 SYNAPSE_DIR。
+ *
+ * portExplicit 标记这个端口号是不是用户主动给的(--port 或 PORT 环境变量),
+ * 还是没给、退到了默认值 —— ensureDaemon 据此决定新起的进程撞见端口占用时
+ * 能不能递增重试(见 daemon.ts ensureDaemon 注释)。不能靠"port 是否等于
+ * DEFAULT_PORT"反推:用户完全可能 --port 47100 显式撞上默认值。
  */
-function parseArgv(argv: string[]): { dir: string | undefined; port: number } {
+function parseArgv(argv: string[]): { dir: string | undefined; port: number; portExplicit: boolean } {
   const rest: string[] = [];
   let port = Number(process.env.PORT ?? DEFAULT_PORT);
+  let portExplicit = process.env.PORT != null;
 
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]!;
@@ -88,15 +94,17 @@ function parseArgv(argv: string[]): { dir: string | undefined; port: number } {
       const v = argv[++i];
       if (!v || Number.isNaN(Number(v))) die(`--port 需要一个数字: ${v ?? '(缺失)'}`);
       port = Number(v);
+      portExplicit = true;
     } else if (a.startsWith('--port=')) {
       const v = a.slice('--port='.length);
       if (Number.isNaN(Number(v))) die(`--port 需要一个数字: ${v}`);
       port = Number(v);
+      portExplicit = true;
     } else {
       rest.push(a);
     }
   }
-  return { dir: rest[0], port };
+  return { dir: rest[0], port, portExplicit };
 }
 
 /**
@@ -165,7 +173,7 @@ export async function main(argv: string[]): Promise<void> {
   const ownArgv = sepIdx === -1 ? argv : argv.slice(0, sepIdx);
   const claudeArgs = sepIdx === -1 ? [] : withForkSession(argv.slice(sepIdx + 1));
 
-  const { dir: dirArg, port } = parseArgv(ownArgv);
+  const { dir: dirArg, port, portExplicit } = parseArgv(ownArgv);
   const given = resolve(dirArg ?? process.cwd());
   if (!existsSync(given) || !statSync(given).isDirectory()) die(`目录不存在: ${given}`);
 
@@ -184,7 +192,7 @@ export async function main(argv: string[]): Promise<void> {
     process.exit(1);
   }
 
-  const state = await ensureDaemon(port).catch((err) => die(String(err?.message ?? err)));
+  const state = await ensureDaemon(port, undefined, portExplicit).catch((err) => die(String(err?.message ?? err)));
 
   // 同目录并存是允许的(裸 claude 亦然,且钩子按 claudeId 路由不会串),
   // 但要让用户知道网页端将出现同名会话。
@@ -230,12 +238,12 @@ async function daemonCmd(argv: string[]): Promise<void> {
   // parseArgv 把非 --port 的位置参数当「目录」摘出来,子命令名恰好落在同一个槽位。
   // status / stop / restart 只认数据目录里记录的实例,--port 仅在需要新起进程时
   // (start / restart)决定监听端口。
-  const { dir: sub, port } = parseArgv(argv);
+  const { dir: sub, port, portExplicit } = parseArgv(argv);
 
   // start —— 只拉起 daemon + 打印网页链接,不附带会话、不要求在 tmux 内。
   // 任务面板只需要 daemon + 网页 UI:会话之后从网页里创建/绑定/启动。
   if (sub === 'start') {
-    const state = await ensureDaemon(port).catch((err) => die(String(err?.message ?? err)));
+    const state = await ensureDaemon(port, undefined, portExplicit).catch((err) => die(String(err?.message ?? err)));
     console.log(`${c.blue('●')} 端口 ${state.port} 已就绪 (PID ${state.pid})`);
     console.log(`${c.dim('网页链接:')}\n${urlFor(state)}`);
     process.exit(0);
@@ -260,11 +268,14 @@ async function daemonCmd(argv: string[]): Promise<void> {
 
   if (sub === 'restart') {
     // 在停之前读一次:重启要落回同一个端口,而不是命令行没给 --port 时的默认值。
+    // 取自 prev.port 时按 explicit 处理 —— 要求精确落回那个端口(可能是上次
+    // 默认端口递增重试后落到的非默认值),不允许这次又漂移到别的端口。
     const prev = readState();
     const relaunchPort = prev?.port ?? port;
+    const relaunchExplicit = prev ? true : portExplicit;
     const before = await stopDaemon().catch((err) => die(String(err?.message ?? err)));
     if (before === 'stopped') console.log(`${c.dim('…')} 已停止旧进程,正在拉起新的`);
-    const state = await ensureDaemon(relaunchPort).catch((err) => die(String(err?.message ?? err)));
+    const state = await ensureDaemon(relaunchPort, undefined, relaunchExplicit).catch((err) => die(String(err?.message ?? err)));
     // token 通常跟前一次相同(daemon.ts readOrCreateToken 复用磁盘残留),
     // 但仍打印链接兜底 —— 全新数据目录、或磁盘 token 文件被手动清过时会拿到新值。
     console.log(`${c.blue('●')} 端口 ${state.port} 已就绪 (PID ${state.pid})`);

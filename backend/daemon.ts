@@ -245,15 +245,24 @@ export async function checkHealth(state: DaemonState): Promise<boolean> {
  * 一个进程时才用上。不同 workspace 下不传 port 都复用同一个生产 daemon
  * (Project List 能跨 workspace 聚合会话正是靠这个);测试要隔离用独立的
  * SYNAPSE_DATA_DIR,不靠换端口。
+ *
+ * explicit 标记这个 port 是不是调用方(用户)显式给的,决定新起的子进程
+ * 撞见端口占用时能不能递增重试(见 spawnDaemon/server.ts PORT_EXPLICIT)——
+ * 不能靠子进程自己看有没有 PORT 环境变量反推,那样每次都会显式设置,永远
+ * 判成「显式」,已有实例撞见占用直接退出、无从递增,表现为一撞就报「启动
+ * 超时」,还容易在反复重试里堆出多个占着不同端口、彼此不知道对方存在的
+ * 残留 daemon。
  */
-export async function ensureDaemon(port = DEFAULT_PORT, waitMs = 20_000): Promise<DaemonState> {
+export async function ensureDaemon(
+  port = DEFAULT_PORT, waitMs = 20_000, explicit = false,
+): Promise<DaemonState> {
   // 旧进程可能刚被 stop 掉(restart 场景),这时才轮到把旧目录的 sessions.json 搬上来。
   migrateLegacyStateDir();
   const existing = readState();
   if (existing && (await checkHealth(existing))) return existing;
   if (existing) clearState();
 
-  spawnDaemon(port);
+  spawnDaemon(port, explicit);
   return waitForDaemon(port, waitMs);
 }
 
@@ -278,14 +287,23 @@ function rotateLogIfLarge(path: string): void {
  * 但 daemon 模式下这样会让所有 console.error/log 静默消失 ——
  * 排查 TUI 启动超时这类问题时无从下手。改成落盘到数据目录下的
  * daemon.log(测试用独立 SYNAPSE_DATA_DIR 时也一并隔离)。
+ *
+ * explicit 为假(默认端口)时不把 PORT 塞进子进程环境 —— 子进程据此
+ * 判定 PORT_EXPLICIT=false,撞见占用会递增重试;塞了 PORT 就等于替
+ * 用户「显式指定」了端口,子进程一撞见占用就直接退出,ensureDaemon
+ * 只会看到「启动超时」,查不出真实原因(见 ensureDaemon 注释)。
  */
-function spawnDaemon(port: number): void {
+function spawnDaemon(port: number, explicit: boolean): void {
   mkdirSync(SYNAPSE_DIR, { recursive: true, mode: 0o700 });
   const logPath = join(SYNAPSE_DIR, 'daemon.log');
   rotateLogIfLarge(logPath);
   // 启动横幅会把 token 明文拼进 URL 打印(见 server.ts)—— 日志文件
   // 因此等价于存了一份凭据副本,权限必须跟 token/sessions.json 一样收紧。
   const logFd = openSync(logPath, 'a', 0o600);
+
+  const env: NodeJS.ProcessEnv = { ...process.env, SYNAPSE_DAEMON: '1' };
+  if (explicit) env.PORT = String(port);
+  else delete env.PORT; // 继承自父进程 shell 的 PORT 也不该悄悄冒充「用户显式指定」
 
   const child = spawn(
     process.execPath,
@@ -294,7 +312,7 @@ function spawnDaemon(port: number): void {
       cwd: ROOT,
       detached: true,
       stdio: ['ignore', logFd, logFd],
-      env: { ...process.env, SYNAPSE_DAEMON: '1', PORT: String(port) },
+      env,
     },
   );
   child.unref();

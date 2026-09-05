@@ -171,3 +171,13 @@ stream-json 子 agent 不受影响 —— 那条路径 claude headless 跑,没�
 同一类坑「服务端归约与前端增量必须对齐」是「两处状态,一份逻辑,忘了同步改」;这次是「一份逻辑,两处状态,回调对象却只认一个」——都属于「共享一段行为时,凡是隐式绑定到某个具体调用方的部分都要显式化」。
 
 修正:`wireProcs(root, d, rerender)` 加第三个参数,由调用方传入自己的重绘函数(会话视图传 `renderDetail`,任务视图传 `renderTaskDetail`)。判断一个函数能不能跨视图复用,不能只看它是否读了外部状态,还要看它内部有没有直接点名调用别的顶层函数。
+
+## `ensureDaemon` 不能靠子进程「有没有 PORT 环境变量」反推「用户是否显式指定端口」
+
+锚点:`daemon.ts` `ensureDaemon`/`spawnDaemon`,`server.ts` 的 `PORT_EXPLICIT` 判断,`bin/synapse.ts` `parseArgv`。
+
+`server.ts` 用 `process.env.PORT != null` 判断「用户是否显式指定了端口」,据此决定撞见 `EADDRINUSE` 时能不能递增重试(显式指定就不重试,直接报错 —— 见文件内注释「显式指定的端口悄悄改道只会让人对着旧地址干等」,这个设计取舍本身没问题)。但 `spawnDaemon` 起子进程时,不论调用方给没给端口,一律 `env: { ...process.env, PORT: String(port) }`——子进程永远能看到 `PORT`,`PORT_EXPLICIT` 因此永远判成 `true`。
+
+后果:`ensureDaemon(DEFAULT_PORT)`(没人显式指定,只是用了默认值)在默认端口被残留进程占用时,子进程一启动就因为「显式端口冲突」直接 `exit(1)`,不会递增重试;父进程 `waitForDaemon` 读不到状态文件,只会报「后端启动超时」,看不出真实原因(得翻 `daemon.log` 才看得到「端口已被占用」那行)。反复重试 `synapse daemon start` 会在不同端口上堆出多个互不知道对方存在的僵尸 daemon —— 这才是生产环境里一度同时有 7+ 个 `backend/server.ts` 进程分挂在 47100/47101/4732x 等端口的根因,不是"端口占用后自动换端口"这个设计本身的问题,而是"要不要重试"这个语义在传递链路上丢失、被子进程的环境变量副作用悄悄改写了。
+
+`port` 数值本身不能承担这个判断:用户完全可能 `--port 47100` 显式撞上默认值,不能靠"port == DEFAULT_PORT"反推「非显式」。必须有一个独立的布尔量全程显式传递:`parseArgv` 返回 `portExplicit`(命令行 `--port` 或调用方 shell 里的 `PORT` 环境变量出现过)→ `ensureDaemon(port, waitMs, explicit)` → `spawnDaemon(port, explicit)`,只有 `explicit` 为真才把 `PORT` 塞进子进程 env;`daemon restart` 额外把「取自上次实际监听端口(`prev.port`)」也算作 explicit —— 那是要求精确落回同一端口,不能让它再递增漂移。
