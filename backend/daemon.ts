@@ -175,8 +175,22 @@ export function readState(): DaemonState | null {
  * 是否还活着」的判定依据。restart 场景下旧进程退出时会调这个函数清场,不留
  * token 的话下次启动只能重新生成,用户手里的链接(书签、浏览器历史)全部
  * 失效。见 readOrCreateToken() —— 新进程启动时优先复用这份残留。
+ *
+ * onlyIfOwnedBy 给定时(server.ts shutdown() 传 process.pid)只在
+ * daemon.pid 里记的就是这个 PID 才真的删 —— 一个数据目录本该至多一个
+ * daemon,但曾经因为 bug(见 implementation-lessons.md「ensureDaemon
+ * 不能靠…反推」)在同一数据目录下堆出过多个实例;这些实例各自退出时如果
+ * 无差别 rm,谁后退出谁就把仍然健康的另一个实例的状态文件清掉 —— 状态
+ * 文件指向的进程明明还活着,`synapse daemon status/stop` 却认不出它,
+ * 只能手动把 pid/port 文件写回去。ensureDaemon 的调用路径(readState 后
+ * 决定要不要 clearState)不传这个参数,继续无条件清 —— 那些场景已经
+ * 确认过陈旧或即将被同 PID 的新状态覆盖,不存在"清错别人"的风险。
  */
-export function clearState(): void {
+export function clearState(onlyIfOwnedBy?: number): void {
+  if (onlyIfOwnedBy != null) {
+    const current = readState();
+    if (current && current.pid !== onlyIfOwnedBy) return;
+  }
   for (const f of ['daemon.pid', 'port']) {
     rmSync(join(SYNAPSE_DIR, f), { force: true });
   }

@@ -943,7 +943,10 @@ listenWithRetry(PORT, PORT_EXPLICIT ? 0 : MAX_PORT_TRIES);
 async function shutdown(): Promise<void> {
   console.log('\n正在关闭...');
   stopLivenessWatch();
-  clearState();
+  // 只清自己名下的状态 —— 同一数据目录曾经因为 bug 堆出过多个实例(见
+  // daemon.ts clearState 注释),无差别清会把仍然健康的别的实例的
+  // daemon.pid/port 也删掉,状态文件指向的进程明明还活着却查无此地址。
+  clearState(process.pid);
   permissions.drain();
   // stopAll 而非 closeAll —— 会话记录要留着,下次启动时左栏仍能看到(持久化的意义)。
   await manager.stopAll();

@@ -181,3 +181,13 @@ stream-json 子 agent 不受影响 —— 那条路径 claude headless 跑,没�
 后果:`ensureDaemon(DEFAULT_PORT)`(没人显式指定,只是用了默认值)在默认端口被残留进程占用时,子进程一启动就因为「显式端口冲突」直接 `exit(1)`,不会递增重试;父进程 `waitForDaemon` 读不到状态文件,只会报「后端启动超时」,看不出真实原因(得翻 `daemon.log` 才看得到「端口已被占用」那行)。反复重试 `synapse daemon start` 会在不同端口上堆出多个互不知道对方存在的僵尸 daemon —— 这才是生产环境里一度同时有 7+ 个 `backend/server.ts` 进程分挂在 47100/47101/4732x 等端口的根因,不是"端口占用后自动换端口"这个设计本身的问题,而是"要不要重试"这个语义在传递链路上丢失、被子进程的环境变量副作用悄悄改写了。
 
 `port` 数值本身不能承担这个判断:用户完全可能 `--port 47100` 显式撞上默认值,不能靠"port == DEFAULT_PORT"反推「非显式」。必须有一个独立的布尔量全程显式传递:`parseArgv` 返回 `portExplicit`(命令行 `--port` 或调用方 shell 里的 `PORT` 环境变量出现过)→ `ensureDaemon(port, waitMs, explicit)` → `spawnDaemon(port, explicit)`,只有 `explicit` 为真才把 `PORT` 塞进子进程 env;`daemon restart` 额外把「取自上次实际监听端口(`prev.port`)」也算作 explicit —— 那是要求精确落回同一端口,不能让它再递增漂移。
+
+## `clearState()` 无差别清场,会误删「不是自己」的 daemon 状态
+
+锚点:`daemon.ts` `clearState`,`server.ts` `shutdown()`。
+
+上一条 bug(端口递增重试失效)在修复前已经造成过一批同数据目录、不同端口共存的僵尸 daemon。人工排查后逐个 `kill -TERM` 清理这批僵尸时,其中一个的 `shutdown()` 无条件调用了 `clearState()`,删掉了 `daemon.pid`/`port` —— 而这两个文件当时记的其实是另一个仍然健康在跑的实例(47101)。`synapse daemon status` 随即查无此地址,判成"本就没在跑",而那个实例其实一直存活、网页会话完全没受影响,只是状态文件被指错了对象。
+
+`clearState()` 从设计上没有校验「daemon.pid 里记的是不是我自己」—— 一个数据目录本该至多一个 daemon(§设计前提),`shutdown()` 里无脑清所以从没考虑过"清到别人"这种情况;但前一条 bug 已经证明这个前提在实际运行中被破坏过,防御就不能只靠"不会有第二个实例"这个假设。
+
+修正:`clearState(onlyIfOwnedBy?)` 加可选参数,给了就先 `readState()` 比对 `pid`,不是自己才真的删;`shutdown()` 传 `process.pid`。`ensureDaemon`/`stopDaemon` 里的 `clearState()` 调用点不传 —— 那两处是「调用方确认了 `readState()` 读到的记录已经陈旧/进程已死」才清,清的就是读到的那份记录本身,不存在指错对象的问题,只有「进程在退出时清全局状态」这种自己-其他不对称的场景才需要这层校验。
