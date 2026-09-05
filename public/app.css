@@ -624,7 +624,14 @@ textarea:focus { outline: 2px solid var(--blue); outline-offset: -1px; backgroun
   font-weight: 700; color: var(--ink-3); margin-right: 6px;
   font-size: 11px; text-transform: uppercase; letter-spacing: .03em;
 }
+/* 任务详情 tab 栏 —— 视觉复用会话视图的 .tabs/.tab,放在 td-head 下方 */
+.td-tabbar {
+  display: flex; gap: 2px; padding: 3px; background: rgba(0,0,0,.05);
+  border-radius: 9px; margin: 12px 22px 0; width: fit-content; flex: none;
+}
 .td-body { overflow-y: auto; padding: 16px 22px 30px; display: grid; gap: 14px; }
+/* 对话 tab:pending 卡片/空态与 .td-body 的 grid gap 对齐,turns 内部自带间距 */
+.td-chat { display: grid; gap: 14px; }
 .td-agents, .td-timeline {
   background: var(--surface); border: 1px solid var(--hair); border-radius: 10px; padding: 14px;
 }
@@ -642,21 +649,35 @@ textarea:focus { outline: 2px solid var(--blue); outline-offset: -1px; backgroun
 
 .td-sect-head { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 12px; }
 .td-sect-head h3, .td-timeline h3 { margin: 0; font-size: 14px; }
-.bind-row { margin-left: auto; display: flex; gap: 6px; flex-wrap: wrap; }
-.bind-row select {
-  border: 1px solid var(--hair); background: var(--surface); border-radius: 7px;
-  padding: 4px 8px; font: 12px var(--sans); color: var(--ink); max-width: 240px;
-}
+/* 任务流标题兼折叠触发区 —— 数字徽标视觉同 .tab .n,disclosure 三角靠
+   rotate 切横竖表达开合,没有动画过渡(项目里折叠态一律直接切换,不做补间)。 */
+.td-flow-toggle { display: flex; align-items: center; gap: 6px; cursor: pointer; user-select: none; }
+.td-flow-toggle .n { color: var(--ink-3); font-size: 12px; font-weight: 400; }
+.td-flow-toggle .disclosure { color: var(--ink-3); font-size: 10px; margin-left: auto; }
+.td-flow-toggle .disclosure.open { transform: rotate(90deg); }
+/* 「启动子 agent」是主操作(按钮),「绑定已有会话」是弱化的次要入口(文字链接),
+   点开才弹 modal —— 视觉上不与主操作平级,呼应它在语义上也是次要补救路径。 */
+.bind-row { margin-left: auto; display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
+.bind-row a { font: 12px var(--sans); color: var(--ink-3); cursor: pointer; white-space: nowrap; }
+.bind-row a:hover { color: var(--ink); text-decoration: underline; }
 
-.agent-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap: 10px; }
+/* agent 列表 —— 一行一个 agent,横向排布 transport/name/state/title/meta/actions,
+   而非卡片网格。Metadata tab 本身是单栏(将来还要跟对话 tab 并排收窄),
+   多列卡片网格在窄栏下会被压成一列纵向堆叠、单张卡片信息又纵向拉得很长;
+   list 天然一行到底,窄栏下只是 title 换行更早,不产生这种双重挤压。 */
+/* 外层 .td-agents 已经是带 border 的卡片容器(见上),这里不再重复加框,
+   只用行间 border-bottom 分隔;负 margin 把行拉伸到卡片的内边距边缘,
+   让分隔线通到底,而不是每行都比标题多缩进一截。 */
+.agent-grid { display: flex; flex-direction: column; margin: 0 -14px; }
 .agent {
-  border: 1px solid var(--hair); border-radius: 9px; padding: 12px;
-  display: flex; flex-direction: column; gap: 9px; background: var(--surface);
+  padding: 10px 14px; display: flex; align-items: center; gap: 14px;
+  background: var(--surface); flex-wrap: wrap; border-bottom: 1px solid var(--hair-soft);
 }
-.agent.primary-agent { border-color: rgba(52,168,83,.32); background: linear-gradient(180deg, var(--green-soft), #fff 55%); }
-.agent.waiting { border-color: rgba(184,134,11,.35); background: linear-gradient(180deg, var(--amber-soft), #fff 52%); }
-.agent-top { display: grid; grid-template-columns: auto minmax(0,1fr) auto; align-items: center; gap: 7px; }
-.agent-top strong { font-size: 12.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.agent:last-child { border-bottom: none; }
+.agent.primary-agent { background: linear-gradient(180deg, var(--green-soft), #fff 65%); }
+.agent.waiting { background: linear-gradient(180deg, var(--amber-soft), #fff 60%); }
+.agent-top { display: flex; align-items: center; gap: 7px; flex: none; }
+.agent-top strong { font-size: 12.5px; white-space: nowrap; }
 .transport { font: 10px var(--mono); text-transform: uppercase; border-radius: 4px; padding: 1px 5px; }
 .transport.tmux { background: var(--green-soft); color: var(--green); }
 .transport.json { background: var(--blue-soft); color: var(--blue); }
@@ -665,12 +686,13 @@ textarea:focus { outline: 2px solid var(--blue); outline-offset: -1px; backgroun
 .agent-state.done { background: var(--green-soft); color: var(--green); }
 .agent-state.wait { background: var(--amber-soft); color: var(--amber); }
 .agent-state.idle { background: var(--hair-soft); color: var(--ink-2); }
-.agent p { margin: 0; font-size: 12.5px; color: var(--ink-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.approval-line { font-size: 12px; color: var(--amber); background: var(--amber-soft); border-radius: 6px; padding: 7px 8px; }
-.agent footer { display: flex; flex-direction: column; align-items: flex-start; gap: 8px; }
-.agent-meta { color: var(--ink-3); font: 11px var(--mono); }
+/* title(p) + ctx/cost 挤在中间这一段,占满行内剩余空间,收窄时先於两侧信息换行 */
+.agent-mid { display: flex; align-items: baseline; gap: 10px; flex: 1 1 160px; min-width: 0; }
+.agent-mid p { margin: 0; font-size: 12.5px; color: var(--ink-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1 1 auto; min-width: 0; }
+.approval-line { font-size: 12px; color: var(--amber); background: var(--amber-soft); border-radius: 6px; padding: 3px 8px; flex: none; }
+.agent-meta { color: var(--ink-3); font: 11px var(--mono); flex: none; }
 /* 一行:主操作是按钮,attach/停止/解绑是弱化的文字链接 */
-.agent-acts { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.agent-acts { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; flex: none; margin-left: auto; }
 .agent-acts a {
   font: 12px var(--sans); color: var(--ink-3); cursor: pointer; white-space: nowrap;
 }

@@ -161,3 +161,13 @@ CLI 把中断写成一条 `type: "user"` 消息,`content` 是纯文本块(`[Requ
 2. `#waitReady` 的信任框兜底原本发裸 `Enter`(选中默认项)。正常路径 `ensureTrusted` 预置信任、根本走不到这里,但真走到了(`~/.claude.json` 不可写等)裸 Enter 会选「No, exit」。改成先 `Down` 再 `Enter`,移到「Yes, I trust」。
 
 stream-json 子 agent 不受影响 —— 那条路径 claude headless 跑,没有信任 TUI。
+
+## 跨视图复用渲染函数,重绘入口不能硬编码
+
+锚点:`public/app.js` `wireProcs`,任务详情「对话」tab(`renderTaskChatTab`)复用会话视图的 `renderTurns`/`wireProcs`。
+
+任务详情加「对话」tab 前,`renderTurns`/`approvalCard`/`wireApprovals` 已经是参数化的纯函数(不读 `state.detail`),看起来能直接搬去任务视图复用。但 `wireProcs` 里点击「N 步」展开/收起的回调原样写死调用 `renderDetail()`——那是会话视图专属的重绘入口,任务详情此时的 DOM 挂在 `#colDetail` 而非 `#body`,点了要么无效要么把内容渲染进错误的容器。
+
+同一类坑「服务端归约与前端增量必须对齐」是「两处状态,一份逻辑,忘了同步改」;这次是「一份逻辑,两处状态,回调对象却只认一个」——都属于「共享一段行为时,凡是隐式绑定到某个具体调用方的部分都要显式化」。
+
+修正:`wireProcs(root, d, rerender)` 加第三个参数,由调用方传入自己的重绘函数(会话视图传 `renderDetail`,任务视图传 `renderTaskDetail`)。判断一个函数能不能跨视图复用,不能只看它是否读了外部状态,还要看它内部有没有直接点名调用别的顶层函数。

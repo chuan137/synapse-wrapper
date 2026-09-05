@@ -371,7 +371,12 @@ onEvent(fn)  订阅事件流
 
 左上角切换两个模式,偏好存 localStorage:
 
-- **任务**(默认)— 项目 / 任务 / 任务详情三栏。左栏(复用 aside)列项目,带任务数、运行中 agent 数、待批准数;中栏列任务,带状态点、agent 数、待批准数;右栏是任务详情:头部(标题 + 状态 + 编辑,目标 / 验收作副标题一行);无活跃主 agent 时一块「开始任务」主操作区(启动主 agent);Agents 区(主 agent 卡片排在子 agent 前,transport / state / context / cost / pending,主 agent 绿底,自建 tmux 主 agent 卡片带 attach 动作);任务流事件(newest-first)。项目按 name `localeCompare`、任务按 `createdAt` 固定排序,不随状态跳动(理由见 `notes/implementation-lessons.md`「左栏排序固定」)。交互:创建 / 编辑任务、绑定已有会话为主/子 agent、解绑(不关会话)、点 agent 卡片「打开会话」跳到会话模式的该会话详情。任务流首次拉取(`GET /api/tasks/:id`)与 WS 增量(`task_event` 消息)push 进同一个 `events` 数组、同一套渲染(「服务端归约与前端增量必须对齐」的老问题,见 `notes/implementation-lessons.md`)。
+- **任务**(默认)— 项目 / 任务 / 任务详情三栏。左栏(复用 aside)列项目,带任务数、运行中 agent 数、待批准数;中栏列任务,带状态点、agent 数、待批准数;右栏是任务详情:头部只留标题 + 状态 + 编辑,下接三个 tab(`state.taskTab`,切任务重置为默认值),不再是早期版本的纵向堆叠、目标/验收也不再常驻头部:
+    - **对话**(默认)— 主 agent 会话的完整对话时间线,与会话视图「对话」页签同一套降噪规则(轮次分组、进程折叠,见下方「对话页签的降噪」),复用同一份 `renderTurns`/`reduceSessionEvent` 归约,不各写一份。没有活跃主 agent 时,这里显示「开始任务」主操作区(启动主 agent);有主 agent 但会话详情还没异步拉回来时给加载态。默认不 autostart 主 agent —— 唯一入口是这块的「▶ 启动主 agent」按钮,点击后走 §5.2 的预检对话框。
+    - **Metadata** — 目标 / 验收(原头部副标题搬过来,未填写时灰字占位)、Agents 区(主 agent 卡片排在子 agent 前,transport / state / context / cost / pending,主 agent 绿底,自建 tmux 主 agent 卡片带 attach 动作,视觉是发丝线分隔的 list 而非卡片网格,窄栏下不会被挤成多列)、任务流事件(newest-first,`state.taskFlowExpanded` 控制默认折叠 —— 低频追溯信息不常驻占屏幕,点标题展开)。任务流首次拉取(`GET /api/tasks/:id`)与 WS 增量(`task_event` 消息)push 进同一个 `events` 数组、同一套渲染(「服务端归约与前端增量必须对齐」的老问题,见 `notes/implementation-lessons.md`)。
+    - **Artifacts** — 同会话视图的 Artifacts 页签,**后端采集未实现**,占位空态(见 §7)。
+
+    项目按 name `localeCompare`、任务按 `createdAt` 固定排序,不随状态跳动(理由见 `notes/implementation-lessons.md`「左栏排序固定」)。交互:创建 / 编辑任务、Metadata tab 里「启动子 agent」(主操作,过渡期手动通道 —— 正式路径是主 agent 调度,见 §1.5)、「绑定已有会话…」(弱化的文字链接,点开弹 popup 选会话与角色,默认 main;收进 popup 而非跟主操作并排常驻,避免把「手动挑会话认领成子 agent」暗示成常规流程)、解绑(不关会话)、点 agent 卡片「打开会话」跳到会话模式的该会话详情。
   - **未绑定会话区。** `synapse` 起的 tmux 会话进了 `SessionManager` 但不会自动成为任务 —— 若只渲染有 binding 的 agent,这些会话在任务视图里完全不可见。故中栏任务列表上方单列一区:属于当前项目 `workspaceRoots`、`state !== 'exited'`、且无 active binding 的会话,由 `GET /api/projects/:id/tasks` 的 `unboundSessions` 字段给出(服务端按 binding 算,前端无从本地推导 —— 新会话出现或 tmux 会话 `exited` 时前端重取该接口)。每行一个「转为任务」按钮,调 `POST /api/tasks/from-session`:以会话 `title || name` 建任务、立即把该会话挂为 main agent,一步到位。点会话行本身跳到会话模式查看。
 - **会话** — 下面描述的原有两层结构,能力不变。
 

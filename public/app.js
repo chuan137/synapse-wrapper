@@ -41,7 +41,13 @@ const state = {
   taskList: [],          // 当前 project 的任务列表(带聚合)
   unboundSessions: [],   // 当前 project 工作区下、未绑定任何任务的活跃会话(synapse 起的 tmux 会话主要落这里)
   taskId: null,          // 当前打开的任务
-  taskDetail: null,      // GET /api/tasks/:id
+  taskDetail: null,      // GET /api/tasks/:id,外加下面两个前端专用字段(不落盘、不经服务端):
+                          //   .agentTimeline  主 agent 会话详情(GET /api/sessions/:localId 的结果,
+                          //                    形状同 state.detail,供「对话」tab 复用 reduceSessionEvent)
+                          //   .agentTimeline 为 null 表示当前任务没有活跃主 agent,或还没加载完
+  taskTab: 'chat',        // 任务详情 tab:chat(默认)| meta | artifacts
+  taskFlowExpanded: false, // Metadata tab 里任务流事件默认折叠,低频信息不占屏幕
+  taskChatPinBottom: false, // 下次任务详情「对话」tab 渲染是否强制贴底,语义同会话视图 state.pinBottom
   taskError: '',         // 最近一次任务操作的错误(409/400/404 等),渲染在详情顶部
   draftQueue: new Map(), // localId -> string[],会话忙碌时攒的待发 prompt(纯前端,不持久化)
   pinBottom: false,      // 下次 renderDetail 是否无条件贴底(切会话/切页签/刚发消息)
@@ -226,6 +232,7 @@ function connect() {
 
       case 'session_event':
         onSessionEvent(m.localId, m.event);
+        onTaskAgentEvent(m.localId, m.event);
         break;
 
       case 'approval_request':
@@ -245,6 +252,11 @@ function connect() {
           // 自己刚发的消息,不管发送前滚到哪都跳回底部去看它。
           if (state.view === m.localId) state.pinBottom = true;
           if (state.tab === 'chat') renderBody();
+        }
+        if (state.taskDetail?.agentTimeline?.localId === m.localId) {
+          state.taskDetail.agentTimeline.timeline.push({ kind: 'user', text: m.text, at: Date.now() });
+          state.taskChatPinBottom = true;
+          renderTaskDetail();
         }
         break;
 
@@ -270,7 +282,19 @@ function connect() {
 function onSessionEvent(localId, ev) {
   const d = state.detail;
   if (!d || d.localId !== localId) return;
+  reduceSessionEvent(d, ev);
+  renderBody();
+  renderTabs();
+}
 
+/**
+ * 把一条 session_event 归约进会话详情对象 d(timeline/files/todos/…)。
+ * 会话视图(state.detail)与任务视图对话 tab(taskDetail.agentTimeline)
+ * 是同一份 detail 形状(见 navigate() 的初始化字段),共用这一套归约,
+ * 不各写一份、避免两处行为分叉。纯变更 d,不做任何渲染 —— 渲染由调用方按
+ * 自己的场景决定(会话视图 renderBody+renderTabs,任务视图 renderTaskDetail)。
+ */
+function reduceSessionEvent(d, ev) {
   switch (ev.kind) {
     // 网页自己发的消息走独立的 user_message 通知(见上面的 case),这里
     // 只处理终端里绕开网页直接敲的下一轮 prompt —— 不接的话新一轮内容
@@ -359,8 +383,21 @@ function onSessionEvent(localId, ev) {
   // TodoWrite 数据时才用 tasks Map 兜底(不能靠 d.todos.length 判断 ——
   // tasks 场景下上一次同步已经把它填成非空,length 再也不会掉回 0)。
   if (ev.name !== 'TodoWrite' && d.tasks.size) d.todos = [...d.tasks.values()];
-  renderBody();
-  renderTabs();
+}
+
+/**
+ * 任务详情「对话」tab 的增量更新 —— 只在当前打开的任务里,该事件所属会话
+ * 正是已加载的主 agent(agentTimeline.localId 由 loadTaskDetail 拉取时打上)
+ * 才归约;否则任务详情压根没订阅这条会话,忽略。会话视图与任务视图各自
+ * 独立判断是否命中,同一条 session_event 可能被两边同时接住(用户开着任务
+ * 详情的同时又在会话视图看同一个会话),互不影响。
+ */
+function onTaskAgentEvent(localId, ev) {
+  const at = state.taskDetail?.agentTimeline;
+  if (!at || at.localId !== localId) return;
+  reduceSessionEvent(at, ev);
+  state.taskChatPinBottom = true;
+  renderTaskDetail();
 }
 
 /**
@@ -1078,18 +1115,22 @@ function renderDetail() {
   $('body').innerHTML = html;
   wireApprovals($('body'));
   wireStallNotice($('body'));
-  if (state.tab === 'chat') { wireProcs($('body'), d); wireDraftQueue($('body')); }
+  if (state.tab === 'chat') { wireProcs($('body'), d, renderDetail); wireDraftQueue($('body')); }
   if (state.tab === 'chat' && wasBottom) $('body').scrollTop = $('body').scrollHeight;
 }
 
-function wireProcs(root, d) {
+/**
+ * rerender 由调用方传入 —— 会话视图(renderDetail)与任务视图对话 tab
+ * (renderTaskDetail)是两套不同的重绘入口,写死一个会把另一边点错地方。
+ */
+function wireProcs(root, d, rerender) {
   // .proc-sum.live(进行中轮次)没有 data-turn、也没有对应的 .proc 可展开,
   // 排除在外,否则点击会把 NaN 塞进 expandedTurns。
   for (const el of root.querySelectorAll('.proc-sum:not(.live)')) {
     el.onclick = () => {
       const i = Number(el.dataset.turn);
       if (d.expandedTurns.has(i)) d.expandedTurns.delete(i); else d.expandedTurns.add(i);
-      renderDetail();
+      rerender();
     };
   }
 }
@@ -1157,7 +1198,38 @@ async function loadTaskDetail(taskId) {
     state.taskDetail = await api(`/api/tasks/${taskId}`);
   } catch {
     state.taskDetail = null;
+    renderTaskDetail();
+    return;
   }
+  renderTaskDetail(); // 先出 Metadata/Agents,「对话」tab 的会话详情单独异步补,不拖慢首屏
+  await loadTaskAgentTimeline();
+}
+
+/**
+ * 为「对话」tab 拉取主 agent 的完整会话详情,补进 state.taskDetail.agentTimeline。
+ * 没有活跃主 agent(尚未启动/已解绑)时留空,由 renderTaskDetail 走「开始任务」空态。
+ * 与 navigate() 拉会话详情用的是同一个端点,字段初始化对齐(见其注释)—— 这样
+ * 才能让 onTaskAgentEvent 里的 reduceSessionEvent 与会话视图共用同一套归约。
+ */
+async function loadTaskAgentTimeline() {
+  const d = state.taskDetail;
+  if (!d) return;
+  const mainAgent = d.agents.find((a) => a.binding.role === 'main' && a.binding.endedAt === null);
+  const localId = mainAgent?.session?.localId;
+  if (!localId) { d.agentTimeline = null; renderTaskDetail(); return; }
+  try {
+    const detail = await api(`/api/sessions/${localId}`);
+    // 拉取期间用户可能已经切到别的任务 —— 结果落后就丢弃,不要污染新任务的详情。
+    if (state.taskDetail !== d) return;
+    detail.expandedTurns = new Set();
+    detail.settledTurns = new Set();
+    detail.tasks = new Map(detail.todos.filter((t) => t.id).map((t) => [t.id, t]));
+    detail.pendingTaskCreates = new Map();
+    d.agentTimeline = detail;
+  } catch {
+    if (state.taskDetail === d) d.agentTimeline = null;
+  }
+  state.taskChatPinBottom = true;
   renderTaskDetail();
 }
 
@@ -1174,6 +1246,8 @@ function selectTask(id) {
   state.taskId = id;
   state.taskDetail = null;
   state.taskError = '';
+  state.taskTab = 'chat'; // 切任务回到默认 tab,不带上一个任务停留的 tab
+  state.taskFlowExpanded = false;
   renderTaskList();
   loadTaskDetail(id);
 }
@@ -1300,16 +1374,10 @@ function renderTaskDetail() {
       state.taskId ? '加载中…' : '从左侧选一个任务查看详情。'}</div>`;
     return;
   }
-  const { task, project, agents, events } = d;
+  const { task, project, agents } = d;
   const st = task.status;
   const errBar = state.taskError
     ? `<div class="td-err">${esc(state.taskError)}<button id="tdErrX" title="关闭">✕</button></div>` : '';
-
-  // 目标 / 验收降为头部副标题 —— 它们是任务的定义,不是要用户反复读的一块内容。
-  const sub = (label, val) => val
-    ? `<span class="td-sub-item"><b>${label}</b>${esc(val)}</span>`
-    : `<span class="td-sub-item muted"><b>${label}</b>未填写</span>`;
-  const subhead = `<div class="td-subhead">${sub('目标', task.goal)}${sub('验收', task.acceptance)}</div>`;
 
   const mainAgent = agents.find((a) => a.binding.role === 'main' && a.binding.endedAt === null);
   const subAgents = agents.filter((a) => !(a.binding.role === 'main' && a.binding.endedAt === null));
@@ -1317,44 +1385,17 @@ function renderTaskDetail() {
   // 启动子 agent / 主 agent 的默认工作区:优先 project 的第一个 root。
   const defaultWs = project?.workspaceRoots?.[0] ?? '';
 
-  // 主操作区:没有主 agent 时,这是「开始任务」的入口 —— 起一个主 agent
-  // 去拆解、调度。有了主 agent 后收起,它的卡片在 Agents 区里。
-  const startBlock = mainAgent ? '' : `<div class="td-start">
-    <div class="td-start-copy">
-      <strong>开始任务</strong>
-      <p>启动一个主 agent —— 它确定 work dir、把任务拆成子任务、分派子 agent、跟踪进度。自己不改代码。</p>
-    </div>
-    <button class="btn pri lg" id="startMain">▶ 启动主 agent</button>
-  </div>`;
+  const tabDefs = [
+    ['chat', '对话'],
+    ['meta', 'Metadata'],
+    ['artifacts', 'Artifacts'],
+  ];
+  const tabBar = `<div class="td-tabbar">${tabDefs.map(([k, label]) =>
+    `<button class="tab ${state.taskTab === k ? 'on' : ''}" data-tt="${k}">${label}</button>`).join('')}</div>`;
 
-  const agentCards = subAgents.length || mainAgent
-    ? [...(mainAgent ? [mainAgent] : []), ...subAgents].map((a) => agentCard(a)).join('')
-    : `<div class="muted" style="padding:4px 0">还没有子 agent。「启动子 agent」在后台起一个,或「绑定已有会话」把手头的会话挂进来。</div>`;
-
-  const bindOpts = [...state.sessions.values()]
-    .filter((s) => s.state !== 'exited')
-    .map((s) => `<option value="${s.localId}">${esc(s.name)}${s.title ? ' · ' + esc(s.title) : ''} (${s.transport})</option>`)
-    .join('');
-
-  const agentsBlock = `<div class="td-agents">
-    <div class="td-sect-head"><h3>Agents</h3>
-      <div class="bind-row">
-        <button class="btn" id="startSub">启动子 agent</button>
-        <select id="bindSel"><option value="">绑定已有会话…</option>${bindOpts}</select>
-        <select id="bindRole"><option value="sub">子 agent</option><option value="main">主 agent</option></select>
-        <button class="btn" id="bindBtn">绑定</button>
-      </div>
-    </div>
-    <div class="agent-grid">${agentCards}</div>
-  </div>`;
-
-  const timeline = `<div class="td-timeline">
-    <h3>任务流</h3>
-    ${events.length ? `<ol>${events.slice().reverse().map((e) => `<li>
-      <time>${new Date(e.createdAt).toLocaleTimeString('zh', { hour: '2-digit', minute: '2-digit' })}</time>
-      <div><strong>${TASK_EVENT_LABEL[e.kind] ?? e.kind}</strong><p>${esc(e.message)}</p></div>
-    </li>`).join('')}</ol>` : '<p class="muted">还没有事件。</p>'}
-  </div>`;
+  const panel = state.taskTab === 'meta' ? renderTaskMetaTab(d, mainAgent, subAgents)
+    : state.taskTab === 'artifacts' ? renderTaskArtifactsTab()
+    : renderTaskChatTab(d, mainAgent);
 
   $('colDetail').innerHTML = `
     ${errBar}
@@ -1368,14 +1409,20 @@ function renderTaskDetail() {
           <button class="btn" id="editTask">编辑</button>
         </div>
       </div>
-      ${subhead}
     </div>
-    <div class="td-body">${startBlock}${agentsBlock}${timeline}</div>`;
+    ${tabBar}
+    <div class="td-body">${panel}</div>`;
 
   const errX = $('tdErrX');
   if (errX) errX.onclick = () => { state.taskError = ''; renderTaskDetail(); };
 
   const afterMutation = () => { state.taskError = ''; loadTaskDetail(task.id); loadTasks(state.taskProjectId); };
+
+  for (const el of $('colDetail').querySelectorAll('.td-tabbar .tab')) {
+    el.onclick = () => { state.taskTab = el.dataset.tt; state.taskChatPinBottom = true; renderTaskDetail(); };
+  }
+  const flowToggle = $('tdFlowToggle');
+  if (flowToggle) flowToggle.onclick = () => { state.taskFlowExpanded = !state.taskFlowExpanded; renderTaskDetail(); };
 
   $('tdStatus').onchange = async (e) => {
     try {
@@ -1384,18 +1431,12 @@ function renderTaskDetail() {
     } catch (err) { showTaskError(err.message); }
   };
   $('editTask').onclick = () => openEditTaskModal(task);
-  $('startSub').onclick = () => openStartAgentModal(task, project, defaultWs);
+  const startSubBtn = $('startSub');
+  if (startSubBtn) startSubBtn.onclick = () => openStartAgentModal(task, project, defaultWs);
   const startMainBtn = $('startMain');
   if (startMainBtn) startMainBtn.onclick = () => openStartMainAgentModal(task, project, defaultWs);
-  $('bindBtn').onclick = async () => {
-    const localId = $('bindSel').value;
-    const role = $('bindRole').value;
-    if (!localId) return;
-    try {
-      await api(`/api/tasks/${task.id}/agents`, { method: 'POST', body: JSON.stringify({ localId, role }) });
-      afterMutation();
-    } catch (err) { showTaskError(err.message); }
-  };
+  const openBindBtn = $('openBindModal');
+  if (openBindBtn) openBindBtn.onclick = () => openBindAgentModal(task);
   for (const el of $('colDetail').querySelectorAll('[data-open-session]')) {
     el.onclick = () => { switchMode('sessions'); navigate(el.dataset.openSession); };
   }
@@ -1430,11 +1471,98 @@ function renderTaskDetail() {
     };
   }
   // <a role="button"> 的次要操作:Enter / Space 也触发,补齐键盘可达性。
-  for (const el of $('colDetail').querySelectorAll('.agent-acts a[role="button"]')) {
+  for (const el of $('colDetail').querySelectorAll('.agent-acts a[role="button"], .bind-row a[role="button"]')) {
     el.onkeydown = (e) => {
       if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); el.click(); }
     };
   }
+
+  if (state.taskTab === 'chat') {
+    const chatBody = $('tdChatBody');
+    if (chatBody) {
+      const forceBottom = state.taskChatPinBottom;
+      state.taskChatPinBottom = false;
+      // 首次切进这个任务(或切换 tab)时无需比较滚动位置,直接贴底;
+      // 之后的增量重绘按「渲染前是否已在底部」决定,同 renderDetail() 的老逻辑。
+      wireProcs(chatBody, d.agentTimeline, renderTaskDetail);
+      wireApprovals(chatBody);
+      if (forceBottom) chatBody.scrollTop = chatBody.scrollHeight;
+    }
+  }
+}
+
+/**
+ * 「对话」tab —— 展示主 agent 会话的完整对话时间线,复用会话视图的
+ * renderTurns/wireProcs/approvalCard(均已参数化,不依赖 state.detail)。
+ * 没有主 agent 时给「开始任务」引导;有主 agent 但 agentTimeline 还没
+ * 拉回来(loadTaskAgentTimeline 是异步补的,见其注释)时给加载态。
+ */
+function renderTaskChatTab(d, mainAgent) {
+  if (!mainAgent) {
+    return `<div class="td-start">
+      <div class="td-start-copy">
+        <strong>开始任务</strong>
+        <p>启动一个主 agent —— 它确定 work dir、把任务拆成子任务、分派子 agent、跟踪进度。自己不改代码。</p>
+      </div>
+      <button class="btn pri lg" id="startMain">▶ 启动主 agent</button>
+    </div>`;
+  }
+  const at = d.agentTimeline;
+  if (!at) return `<div class="td-empty">加载对话…</div>`;
+
+  const pend = pendingFor(at.localId).sort((a, b) => a.requestedAt - b.requestedAt);
+  const pendCards = pend.map((a) => approvalCard(a, false)).join('');
+  const turns = at.timeline.length ? renderTurns(at)
+    : (!pend.length ? `<div class="empty">还没有对话。</div>` : '');
+  return `<div class="td-chat" id="tdChatBody">${turns}${pendCards}</div>`;
+}
+
+/** 「Metadata」tab —— agent list + 任务流事件,原纵向堆叠布局原样收纳进来。 */
+function renderTaskMetaTab(d, mainAgent, subAgents) {
+  const { task, events } = d;
+
+  // 目标 / 验收:从头部搬进来,任务的定义性字段跟 Agents/任务流一起归到 Metadata。
+  const sub = (label, val) => val
+    ? `<span class="td-sub-item"><b>${label}</b>${esc(val)}</span>`
+    : `<span class="td-sub-item muted"><b>${label}</b>未填写</span>`;
+  const goalBlock = `<div class="td-subhead">${sub('目标', task.goal)}${sub('验收', task.acceptance)}</div>`;
+
+  const agentCards = subAgents.length || mainAgent
+    ? [...(mainAgent ? [mainAgent] : []), ...subAgents].map((a) => agentCard(a)).join('')
+    : `<div class="muted" style="padding:4px 0">还没有子 agent。「启动子 agent」在后台起一个。</div>`;
+
+  // 「启动子 agent」是唯一的主操作 —— 正式路径是主 agent 调度子 agent(spec §1.5,
+  // 尚未落地),网页手动起子 agent 只是过渡期替代。「绑定已有会话」是次要的补救
+  // 操作(收编一个游离会话,常见场景是绑 main),收进 popup 而非跟主操作并排常驻,
+  // 避免让人误以为"手动挑一个会话认领成子 agent"是常规流程。
+  const agentsBlock = `<div class="td-agents">
+    <div class="td-sect-head"><h3>Agents</h3>
+      <div class="bind-row">
+        <button class="btn pri" id="startSub">启动子 agent</button>
+        <a role="button" tabindex="0" id="openBindModal">绑定已有会话…</a>
+      </div>
+    </div>
+    <div class="agent-grid">${agentCards}</div>
+  </div>`;
+
+  // 默认折叠 —— 任务流是低频、追溯用的信息,不该常驻占屏幕;标题本身就是
+  // 展开/收起的触发区,复用「N 步」折叠同一套「点标题切换」交互习惯。
+  const flowOpen = state.taskFlowExpanded;
+  const timeline = `<div class="td-timeline">
+    <h3 class="td-flow-toggle" id="tdFlowToggle">任务流${events.length ? `<span class="n">${events.length}</span>` : ''}
+      <span class="disclosure ${flowOpen ? 'open' : ''}">▸</span></h3>
+    ${flowOpen ? (events.length ? `<ol>${events.slice().reverse().map((e) => `<li>
+      <time>${new Date(e.createdAt).toLocaleTimeString('zh', { hour: '2-digit', minute: '2-digit' })}</time>
+      <div><strong>${TASK_EVENT_LABEL[e.kind] ?? e.kind}</strong><p>${esc(e.message)}</p></div>
+    </li>`).join('')}</ol>` : '<p class="muted">还没有事件。</p>') : ''}
+  </div>`;
+
+  return `${goalBlock}${agentsBlock}${timeline}`;
+}
+
+/** 「Artifacts」tab —— 后端采集未实现(spec §0.2/§7),占位空态与会话视图同款文案。 */
+function renderTaskArtifactsTab() {
+  return `<div class="td-empty">Artifacts 采集尚未实现。</div>`;
 }
 
 const TASK_EVENT_LABEL = {
@@ -1477,17 +1605,17 @@ function agentCard(a) {
       <strong>${b.role === 'main' ? '主 agent' : '子 agent'}${s ? ' · ' + esc(s.name) : ''}</strong>
       <span class="agent-state ${stateCls}">${stateLabel}</span>
     </div>
-    <p>${s && s.title ? esc(s.title) : (s ? esc(s.workspace) : '会话已不存在,可解绑')}</p>
-    ${pend}
-    <footer>
+    <div class="agent-mid">
+      <p>${s && s.title ? esc(s.title) : (s ? esc(s.workspace) : '会话已不存在,可解绑')}</p>
       ${(ctx || cost) ? `<span class="agent-meta">${[ctx, cost].filter(Boolean).join(' · ')}</span>` : ''}
-      <div class="agent-acts">
-        ${s ? `<button class="pri" data-open-session="${s.localId}">打开会话</button>` : ''}
-        ${ownTmux ? `<a role="button" tabindex="0" data-attach-tmux="${esc(s.tmuxName)}">attach</a>` : ''}
-        ${canStop ? `<a role="button" tabindex="0" title="终止进程,记录保留" data-stop-session="${s.localId}">停止</a>` : ''}
-        ${!ended ? `<a role="button" tabindex="0" title="不关会话" data-detach="${b.id}">解绑</a>` : ''}
-      </div>
-    </footer>
+    </div>
+    ${pend}
+    <div class="agent-acts">
+      ${s ? `<button class="pri" data-open-session="${s.localId}">打开会话</button>` : ''}
+      ${ownTmux ? `<a role="button" tabindex="0" data-attach-tmux="${esc(s.tmuxName)}">attach</a>` : ''}
+      ${canStop ? `<a role="button" tabindex="0" title="终止进程,记录保留" data-stop-session="${s.localId}">停止</a>` : ''}
+      ${!ended ? `<a role="button" tabindex="0" title="不关会话" data-detach="${b.id}">解绑</a>` : ''}
+    </div>
   </article>`;
 }
 
@@ -1671,6 +1799,59 @@ function openStartMainAgentModal(task, project, defaultWs) {
           model: bg.querySelector('#maModel').value || undefined,
         }),
       });
+      close();
+      loadTaskDetail(task.id);
+      loadTasks(state.taskProjectId);
+    } catch (e) {
+      err.textContent = e.message; err.style.display = 'block'; ok.disabled = false;
+    }
+  };
+}
+
+/**
+ * 「绑定已有会话」—— 次要的补救操作,收进 popup 而非跟「启动子 agent」并排
+ * 常驻(见 renderTaskMetaTab 的 agentsBlock 注释)。角色默认 main:收编一个
+ * 游离会话成为任务入口是常见场景(跟「转为任务」同一类操作);选 sub 时
+ * 给出提示,子 agent 的正式来路是主 agent 调度(spec §1.5),手动绑不相关
+ * 会话认领成子 agent 基本没有正当用途,不做成默认项。
+ */
+function openBindAgentModal(task) {
+  const bg = document.createElement('div');
+  bg.className = 'modal-bg';
+  const bindOpts = [...state.sessions.values()]
+    .filter((s) => s.state !== 'exited')
+    .map((s) => `<option value="${s.localId}">${esc(s.name)}${s.title ? ' · ' + esc(s.title) : ''} (${s.transport})</option>`)
+    .join('');
+  bg.innerHTML = `<div class="modal">
+    <h3>绑定已有会话</h3>
+    <p>把手头一个已经在跑的会话收编进这个任务,不新起进程。</p>
+    <label for="bmSel">会话</label>
+    <select id="bmSel"><option value="">选择会话…</option>${bindOpts}</select>
+    <label for="bmRole">角色</label>
+    <select id="bmRole">
+      <option value="main">主 agent —— 作为这个任务的入口</option>
+      <option value="sub">子 agent —— 正式路径应由主 agent 调度,这里是手动替代</option>
+    </select>
+    <div class="err" id="bmErr" style="display:none"></div>
+    <div class="modal-act">
+      <button class="btn" id="bmCancel">取消</button>
+      <button class="btn pri" id="bmOk">绑定</button>
+    </div>
+  </div>`;
+  document.body.append(bg);
+  const close = () => bg.remove();
+  bg.querySelector('#bmCancel').onclick = close;
+  bg.onclick = (e) => { if (e.target === bg) close(); };
+
+  bg.querySelector('#bmOk').onclick = async () => {
+    const localId = bg.querySelector('#bmSel').value;
+    const role = bg.querySelector('#bmRole').value;
+    const err = bg.querySelector('#bmErr');
+    if (!localId) { bg.querySelector('#bmSel').focus(); return; }
+    const ok = bg.querySelector('#bmOk');
+    ok.disabled = true;
+    try {
+      await api(`/api/tasks/${task.id}/agents`, { method: 'POST', body: JSON.stringify({ localId, role }) });
       close();
       loadTaskDetail(task.id);
       loadTasks(state.taskProjectId);
