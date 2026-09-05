@@ -35,7 +35,17 @@ export type SessionEvent =
   | { kind: 'context_window'; model: string; window: number }
   | { kind: 'turn_end'; result: string; costUsd?: number; interrupted?: boolean }
   | { kind: 'status'; state: 'starting' | 'ready' | 'busy' | 'exited'; detail?: string }
-  | { kind: 'error'; message: string };
+  /**
+   * `scope` 区分错误的归因对象,不区分不行 —— `start()`/重接管失败与某一次
+   * `send()` 注入失败是两件独立的事,但都只有一个 error kind,前端/#absorb
+   * 若不看来源,会把启动期的报错误判成"刚才那条消息没发出去"(见
+   * docs/notes/implementation-lessons.md「TUI 启动超时」条目)。
+   *   - 'send':某次 send() 触发的注入/写入失败,有一个未配对的 pendingTurn
+   *     等着被这次失败收回,前端应作为该轮"发送失败"提示。
+   *   - 'lifecycle':启动 / 重连 / 重接管过程中的问题,不对应任何具体的
+   *     发送动作,不该冲抵 pendingTurns,也不该被渲染成某一轮的发送失败。
+   */
+  | { kind: 'error'; message: string; scope: 'send' | 'lifecycle' };
 
 export type SessionEventHandler = (event: SessionEvent) => void;
 

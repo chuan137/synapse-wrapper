@@ -69,7 +69,9 @@ export class StreamJsonTransport extends EventEmitterBase implements SessionTran
     });
 
     proc.on('error', (err) => {
-      this.emit({ kind: 'error', message: `无法启动 claude: ${err.message}` });
+      // 启动期故障,不对应任何具体的 send() —— 用 'lifecycle',
+      // 语义与 tmuxTransport.ts 的启动超时报错一致(见 transport.ts scope 注释)。
+      this.emit({ kind: 'error', scope: 'lifecycle', message: `无法启动 claude: ${err.message}` });
     });
 
     this.emit({ kind: 'status', state: 'ready' });
@@ -167,7 +169,7 @@ export class StreamJsonTransport extends EventEmitterBase implements SessionTran
 
   send(text: string): void {
     if (!this.#proc?.stdin.writable) {
-      this.emit({ kind: 'error', message: '会话未就绪,消息未送达' });
+      this.emit({ kind: 'error', scope: 'send', message: '会话未就绪,消息未送达' });
       return;
     }
     const msg = {

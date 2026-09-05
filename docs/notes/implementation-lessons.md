@@ -191,3 +191,29 @@ stream-json 子 agent 不受影响 —— 那条路径 claude headless 跑,没�
 `clearState()` 从设计上没有校验「daemon.pid 里记的是不是我自己」—— 一个数据目录本该至多一个 daemon(§设计前提),`shutdown()` 里无脑清所以从没考虑过"清到别人"这种情况;但前一条 bug 已经证明这个前提在实际运行中被破坏过,防御就不能只靠"不会有第二个实例"这个假设。
 
 修正:`clearState(onlyIfOwnedBy?)` 加可选参数,给了就先 `readState()` 比对 `pid`,不是自己才真的删;`shutdown()` 传 `process.pid`。`ensureDaemon`/`stopDaemon` 里的 `clearState()` 调用点不传 —— 那两处是「调用方确认了 `readState()` 读到的记录已经陈旧/进程已死」才清,清的就是读到的那份记录本身,不存在指错对象的问题,只有「进程在退出时清全局状态」这种自己-其他不对称的场景才需要这层校验。
+
+## `ensureDaemon` 并发调用之间也要互斥,不能只修单次调用内部的逻辑
+
+锚点:`daemon.ts` `acquireLock`/`releaseLock`/`ensureDaemon`。
+
+前两条 bug 修完后(端口重试语义、`clearState` 所有权校验),单次 `ensureDaemon` 调用内部已经没有已知逻辑错误,但「判断没有健康实例 → `spawnDaemon`」这几行之间没有互斥:两次 `ensureDaemon`(典型触发路径——网页和终端几乎同时唤起 daemon)前后脚都读到「没有健康实例」,会各自 `spawnDaemon`;默认端口撞上后各自独立递增,双方都监听成功,`daemon.pid`/`port` 最后谁写入生效就显示谁,但两个进程其实都在跑。这是跟前两条同族但触发路径不同的问题:那两条是「单次调用内部」逻辑错误,这条是「多次调用之间」没有序列化。
+
+验证方法上踩了一个坑:一开始用「起 N 个并发进程各自调 `ensureDaemon`,比较返回的 `pid`/`port` 是否唯一」来验证,无锁版本却一直测不出问题。原因是这个判断本身不可靠 —— 所有并发进程读的是同一份 `daemon.pid`/`port` 文件,不管背后实际 spawn 出几个 `server.ts`,大家读到的都是**最后一次写入**的那份记录,天然看起来"唯一"。真正需要检查的是 `lsof -iTCP -sTCP:LISTEN` 或 `ps` 数出来的**实际监听进程数**——改用这个方法后,无锁版本在几轮测试里已经堆出 19 个孤儿 `server.ts`,分挂在 47100~47118 不同端口,没有一个被后续调用回收。教训:验证「是否只有一个实例」不能通过应用自己的状态文件去看,状态文件本身就是被怀疑对象,只能绕过它直接查系统级的进程/端口事实。
+
+修正:`ensureDaemon` 在「读状态判断」与「`spawnDaemon`」之间插入跨进程锁(`<数据目录>/daemon.lock`,`wx` 独占创建 + 内容记持锁 PID + 陈旧锁按 PID 存活性抢占)。拿到锁后重新 `readState`+`checkHealth` 一遍才决定要不要真的 `spawn` —— 单纯把判断串行化不够,还要在拿到锁的那一刻假设「等锁的时候别人可能已经启动完成」,否则退化成「谁先排到谁 spawn,后面全部再 spawn 一次」。
+
+## `start()` 与 `#inject` 共享同一个 `#waitReady` 单飞结果,error 事件却不分来源
+
+锚点:`tmuxTransport.ts` `#waitReady`/`startTimeoutEvent`/`#reportStartTimeout`/`#inject`,`sessionManager.ts` `#absorb` 的 `case 'error'`,`public/app.js` `reduceSessionEvent`/`renderTurns`。
+
+上面「就绪判定必须先清残留,超时不能当失败」那条修完后,`#inject` 超时会降级放行(pane 还在就照常注入,只 `console.error`),但 `start()` 超时仍然无条件 `emit error`。两者本该是独立的:`start()` 的探测是"启动/重接管期间确认一次 TUI 就绪",`#inject` 的探测是"这次 `send()` 能不能安全注入"。`#waitReady` 的 `#readyWaiter` 单飞缓存把这两件事焊在了一起——同一个 transport 实例上,谁先调用谁的探测结果被复用。
+
+`#reclaimTmuxSessions`(daemon 重启后重新接管 tmux 会话,见上一条)异步调用 `transport.start()`,期间用户对同一会话发消息会走 `send()` → `#inject()`,复用的正是 `start()` 那次仍在跑的探测。探测超时时:`#inject` 侧降级放行(消息其实送达),`start()` 侧照样 `emit error`——这条 error 经 `#absorb` 无条件 `pendingTurns--` 并广播给所有 WS 客户端,前端 `renderTurns` 按"最后一条 user 消息之后"的时间窗口无差别地把它当这一轮的失败原因,渲染成「⚠️ 发送失败」。用户看到的现象是**偶发的假失败提示,立刻重试就成功**——消息第一次其实就发出去了。
+
+两处都要修,缺一不行:只让 `start()` 降级会把真实的登录/信任提示卡死也悄悄咽掉(那种情况 pane 早已不在或者永远等不到 `❯`,是需要用户知道的);只加错误来源标记而不查 `alive()`,`start()` 该报的场景没变化,治标不治本。
+
+修正:
+- `SessionEvent` 的 `error` kind 加必填 `scope: 'send' | 'lifecycle'`——`send` 对应某次 `send()` 触发的注入失败,`lifecycle` 对应启动/重连期间、不冲抵任何具体发送的问题。`streamJson.ts` 的两处 `error` 也一并打上标签(`proc.on('error')` 是 `lifecycle`,`send()` 的 stdin 不可写是 `send`)。
+- `tmuxTransport.ts` 新增纯函数 `startTimeoutEvent(alive: boolean)`:`start()` 超时后先查 `alive()`,pane 还在只报一条 `scope:'lifecycle'` 的"启动确认超时"提示(不当发送失败);pane 真的不在了才是"启动失败",同样标 `lifecycle`。抽成纯函数是因为 `#reportStartTimeout` 本体依赖真实 tmux 且默认超时 45s,不适合单测,单测只覆盖"给定 alive 结果该产出哪种事件"这段判断本身(`tmuxTransport.test.ts`)。
+- `sessionManager.ts` `#absorb` 的 `case 'error'` 只在 `scope === 'send'` 时才 `pendingTurns--`——`lifecycle` 错误不消耗这个计数器,避免了"当前没有真正卡住的发送、却被一条无关的启动期报错误收"的错位。
+- `public/app.js` `reduceSessionEvent` 只把 `scope === 'send'` 的错误压进 `d.timeline`(会被 `renderTurns` 按时间窗口渲染成"发送失败");`lifecycle` 错误目前只 `console.warn`,不打断用户——真正的登录/信任提示卡住,用户重试发送时会以 `send` 错误的形式再次、且这次归因正确地出现。

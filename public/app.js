@@ -374,7 +374,19 @@ function reduceSessionEvent(d, ev) {
       // 后端已经把泄漏的 pendingTurns 收回、state 改回 ready(见
       // sessionManager.ts #absorb 的 case 'error' 注释),这里只负责
       // 让用户看到"刚才那次发送其实没成功",不必再去 tmux 才发现。
-      d.timeline.push({ kind: 'error', text: ev.message, at: Date.now() });
+      //
+      // 只有 scope 'send' 才落进 timeline —— renderTurns 按 user 消息切分
+      // turn,把 timeline 里的 error 项无差别地挂到"当前正打开的那个分组"
+      // 上;'lifecycle' 错误(start()/重接管失败等)不对应任何具体的发送
+      // 动作,一旦混进 timeline 就会被误标成"这一轮发送失败"(即使此刻
+      // 根本没有进行中的发送),见 implementation-lessons.md「TUI 启动超时」
+      // 条目。lifecycle 错误目前只打日志,不打断用户 —— 真正卡住的登录/
+      // 信任提示会在重试发送时以 send 错误的形式再次出现。
+      if (ev.scope === 'send') {
+        d.timeline.push({ kind: 'error', text: ev.message, at: Date.now() });
+      } else {
+        console.warn(`[session ${d.localId}] lifecycle error: ${ev.message}`);
+      }
       break;
   }
   // renderTodoPanel 只读 d.todos,Task* 分支只改了 d.tasks Map,

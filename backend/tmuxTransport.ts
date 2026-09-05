@@ -11,7 +11,7 @@ import { open, writeFile, unlink, readdir, stat, readFile, rename } from 'node:f
 import { join } from 'node:path';
 import { homedir, tmpdir } from 'node:os';
 import { randomUUID } from 'node:crypto';
-import { EventEmitterBase, type SessionTransport } from './transport.ts';
+import { EventEmitterBase, type SessionTransport, type SessionEvent } from './transport.ts';
 import { parseTranscriptLineMulti, encodeProjectDir } from './transcript.ts';
 
 const exec = promisify(execFile);
@@ -56,6 +56,27 @@ export function screenLooksReady(screen: string): boolean {
 /** 抓屏内容是否是工作区信任对话框(就绪判断之前要先识别,否则提示词会粘进对话框丢失)。 */
 export function screenIsTrustDialog(screen: string): boolean {
   return /trust this folder|trust the files|Security guide/i.test(screen);
+}
+
+/**
+ * `start()` 里 `#waitReady` 超时后该 emit 哪个事件 —— 抽成纯函数供单测覆盖
+ * (`#reportStartTimeout` 本体依赖真实 tmux `alive()`,45s 的默认超时也不
+ * 适合跑单测,这里只测"给定 alive 结果 → 该产出哪种事件"这段判断本身)。
+ *
+ * 超时不等于没起来:pane 还活着多半是输入框残留或抓屏一时不准(`#inject`
+ * 同一探测走的是降级放行,见其注释),此时报成"发送失败"是错误归因 ——
+ * 可能压根没有正在进行的发送。只有 pane 确实不在了才是真正值得打断用户的
+ * 故障。两个分支都用 scope:'lifecycle',不冲抵 pendingTurns、不会被前端
+ * 渲染成某一轮的"发送失败"(见 transport.ts SessionEvent.error 的注释)。
+ */
+export function startTimeoutEvent(alive: boolean): Extract<SessionEvent, { kind: 'error' }> {
+  return alive
+    ? {
+        kind: 'error',
+        scope: 'lifecycle',
+        message: `TUI 启动确认超时,如页面长时间无响应可能需要手动处理(登录或信任提示)`,
+      }
+    : { kind: 'error', scope: 'lifecycle', message: `TUI 启动失败:承载 pane 已消失` };
 }
 
 /**
@@ -248,9 +269,7 @@ export class TmuxTransport extends EventEmitterBase implements SessionTransport 
 
     // 接管模式:claude 由 CLI 在用户自己的 pane 里启动,这里只等它就绪并开始观察
     if (this.#opts.paneId) {
-      if (!(await this.#waitReady())) {
-        this.emit({ kind: 'error', message: `TUI 启动超时 —— 可能需手动处理(登录或信任提示)` });
-      }
+      if (!(await this.#waitReady())) await this.#reportStartTimeout();
       this.#discoverTranscript();
       this.emit({ kind: 'status', state: 'ready' });
       return;
@@ -277,11 +296,16 @@ export class TmuxTransport extends EventEmitterBase implements SessionTransport 
       await this.#describe();
     }
 
-    if (!(await this.#waitReady())) {
-      this.emit({ kind: 'error', message: `TUI 启动超时 —— 可能需手动处理(登录或信任提示)` });
-    }
+    if (!(await this.#waitReady())) await this.#reportStartTimeout();
     this.#discoverTranscript();
     this.emit({ kind: 'status', state: 'ready' });
+  }
+
+  /** `#waitReady` 超时后的报错分支,`start()` 两处调用共用 —— 判断逻辑见 `startTimeoutEvent`。 */
+  async #reportStartTimeout(): Promise<void> {
+    const alive = await this.alive();
+    if (alive) console.error(`[tmux] start() 就绪探测超时,pane 仍在(target=${this.#target})`);
+    this.emit(startTimeoutEvent(alive));
   }
 
   /**
@@ -289,8 +313,13 @@ export class TmuxTransport extends EventEmitterBase implements SessionTransport 
    *
    * 返回 `true` = 探到就绪;`false` = 超时。超时**不代表**注入会失败(实测输入框
    * 残留会误触发超时、而注入其实照常成功),故这里不 emit error —— 报错语义
-   * 交给调用点按自己的场景决定(`start()` 报「TUI 启动超时」,`#inject` 降级放行)。
-   * 详见 docs/notes/implementation-lessons.md。
+   * 交给调用点按自己的场景决定(`start()`/`#inject` 都先查 `alive()` 再降级,
+   * 见 `#reportStartTimeout` 与 `#inject`)。详见 docs/notes/implementation-lessons.md。
+   *
+   * 单飞缓存(`#readyWaiter`)意味着 `start()` 与几乎同时调用的 `#inject`
+   * 可能拿到同一次探测结果 —— 两者报错的 scope 必须独立判断(`start()` 走
+   * 'lifecycle',`#inject` 走 'send'),不能假设"谁调的谁负责",否则一次
+   * 探测超时会同时触发两条含义不同却共享同一归因的错误。
    */
   #waitReady(timeoutMs = 45_000): Promise<boolean> {
     if (this.#readyWaiter) return this.#readyWaiter;
@@ -526,7 +555,7 @@ export class TmuxTransport extends EventEmitterBase implements SessionTransport 
       // 输入队列)—— 实测残留误触发的超时后注入其实成功。见 implementation-lessons.md。
       if (!(await this.#waitReady(45_000))) {
         if (!(await this.alive())) {
-          this.emit({ kind: 'error', message: `注入失败:承载 pane 已消失` });
+          this.emit({ kind: 'error', scope: 'send', message: `注入失败:承载 pane 已消失` });
           return;
         }
         console.error(`[tmux] #inject 就绪探测超时,pane 仍在,照常注入(target=${this.#target})`);
@@ -544,7 +573,7 @@ export class TmuxTransport extends EventEmitterBase implements SessionTransport 
       await keys('Enter');  // 必须与 paste 分开,合并调用不可靠
       this.emit({ kind: 'status', state: 'busy' });
     } catch (err) {
-      this.emit({ kind: 'error', message: `注入失败: ${String(err)}` });
+      this.emit({ kind: 'error', scope: 'send', message: `注入失败: ${String(err)}` });
     } finally {
       await unlink(tmp).catch(() => {});
       await exec('tmux', ['delete-buffer', '-b', bufName]).catch(() => {});

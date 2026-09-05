@@ -834,9 +834,14 @@ export class SessionManager {
       // 这次尝试不会再有 turn_end 来配对,pendingTurns 若不在此收回,会永久
       // 卡在 >0,turn_end 分支的 === 0 判断再也不成立,会话就此再也回不到
       // ready(除了这条错误路径,没有别处会让 pendingTurns 减少)。
+      //
+      // scope === 'lifecycle' 的错误(start()/重接管失败等)不对应任何一次
+      // send() 调用,不该冲抵 pendingTurns —— 否则 daemon 重启后重接管期间
+      // 恰好有一次真正的发送在排队,会被这条无关的启动期报错误收(见
+      // docs/notes/implementation-lessons.md「TUI 启动超时」条目)。
       case 'error':
-        console.error(`[session ${s.localId}] transport error: ${ev.message}`);
-        if (s.pendingTurns > 0) {
+        console.error(`[session ${s.localId}] transport error (${ev.scope}): ${ev.message}`);
+        if (ev.scope === 'send' && s.pendingTurns > 0) {
           s.pendingTurns--;
           if (s.pendingTurns === 0 && s.state !== 'exited') {
             s.state = 'ready';
