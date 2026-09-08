@@ -240,6 +240,36 @@ test('eventsForBinding --since 只返回 seq 更大的事件', async () => {
   }
 });
 
+test('appendEvent 的 data 原样保留,重启后仍可读回', async () => {
+  const { path, cleanup } = tmpTasksPath();
+  try {
+    const s1 = new TaskStore(path);
+    const project = s1.ensureProjectForWorkspace('/tmp/repo-a');
+    const t = s1.createTask({ projectId: project.id, title: 't' });
+    const b = s1.attachAgent({
+      taskId: t.id,
+      localId: 'sess-1',
+      role: 'sub',
+      transportKind: 'stream-json',
+    });
+    // turn_completed 带子 agent 真结论 —— poll / await / context 从 data.result 取。
+    s1.appendEvent({
+      taskId: t.id,
+      agentBindingId: b.id,
+      kind: 'turn_completed',
+      message: '轮次完成',
+      data: { result: '改完了 foo.ts', costUsd: 0.12, interrupted: false },
+    });
+    await s1.flush();
+
+    const s2 = new TaskStore(path);
+    const [ev] = s2.eventsForBinding(b.id);
+    assert.deepEqual(ev?.data, { result: '改完了 foo.ts', costUsd: 0.12, interrupted: false });
+  } finally {
+    cleanup();
+  }
+});
+
 test('appendEvent / listEvents 按 taskId 隔离', async () => {
   const { path, cleanup } = tmpTasksPath();
   try {

@@ -132,7 +132,7 @@ export async function main(argv: string[]): Promise<void> {
     console.log(`
 用法: synapse [目录] [--port <端口>] [-- <claude 参数...>]
       synapse daemon <start|status|restart|stop> [--port <端口>]
-      synapse agent <context>   (主 agent 会话内用,见 synapse agent -h)
+      synapse agent <context|spawn|poll|await>   (主 agent 会话内用,见 synapse agent -h)
 
   在当前 tmux pane 里启动 claude,同时接入网页端监管。
   目录默认为当前目录;后端未运行时自动以守护进程拉起。

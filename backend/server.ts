@@ -366,13 +366,18 @@ function agentContext(taskId: string) {
       const events = tasks.eventsForBinding(b.id);
       const lastTurn = [...events].reverse().find((e) => e.kind === 'turn_completed') ?? null;
       const exited = events.some((e) => e.kind === 'agent_exited') || b.endedAt !== null;
+      // 优先取 turn_end 载荷里的真结论(首行、截断);没有再回退到固定 message。
+      const result = (lastTurn?.data as { result?: string } | null)?.result;
+      const summary = result?.trim()
+        ? result.trim().split('\n')[0]!.slice(0, 200)
+        : (lastTurn?.message ?? null);
       return {
         bindingId: b.id,
         workspace: session?.workspace ?? null,
         // running / idle / exited —— 主 agent 据此判断能不能派下一个子任务。
         state: exited ? 'exited' : session && RUNNING_STATES.has(session.state) ? 'running' : 'idle',
         lastTurnAt: lastTurn?.createdAt ?? null,
-        lastTurnSummary: lastTurn?.message ?? null,
+        lastTurnSummary: summary,
         pendingApprovals: pendingForBinding(b),
       };
     });
@@ -566,6 +571,69 @@ function subAgentPrompt(
 }
 
 /**
+ * 起一个 stream-json 子 agent 并挂上任务:manager.create + attachAgent(role:'sub')
+ * + agent_started 事件 + send(首轮 prompt)。`/agents/start` 的 sub 分支和
+ * `/agents/spawn` 端点共用这一段。
+ *
+ * 调用方决定 firstPrompt(网页 UI 用 subAgentPrompt 模板;主 agent 的
+ * `synapse agent spawn --handoff` 用 handoff 文件内容)。
+ */
+async function spawnSubAgent(
+  task: Task,
+  opts: {
+    workspace: string;
+    model?: string;
+    appendSystemPrompt?: string;
+    firstPrompt: string;
+    transport?: 'tmux' | 'stream-json';
+  },
+): Promise<AgentBinding> {
+  const s = await manager.create(opts.workspace, {
+    transport: opts.transport ?? 'stream-json',
+    model: opts.model,
+    appendSystemPrompt: opts.appendSystemPrompt,
+  });
+  const binding = tasks.attachAgent({
+    taskId: task.id,
+    localId: s.localId,
+    claudeId: s.claudeId,
+    role: 'sub',
+    transportKind: s.transportKind,
+  });
+  tasks.appendEvent({
+    taskId: task.id,
+    agentBindingId: binding.id,
+    kind: 'agent_started',
+    message: `启动子 agent(${opts.transport ?? 'stream-json'})于 ${opts.workspace}`,
+  });
+  manager.send(s.localId, opts.firstPrompt);
+  return binding;
+}
+
+/**
+ * 子 agent 的首轮 prompt —— 有 handoff 时用它的文件内容替换 subAgentPrompt 的
+ * 硬编码模板(主 agent 已经在 handoff 里写清了目标 / work dir / 验收 / 子任务),
+ * 没有时回退到模板。
+ */
+function spawnFirstPrompt(
+  project: Project | undefined,
+  task: Task,
+  workspace: string,
+  handoff: string | undefined,
+  userPrompt: string | undefined,
+): string {
+  if (handoff && handoff.trim()) {
+    return [
+      handoff.trim(),
+      ...(userPrompt && userPrompt.trim() ? ['', '---', '', userPrompt.trim()] : []),
+      '',
+      '完成后用简短中文总结:做了什么 / 改了哪些文件 / 如何验证 / 剩余风险。',
+    ].join('\n');
+  }
+  return subAgentPrompt(project, task, workspace, (userPrompt ?? '').trim() || task.goal.trim());
+}
+
+/**
  * 主 agent 的 system prompt 基线(落地顺序第 3 步:只讲「该怎么做」)。
  *
  * 这段只是倾向 —— 真正兜住「不能做什么」的受限 permissions 是第 4 步。
@@ -706,29 +774,91 @@ app.post('/api/tasks/:id/agents/start', async (req, res) => {
       : undefined;
 
   try {
-    const s = await manager.create(workspace, {
-      transport,
+    await spawnSubAgent(task, {
+      workspace,
       model,
       appendSystemPrompt,
+      transport,
+      firstPrompt: subAgentPrompt(project, task, workspace, userPrompt),
     });
-    const binding = tasks.attachAgent({
-      taskId: task.id,
-      localId: s.localId,
-      claudeId: s.claudeId,
-      role: 'sub',
-      transportKind: s.transportKind,
-    });
-    tasks.appendEvent({
-      taskId: task.id,
-      agentBindingId: binding.id,
-      kind: 'agent_started',
-      message: `启动子 agent(${transport})于 ${workspace}`,
-    });
-    manager.send(s.localId, subAgentPrompt(project, task, workspace, userPrompt));
     res.json(taskDetail(task.id));
   } catch (err) {
     res.status(500).json({ error: String(err instanceof Error ? err.message : err) });
   }
+});
+
+/**
+ * 主 agent 起子 agent —— `synapse agent spawn` 的后端。
+ * body: { workspace, handoff?, prompt?, model?, strategy? }
+ *
+ * 和 `/agents/start` 的 sub 分支同一条创建路径(spawnSubAgent),差异只在:
+ *  - `handoff` 是 CLI 侧读出的文件内容,替换 subAgentPrompt 的模板拼进首轮 prompt
+ *  - 返回 `{ bindingId, workspace }`,不是 taskDetail —— 主 agent 只要这个 id 去 poll
+ *
+ * `strategy`(worktree 隔离,spec §1.3)本步不实现,收下即忽略 —— 落地顺序第 6 步。
+ */
+app.post('/api/tasks/:id/agents/spawn', async (req, res) => {
+  if (!checkOrigin(req, res)) return;
+  const task = tasks.getTask(String(req.params.id));
+  if (!task) {
+    res.status(404).json({ error: 'task 不存在' });
+    return;
+  }
+  const b = req.body ?? {};
+  const given = resolve(String(b.workspace ?? ''));
+  if (!given || !existsSync(given) || !statSync(given).isDirectory()) {
+    res.status(400).json({ error: '工作目录不存在' });
+    return;
+  }
+  const workspace = realpathSync(given);
+  const model = typeof b.model === 'string' && b.model.trim() ? b.model.trim() : undefined;
+  const handoff = typeof b.handoff === 'string' ? b.handoff : undefined;
+  const prompt = typeof b.prompt === 'string' ? b.prompt : undefined;
+
+  if (!handoff?.trim() && !prompt?.trim() && !task.goal.trim()) {
+    res.status(400).json({ error: '需要 handoff 文件、prompt,或先给任务填写目标' });
+    return;
+  }
+
+  const project = tasks.getProject(task.projectId);
+  try {
+    const binding = await spawnSubAgent(task, {
+      workspace,
+      model,
+      firstPrompt: spawnFirstPrompt(project, task, workspace, handoff, prompt),
+    });
+    res.json({ bindingId: binding.id, workspace });
+  } catch (err) {
+    res.status(500).json({ error: String(err instanceof Error ? err.message : err) });
+  }
+});
+
+/**
+ * 某子 agent 自 `since`(不含)以来的任务流事件 —— `synapse agent poll` 的后端。
+ * 无新事件立即返回空,不 hang(轮询循环在 CLI 侧,见设计文档「交互协议」)。
+ */
+app.get('/api/tasks/:id/agents/:bindingId/events', (req, res) => {
+  if (!checkOrigin(req, res)) return;
+  const task = tasks.getTask(String(req.params.id));
+  if (!task) {
+    res.status(404).json({ error: 'task 不存在' });
+    return;
+  }
+  const binding = tasks.getBinding(String(req.params.bindingId));
+  if (!binding || binding.taskId !== task.id) {
+    res.status(404).json({ error: 'binding 不存在' });
+    return;
+  }
+  if (binding.role !== 'sub') {
+    res.status(400).json({ error: '只能 poll 子 agent 的事件' });
+    return;
+  }
+  const sinceRaw = Number(req.query.since);
+  const since = Number.isFinite(sinceRaw) && sinceRaw > 0 ? sinceRaw : 0;
+  const events = tasks.eventsForBinding(binding.id, since);
+  // 这批为空则 cursor 停在传入的 since —— 下次 poll 从同一处继续。
+  const cursor = events.length ? events[events.length - 1]!.seq : since;
+  res.json({ events, cursor });
 });
 
 app.delete('/api/tasks/:id/agents/:bindingId', (req, res) => {
@@ -861,7 +991,16 @@ manager.onEvent((e: ManagerEvent) => {
     endBindingForExited(e.session.localId);
   }
   if (e.type === 'session_event' && e.event.kind === 'turn_end') {
-    emitTaskEvent(e.localId, 'turn_completed', e.event.interrupted ? '轮次已中断' : '轮次完成');
+    // message 仍是固定串;子 agent 本轮的实际结论(最终 assistant 文本)放进
+    // data.result,让 `synapse agent poll` / `await` / `context` 能打印真结论
+    // 而不是「轮次完成」。改动文件列表 turn_end 载荷里没有 —— 留到后续从
+    // transcript 解析(设计文档「未决」)。
+    emitTaskEvent(
+      e.localId,
+      'turn_completed',
+      e.event.interrupted ? '轮次已中断' : '轮次完成',
+      { result: e.event.result, costUsd: e.event.costUsd, interrupted: e.event.interrupted ?? false },
+    );
   }
   broadcast(e);
 });
