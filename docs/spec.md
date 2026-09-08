@@ -374,7 +374,7 @@ onEvent(fn)  订阅事件流
 左上角切换两个模式,偏好存 localStorage:
 
 - **任务**(默认)— 项目 / 任务 / 任务详情三栏。左栏(复用 aside)列项目,带任务数、运行中 agent 数、待批准数;中栏列任务,带状态点、agent 数、待批准数;右栏是任务详情:头部只留标题 + 状态 + 编辑,下接三个 tab(`state.taskTab`,切任务重置为默认值),不再是早期版本的纵向堆叠、目标/验收也不再常驻头部:
-    - **对话**(默认)— 主 agent 会话的完整对话时间线,与会话视图「对话」页签同一套降噪规则(轮次分组、进程折叠,见下方「对话页签的降噪」),复用同一份 `renderTurns`/`reduceSessionEvent` 归约,不各写一份。没有活跃主 agent 时,这里显示「开始任务」主操作区(启动主 agent);有主 agent 但会话详情还没异步拉回来时给加载态。默认不 autostart 主 agent —— 唯一入口是这块的「▶ 启动主 agent」按钮,点击后走 §5.2 的预检对话框。对话内容上方常驻一条 config bar(状态 / context / session / attach)。
+    - **对话**(默认)— 主 agent 会话的完整对话时间线,与会话视图「对话」页签同一套降噪规则(轮次分组、进程折叠,见下方「对话页签的降噪」),复用同一份 `renderTurns`/`reduceSessionEvent` 归约,不各写一份。没有活跃主 agent 时,这里显示「开始任务」主操作区(启动主 agent);有主 agent 但会话详情还没异步拉回来时给加载态。默认不 autostart 主 agent —— 唯一入口是这块的「▶ 启动主 agent」按钮,点击后走 §5.2 的预检对话框。对话内容上方常驻一条 config bar(状态 / context / session / attach),对话场景下 session id 是核对「在跟哪个会话说话」的必要信息,故常驻显示其前缀(Claude 尚未写出转写文件时为空),点击复制完整 UUID。
     - **Metadata** — 目标 / 验收(原头部副标题搬过来,未填写时灰字占位)、Agents 区(主 agent 卡片排在子 agent 前,transport / state / context / cost / pending,主 agent 绿底,自建 tmux 主 agent 卡片带 attach 动作,视觉是发丝线分隔的 list 而非卡片网格,窄栏下不会被挤成多列)、任务流事件(newest-first,`state.taskFlowExpanded` 控制默认折叠 —— 低频追溯信息不常驻占屏幕,点标题展开)。任务流首次拉取(`GET /api/tasks/:id`)与 WS 增量(`task_event` 消息)push 进同一个 `events` 数组、同一套渲染(「服务端归约与前端增量必须对齐」的老问题,见 `notes/implementation-lessons.md`)。
     - **Artifacts** — 同会话视图的 Artifacts 页签,**后端采集未实现**,占位空态(见 §7)。
 

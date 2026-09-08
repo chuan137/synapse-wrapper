@@ -151,6 +151,8 @@ const STATE_LABEL = {
   waiting: '等待批准', exited: '已退出',
 };
 
+const SID_PREFIX_LEN = 8;
+
 // AskUserQuestion 之外的工具不再经网页批准(spec §2.3a),Claude Code
 // 内置权限系统若需要询问,会在没有 TTY 的 stream-json 管道里干等 ——
 // 网页看不到这类阻塞。超过此时长仍无结果回填,视为疑似卡住。
@@ -1541,6 +1543,20 @@ function renderTaskDetail() {
       }
     };
   }
+  for (const el of $('colDetail').querySelectorAll('[data-copy-sid]')) {
+    const label = el.textContent;
+    const copy = async () => {
+      try {
+        await navigator.clipboard.writeText(el.dataset.copySid);
+        el.textContent = '已复制';
+        setTimeout(() => { el.textContent = label; }, 1500);
+      } catch {
+        prompt('session ID:', el.dataset.copySid);
+      }
+    };
+    el.onclick = copy;
+    el.onkeydown = (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); copy(); } };
+  }
   if (mainAgent?.session) updateComposer(displayState(mainAgent.session));
 }
 
@@ -1588,7 +1604,8 @@ function renderTaskChatHead(at) {
   return `<div class="td-chat-head">
     <span class="chip ${st}">${STATE_LABEL[st]}${pendCount ? ` · ${pendCount} 项待批准` : ''}</span>
     ${contextChip(at)}
-    ${at.claudeId ? `<span class="ctx-chip td-chat-sid" title="${esc(at.claudeId)}">${esc(at.claudeId.slice(0, 8))}</span>` : ''}
+    ${at.claudeId ? `<span class="ctx-chip td-chat-sid" role="button" tabindex="0" data-copy-sid="${esc(at.claudeId)}"
+        title="${esc(at.claudeId)} —— 点击复制完整 session ID">${esc(at.claudeId.slice(0, SID_PREFIX_LEN))}</span>` : ''}
     ${ownTmux ? `<a role="button" tabindex="0" class="td-chat-attach" data-attach-tmux="${esc(at.tmuxName)}"
         title="复制 tmux attach 命令,在终端里接上这个主 agent 会话">🔗 attach</a>` : ''}
   </div>`;
