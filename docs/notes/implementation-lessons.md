@@ -217,3 +217,13 @@ stream-json 子 agent 不受影响 —— 那条路径 claude headless 跑,没�
 - `tmuxTransport.ts` 新增纯函数 `startTimeoutEvent(alive: boolean)`:`start()` 超时后先查 `alive()`,pane 还在只报一条 `scope:'lifecycle'` 的"启动确认超时"提示(不当发送失败);pane 真的不在了才是"启动失败",同样标 `lifecycle`。抽成纯函数是因为 `#reportStartTimeout` 本体依赖真实 tmux 且默认超时 45s,不适合单测,单测只覆盖"给定 alive 结果该产出哪种事件"这段判断本身(`tmuxTransport.test.ts`)。
 - `sessionManager.ts` `#absorb` 的 `case 'error'` 只在 `scope === 'send'` 时才 `pendingTurns--`——`lifecycle` 错误不消耗这个计数器,避免了"当前没有真正卡住的发送、却被一条无关的启动期报错误收"的错位。
 - `public/app.js` `reduceSessionEvent` 只把 `scope === 'send'` 的错误压进 `d.timeline`(会被 `renderTurns` 按时间窗口渲染成"发送失败");`lifecycle` 错误目前只 `console.warn`,不打断用户——真正的登录/信任提示卡住,用户重试发送时会以 `send` 错误的形式再次、且这次归因正确地出现。
+
+## 并行主 agent 共用同一工作树,改动缠在一起没法按任务提交
+
+锚点:`docs/design/main-agent-orchestration.md` 落地顺序第 6 步,spec §1.3 / §7,`bin/agent.ts` `cmdSpawn`。
+
+落地第 5 步(`synapse agent spawn`)上线后,`--strategy` 后端收下即忽略(第 6 步才做),子 agent 直接在传入的 `--workspace` 上改文件 —— 而这个 workspace 就是主库。两个任务各自的主 agent 同时在跑时(实测:一个做「session UUID 显示」、一个做「spawn/poll/await」),它们 spawn 的子 agent 把改动全写进同一个工作树:`public/app.js` 同几个 hunk 里既有 A 任务的 chip 改动、又有 B 任务的 composer 重构,`git diff` 分不开。B 任务的主 agent 先退出、没提交,留下一个半committed 工作树;A 任务的主 agent 要提交自己那部分,只能手工 `git worktree add <老 commit>` 再逐行比对反推,把一坨 diff 拆成两个 commit。
+
+这不是「多子 agent 并行非近期需求」(§1.3 当初延后的理由)——**多个任务各有主 agent 本身就是并行**,只要同时开两个任务就撞。第 6 步的 worktree 隔离在 `spawn` 里落地之前,规避手段只有:同一时间只跑一个任务的主 agent;或主 agent 在 spawn 前自己 `git worktree add ../synapse-wt/<任务简名> -b wt/<任务简名>`、把新路径传给 `--workspace`,子 agent 在里面改 / 测 / 提交,主 agent 事后 `git worktree remove` 并把分支合回。
+
+修正:见落地顺序第 6 步 —— `spawn` 按 spec §1.3 的 `dirtyStrategy` 建 worktree,`bin/agent.ts` 加 `--worktree`(或复用 `--strategy`)让主 agent 不用手搓;任务结束 daemon 侧或 UI 给「移除 worktree」入口。

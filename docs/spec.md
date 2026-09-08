@@ -460,7 +460,7 @@ tmux agent 卡片:会话 `exited` 且 `transport === 'tmux'` 时状态标「pane
 - **中断能力** — `interrupt()` 目前发 SIGINT,stream-json 下的正确中断方式尚未实测确认,可能会终止整个会话。
 - **崩溃恢复** — 后端退出会带走所有子进程。`--resume <session_id>` 可恢复对话上下文,但不恢复进行中的轮次。恢复流程尚未设计。
 - **stream-json 会话的进程存活** — tmux 会话在后端重启后可重新探活接管(`notes/implementation-lessons.md`),stream-json 子进程随后端退出而消失(见「崩溃恢复」),这层还没补。
-- **任务 agent 的 worktree 隔离** — 设计见 §1.3,预检步见 §5.2;`backend/worktree.ts` 与 policy 存储层未实现,Phase 1 收尾时评估「多子 agent 并行」非近期需求而延后。
+- **任务 agent 的 worktree 隔离** — 设计见 §1.3,预检步见 §5.2;`backend/worktree.ts` 与 policy 存储层未实现,Phase 1 收尾时评估「多子 agent 并行」非近期需求而延后。**但主 agent 调度上线后这条已经在阻塞**:两个任务各自的主 agent 同时跑,子 agent 的改动写进同一工作树、缠在一起没法按任务提交(实测,见 `notes/implementation-lessons.md`「并行主 agent 共用同一工作树」)。近期止血:`synapse agent spawn` 加 `--worktree` 让主 agent 每子任务开一个独立 worktree(见 `docs/design/main-agent-orchestration.md` 落地顺序第 6 步),不必等完整 `dirtyStrategy`。
 - **Artifacts 采集** — §0.2 定了落盘路径规范,§5 的 Artifacts 页签在位,但后端未采集会话产出物,页签暂空。
 - **主 agent 调度** — 设计见 `docs/design/main-agent-orchestration.md`(交互协议已定:每次 `synapse agent` 调用是短请求,`poll --since <seq>` 拿增量事件,`await` 的轮询在 CLI 侧、退出码 `0/10/11/20`)。待实现:`TaskEvent.seq` 自增、`turn_end` 的结论/改动文件带进 `TaskEvent.data`、daemon 重启窗口内漏记 turn 的对账。
 - **`synapse agent` 子命令** — §0.1 的 `agent` 分支(daemon HTTP 瘦客户端)。`wrapper` → `synapse` 的代码 sweep 已完成;`agent` 分发与端点见 `docs/design/main-agent-orchestration.md` 落地顺序。
