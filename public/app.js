@@ -789,14 +789,14 @@ function renderDraftQueueInline(localId) {
   </div>`).join('');
 }
 
-function wireDraftQueue(root) {
+function wireDraftQueue(root, localId) {
   for (const btn of root.querySelectorAll('.draft-del')) {
     btn.onclick = () => {
-      const q = state.draftQueue.get(state.view);
+      const q = state.draftQueue.get(localId);
       if (!q) return;
       q.splice(Number(btn.dataset.i), 1);
-      if (q.length) state.draftQueue.set(state.view, q); else state.draftQueue.delete(state.view);
-      renderBody();
+      if (q.length) state.draftQueue.set(localId, q); else state.draftQueue.delete(localId);
+      rerenderActiveChat();
     };
   }
 }
@@ -812,7 +812,7 @@ function flushDraftQueue(localId) {
   state.draftQueue.delete(localId);
   const text = q.join('\n\n');
   ws.send(JSON.stringify({ type: 'prompt', localId, text }));
-  if (state.view === localId && state.tab === 'chat') renderBody();
+  if (activeChatLocalId() === localId) rerenderActiveChat();
 }
 
 // ── 渲染:页签 ──────────────────────────────────────────────
@@ -1127,7 +1127,7 @@ function renderDetail() {
   $('body').innerHTML = html;
   wireApprovals($('body'));
   wireStallNotice($('body'));
-  if (state.tab === 'chat') { wireProcs($('body'), d, renderDetail); wireDraftQueue($('body')); }
+  if (state.tab === 'chat') { wireProcs($('body'), d, renderDetail); wireDraftQueue($('body'), d.localId); }
   if (state.tab === 'chat' && wasBottom) $('body').scrollTop = $('body').scrollHeight;
 }
 
@@ -1163,11 +1163,30 @@ function renderAll() {
 function applyMode() {
   $('sessionView').hidden = state.mode !== 'sessions';
   $('taskView').hidden = state.mode !== 'tasks';
-  $('foot').style.display = state.mode === 'sessions' && state.view !== 'overview' ? 'block' : 'none';
   $('add').style.display = state.mode === 'sessions' ? '' : 'none';
   for (const b of $('modeSwitch').querySelectorAll('button')) {
     b.classList.toggle('on', b.dataset.mode === state.mode);
   }
+  updateFootVisibility();
+}
+
+/**
+ * #foot(发消息输入框)是两个视图共用的同一个 DOM 节点(见 index.html
+ * 顶部注释)—— 没有活跃对话对象就隐藏;有就 appendChild 挪进当前视图
+ * 该放它的容器末尾。用 appendChild 而非「两份 DOM + 显隐切换」,是因为
+ * 挪动一个已存在节点不会丢事件监听器,也不会清空用户正在输入到一半的
+ * 草稿(会话/任务来回切时常见)。
+ */
+function updateFootVisibility() {
+  const foot = $('foot');
+  const localId = activeChatLocalId();
+  // chat head 只在任务视图的对话 tab 有意义 —— 会话视图共用同一个 composer,
+  // 切过去时把它清掉,由 renderTaskDetail 的 chat 分支重新注入。
+  if (state.mode !== 'tasks') $('composerHead').innerHTML = '';
+  if (!localId) { foot.style.display = 'none'; return; }
+  const host = state.mode === 'tasks' ? $('colDetail') : $('sessionView');
+  if (foot.parentElement !== host) host.appendChild(foot);
+  foot.style.display = 'block';
 }
 
 // ══ 任务视图 ═══════════════════════════════════════════════════
@@ -1380,10 +1399,16 @@ function showTaskError(msg) {
 
 function renderTaskDetail() {
   if (state.mode !== 'tasks') return;
+  // colDetail 接下来会被整体 innerHTML 替换 —— #foot 如果正挂在它底下
+  // (上一次渲染挪进来的),先挪去 body 暂存,不能让它被当成旧内容一并
+  // 销毁(它是全局唯一节点,没有第二份可以再挪一次)。函数末尾统一交给
+  // updateFootVisibility() 按这次渲染结果决定挪回哪。
+  document.body.appendChild($('foot'));
   const d = state.taskDetail;
   if (!state.taskId || !d) {
     $('colDetail').innerHTML = `<div class="td-empty">${
       state.taskId ? '加载中…' : '从左侧选一个任务查看详情。'}</div>`;
+    updateFootVisibility();
     return;
   }
   const { task, project, agents } = d;
@@ -1423,7 +1448,7 @@ function renderTaskDetail() {
       </div>
     </div>
     ${tabBar}
-    <div class="td-body">${panel}</div>`;
+    <div class="td-body${state.taskTab === 'chat' ? ' chat' : ''}">${panel}</div>`;
 
   const errX = $('tdErrX');
   if (errX) errX.onclick = () => { state.taskError = ''; renderTaskDetail(); };
@@ -1451,18 +1476,6 @@ function renderTaskDetail() {
   if (openBindBtn) openBindBtn.onclick = () => openBindAgentModal(task);
   for (const el of $('colDetail').querySelectorAll('[data-open-session]')) {
     el.onclick = () => { switchMode('sessions'); navigate(el.dataset.openSession); };
-  }
-  for (const el of $('colDetail').querySelectorAll('[data-attach-tmux]')) {
-    el.onclick = async () => {
-      const cmd = `tmux attach -t ${el.dataset.attachTmux}`;
-      try {
-        await navigator.clipboard.writeText(cmd);
-        el.textContent = '已复制';
-        setTimeout(() => { el.textContent = 'attach'; }, 1500);
-      } catch {
-        prompt('在终端运行:', cmd);
-      }
-    };
   }
   for (const el of $('colDetail').querySelectorAll('[data-detach]')) {
     el.onclick = async () => {
@@ -1498,9 +1511,37 @@ function renderTaskDetail() {
       // 之后的增量重绘按「渲染前是否已在底部」决定,同 renderDetail() 的老逻辑。
       wireProcs(chatBody, d.agentTimeline, renderTaskDetail);
       wireApprovals(chatBody);
+      wireStallNotice(chatBody);
+      wireDraftQueue(chatBody, d.agentTimeline.localId);
       if (forceBottom) chatBody.scrollTop = chatBody.scrollHeight;
     }
   }
+  // #foot 挪进/挪出 colDetail、发送按钮文案("发送"/"加入队列")—— 都要在
+  // 这次重绘的最终 DOM 定下来之后做,顺序早了会被后面的 innerHTML 冲掉。
+  updateFootVisibility();
+  // chat head 注入 composer 顶部;它每次重绘都刷新(状态 chip 会变)。
+  // 非对话场景(其他 tab、无 main agent)清空,让 composer 回到单行。
+  const composerHead = $('composerHead');
+  if (composerHead) {
+    composerHead.innerHTML = (state.taskTab === 'chat' && mainAgent && d.agentTimeline)
+      ? renderTaskChatHead(d.agentTimeline) : '';
+  }
+  // attach 按钮扫的是整个 colDetail —— Metadata tab 的 agentCard 和刚注入
+  // composer 的 chat head 都可能有,必须在两处 DOM 都定下来之后统一 wire。
+  for (const el of $('colDetail').querySelectorAll('[data-attach-tmux]')) {
+    el.onclick = async () => {
+      const label = el.textContent;
+      const cmd = `tmux attach -t ${el.dataset.attachTmux}`;
+      try {
+        await navigator.clipboard.writeText(cmd);
+        el.textContent = '已复制';
+        setTimeout(() => { el.textContent = label; }, 1500);
+      } catch {
+        prompt('在终端运行:', cmd);
+      }
+    };
+  }
+  if (mainAgent?.session) updateComposer(displayState(mainAgent.session));
 }
 
 /**
@@ -1526,7 +1567,31 @@ function renderTaskChatTab(d, mainAgent) {
   const pendCards = pend.map((a) => approvalCard(a, false)).join('');
   const turns = at.timeline.length ? renderTurns(at)
     : (!pend.length ? `<div class="empty">还没有对话。</div>` : '');
-  return `<div class="td-chat" id="tdChatBody">${turns}${pendCards}</div>`;
+  const stall = isStalled(at) ? stallNotice(at) : '';
+  // 头部(状态/模型/session/attach)去了 composer(见 renderTaskChatHead + renderTaskDetail
+  // 的 chat 分支),这里只出对话内容,宽度撑满 .td-body.chat。
+  return `<div class="td-chat" id="tdChatBody">${turns}${stall}${pendCards}${renderDraftQueueInline(at.localId)}</div>`;
+}
+
+/**
+ * 对话 tab 头部:主 agent 会话的基本 config,常驻在对话内容上方 ——
+ * 「打开会话/attach」之前只在 Metadata tab 的 agent 卡片里,对话场景下
+ * 想确认「我在跟哪个模型、哪个会话说话」得先切 tab,不如直接放在对话上方。
+ * attach 按钮的点击事件复用 renderTaskDetail 里统一 wire 的
+ * [data-attach-tmux](该 querySelector 扫的是整个 colDetail —— composer 挂在
+ * colDetail 末尾,所以仍能扫到,只要 wire 时机在注入 #composerHead 之后)。
+ */
+function renderTaskChatHead(at) {
+  const st = displayState(at);
+  const pendCount = pendingFor(at.localId).length;
+  const ownTmux = at.tmuxName && at.tmuxName.startsWith('synapse-main-');
+  return `<div class="td-chat-head">
+    <span class="chip ${st}">${STATE_LABEL[st]}${pendCount ? ` · ${pendCount} 项待批准` : ''}</span>
+    ${contextChip(at)}
+    ${at.claudeId ? `<span class="ctx-chip td-chat-sid" title="${esc(at.claudeId)}">${esc(at.claudeId.slice(0, 8))}</span>` : ''}
+    ${ownTmux ? `<a role="button" tabindex="0" class="td-chat-attach" data-attach-tmux="${esc(at.tmuxName)}"
+        title="复制 tmux attach 命令,在终端里接上这个主 agent 会话">🔗 attach</a>` : ''}
+  </div>`;
 }
 
 /** 「Metadata」tab —— agent list + 任务流事件,原纵向堆叠布局原样收纳进来。 */
@@ -1931,9 +1996,7 @@ async function navigate(id) {
   state.pinBottom = true;
   if (id === 'overview') {
     state.detail = null;
-    $('foot').style.display = 'none';
   } else {
-    $('foot').style.display = 'block';
     try {
       state.detail = await api(`/api/sessions/${id}`);
       if (state.detail) {
@@ -2031,21 +2094,39 @@ $('add').onclick = () => {
 };
 
 // ── 发送 ────────────────────────────────────────────────────
+/**
+ * 「当前应该接收 #input 输入的会话」—— 会话视图是 state.view(overview 时
+ * 没有);任务视图是当前任务主 agent 的会话 localId(没有活跃主 agent、或
+ * agentTimeline 还没拉回来时没有)。#foot 全局唯一,两个视图切换只换绑
+ * 目标 localId,不各自维护一份输入框 DOM/事件。
+ */
+function activeChatLocalId() {
+  if (state.mode === 'tasks') return state.taskDetail?.agentTimeline?.localId ?? null;
+  return state.view !== 'overview' ? state.view : null;
+}
+
+/** 按当前场景(会话视图 body / 任务视图对话 tab)重绘,发消息后让新内容立刻可见。 */
+function rerenderActiveChat() {
+  if (state.mode === 'tasks') { state.taskChatPinBottom = true; renderTaskDetail(); }
+  else if (state.tab === 'chat') renderBody();
+}
+
 function send() {
   const text = $('input').value.trim();
-  if (!text || state.view === 'overview' || !state.connected) return;
-  const s = state.sessions.get(state.view);
-  const ready = s && !pendingFor(s.localId).length && s.state === 'ready';
+  const localId = activeChatLocalId();
+  if (!text || !localId || !state.connected) return;
+  const s = state.sessions.get(localId);
+  const ready = s && !pendingFor(localId).length && s.state === 'ready';
   if (ready) {
-    ws.send(JSON.stringify({ type: 'prompt', localId: state.view, text }));
+    ws.send(JSON.stringify({ type: 'prompt', localId, text }));
   } else {
     // 会话忙碌/待批准/启动中时先攒进本地队列,turn_end 回到 ready 后
     // flushDraftQueue 自动弹出队首发送 —— 不用用户盯着状态手动重试。
-    const q = state.draftQueue.get(state.view) ?? [];
+    const q = state.draftQueue.get(localId) ?? [];
     q.push(text);
-    state.draftQueue.set(state.view, q);
+    state.draftQueue.set(localId, q);
     state.pinBottom = true;
-    if (state.tab === 'chat') renderBody();
+    rerenderActiveChat();
   }
   $('input').value = '';
 }
@@ -2058,8 +2139,8 @@ $('send').onclick = send;
  */
 $('sendForce').onclick = () => {
   const text = $('input').value.trim();
-  if (state.view === 'overview' || !state.connected) return;
-  const localId = state.view;
+  const localId = activeChatLocalId();
+  if (!localId || !state.connected) return;
   const q = state.draftQueue.get(localId) ?? [];
   if (text) q.push(text);
   if (!q.length) return;
@@ -2068,7 +2149,7 @@ $('sendForce').onclick = () => {
   ws.send(JSON.stringify({ type: 'prompt', localId, text: q.join('\n\n') }));
   $('input').value = '';
   state.pinBottom = true;
-  if (state.tab === 'chat') renderBody();
+  rerenderActiveChat();
 };
 
 $('input').onkeydown = (e) => {

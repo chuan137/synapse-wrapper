@@ -25,13 +25,6 @@
   <div class="topbar" id="topbar"></div>
   <div class="tabs" id="tabs" style="display:none"></div>
   <div class="body" id="body"></div>
-  <footer id="foot" style="display:none">
-    <div class="composer">
-      <textarea id="input" rows="2" placeholder="输入消息…  (Enter 发送,Shift+Enter 换行)"></textarea>
-      <button class="btn" id="sendForce" style="display:none" title="中断当前轮次并立即发送这条消息">中断并发送</button>
-      <button class="btn pri" id="send">发送</button>
-    </div>
-  </footer>
 </main>
 
 <!-- 任务视图:项目 / 任务 / 任务详情 三栏(Phase 1) -->
@@ -39,6 +32,26 @@
   <div class="col-tasks" id="colTasks"></div>
   <div class="col-detail" id="colDetail"></div>
 </section>
+
+<!--
+  发消息输入框:两个视图共用同一个 DOM 节点(而非各自一份)—— 会话视图的
+  单会话详情、任务视图的任务详情「对话」tab 都可能是当前的发消息目标,
+  但从不同时是。app.js 的 updateFootVisibility() 按 activeChatLocalId()
+  把这个节点 appendChild 挪进当前该显示它的容器末尾(flex column 布局下
+  天然贴底),不复制一份 DOM/事件、切换视图时正在输入的文字也不丢。
+  初始挂在 body 末尾,首次 renderAll 前不属于任何一个视图。
+-->
+<footer id="foot" style="display:none">
+  <div class="composer">
+    <!-- 对话 tab 时,renderTaskDetail 往这里注入 renderTaskChatHead;其余场景清空。 -->
+    <div id="composerHead"></div>
+    <div class="composer-row">
+      <textarea id="input" rows="2" placeholder="输入消息…  (Enter 发送,Shift+Enter 换行)"></textarea>
+      <button class="btn" id="sendForce" style="display:none" title="中断当前轮次并立即发送这条消息">中断并发送</button>
+      <button class="btn pri" id="send">发送</button>
+    </div>
+  </div>
+</footer>
 
 <script type="module" src="/app.js"></script>
 </body>

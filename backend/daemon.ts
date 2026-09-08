@@ -16,7 +16,7 @@
  * 单看 HTTP 又会把非本工具的服务当成自己人。
  */
 import { spawn } from 'node:child_process';
-import { mkdirSync, readFileSync, writeFileSync, rmSync, openSync, statSync, renameSync, readdirSync } from 'node:fs';
+import { mkdirSync, readFileSync, writeFileSync, rmSync, openSync, closeSync, statSync, renameSync, readdirSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
@@ -250,6 +250,64 @@ export async function checkHealth(state: DaemonState): Promise<boolean> {
   return httpAlive(state);
 }
 
+const LOCK_PATH = () => join(SYNAPSE_DIR, 'daemon.lock');
+const LOCK_POLL_MS = 100;
+const LOCK_WAIT_MS = 10_000;
+
+/**
+ * 跨进程互斥锁,只为串行化 ensureDaemon 里「判断没有健康实例 → spawn」这段
+ * 临界区 —— 两个 CLI 调用(比如网页与终端各自触发一次)前后脚都读到「没有
+ * 健康实例」,不加锁会各自 spawnDaemon,默认端口撞上后各自递增到不同端口,
+ * 双双写 daemon.pid/port,最终谁后写生效,但两个进程其实都在监听,又是一次
+ * 同目录多实例共存(与本文件其余注释描述的历史 bug 同类,只是触发路径不同:
+ * 那两个 bug 是单次 ensureDaemon 内部逻辑错误,这里是多次 ensureDaemon 并发)。
+ *
+ * 用 `wx` 独占创建实现 —— 创建成功即持锁,EEXIST 则已有人持锁。文件内容记
+ * 持锁者 PID,仅用于「持锁进程是否已经不在了」的陈旧锁判断(比如上次拿到锁
+ * 之后进程被杀,没走到 finally 就没了),不影响锁语义本身。
+ */
+async function acquireLock(): Promise<void> {
+  const path = LOCK_PATH();
+  mkdirSync(SYNAPSE_DIR, { recursive: true, mode: 0o700 });
+  const deadline = Date.now() + LOCK_WAIT_MS;
+  for (;;) {
+    try {
+      const fd = openSync(path, 'wx', 0o600);
+      writeFileSync(fd, String(process.pid));
+      closeSync(fd);
+      return;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
+    }
+    // 锁被占着 —— 先看是不是陈旧锁(持锁进程已经不在了),是就抢占。
+    try {
+      const holder = Number(readFileSync(path, 'utf8').trim());
+      if (!Number.isInteger(holder) || holder <= 0 || !pidAlive(holder)) {
+        rmSync(path, { force: true });
+        continue;
+      }
+    } catch {
+      // 锁文件在读的当口被持锁者自己删了(正常释放)—— 下一轮直接重新尝试创建
+      continue;
+    }
+    if (Date.now() >= deadline) {
+      throw new Error(`等待 daemon 启动锁超时(${LOCK_WAIT_MS / 1000}s),持锁 PID 见 ${path}`);
+    }
+    await new Promise((r) => setTimeout(r, LOCK_POLL_MS));
+  }
+}
+
+/** 仅删自己持有的锁 —— 万一等待期间被误判陈旧并遭抢占,不该删掉抢占者的新锁。 */
+function releaseLock(): void {
+  const path = LOCK_PATH();
+  try {
+    const holder = Number(readFileSync(path, 'utf8').trim());
+    if (holder === process.pid) rmSync(path, { force: true });
+  } catch {
+    // 锁文件已经不在了 —— 没有需要释放的
+  }
+}
+
 /**
  * 确保后端在跑,返回可用的连接信息。
  * 已有实例健康则直接复用;否则清掉陈旧状态重新拉起。
@@ -266,6 +324,10 @@ export async function checkHealth(state: DaemonState): Promise<boolean> {
  * 判成「显式」,已有实例撞见占用直接退出、无从递增,表现为一撞就报「启动
  * 超时」,还容易在反复重试里堆出多个占着不同端口、彼此不知道对方存在的
  * 残留 daemon。
+ *
+ * 判断与 spawn 之间加锁(acquireLock/releaseLock,见其注释)串行化并发调用;
+ * 拿到锁后重新读一次状态 —— 等锁期间可能有别的调用者已经把 daemon 启起来了,
+ * 这时直接复用,不再重复 spawn。
  */
 export async function ensureDaemon(
   port = DEFAULT_PORT, waitMs = 20_000, explicit = false,
@@ -274,10 +336,18 @@ export async function ensureDaemon(
   migrateLegacyStateDir();
   const existing = readState();
   if (existing && (await checkHealth(existing))) return existing;
-  if (existing) clearState();
 
-  spawnDaemon(port, explicit);
-  return waitForDaemon(port, waitMs);
+  await acquireLock();
+  try {
+    const afterLock = readState();
+    if (afterLock && (await checkHealth(afterLock))) return afterLock;
+    if (afterLock) clearState();
+
+    spawnDaemon(port, explicit);
+    return await waitForDaemon(port, waitMs);
+  } finally {
+    releaseLock();
+  }
 }
 
 const LOG_ROTATE_BYTES = 5 * 1024 * 1024;

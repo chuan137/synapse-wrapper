@@ -316,11 +316,13 @@ daemon 每次监听成功后重写一遍(幂等)。**URL 里的端口必须是�
 
 ### 守护进程(`backend/daemon.ts`)
 
-状态存**数据目录根**(默认 `~/.synapse/`,`SYNAPSE_DATA_DIR` 覆盖):`daemon.pid` / `port` / `token` / `hooks.settings.json` / `sessions.json` / `daemon.log`,均 `0600`,由后端监听成功后自己写入 —— 端口递增发生在服务端,detached 启动的父进程读不到 stdout,无从得知最终端口,只能靠 `port` 文件回传。`hooks.settings.json` 是所有会话共用的 hook 配置,见 §3.1;`daemon.pid`/`port` 是「进程是否存活」的判定依据,`clearState()` 只清这两个,其余保留。
+状态存**数据目录根**(默认 `~/.synapse/`,`SYNAPSE_DATA_DIR` 覆盖):`daemon.pid` / `port` / `token` / `hooks.settings.json` / `sessions.json` / `daemon.log`,均 `0600`,由后端监听成功后自己写入(`daemon.lock` 例外,见下文,是 CLI 侧 `ensureDaemon` 短暂持有的启动锁,不是后端自身状态) —— 端口递增发生在服务端,detached 启动的父进程读不到 stdout,无从得知最终端口,只能靠 `port` 文件回传。`hooks.settings.json` 是所有会话共用的 hook 配置,见 §3.1;`daemon.pid`/`port` 是「进程是否存活」的判定依据,`clearState()` 只清这两个,其余保留。
 
 **不再按端口分子目录。** 一个数据目录对应至多一个 daemon 实例,`sessions.json` / `token` 各只有一份。旧版按 `~/.synapse/<请求端口>/` 分区来隔离测试与生产;现在测试要隔离改用独立的 `SYNAPSE_DATA_DIR`,daemon 文件全部扁平放根下。`daemon.ts` 的 `migrateLegacyStateDir()` 在 daemon 启动路径跑一次:旧 `<默认端口>/` 子目录存在、且其 `daemon.pid` 不指向活进程时,把 `token` / `sessions.json` / `hooks.settings.json` 搬到根下(根下已有则不覆盖),用户手里的链接和历史会话不因升级而丢。旧进程还活着就整体跳过 —— 它用旧代码,仍往子目录写,等它经 `synapse daemon restart` 退出后下次启动再搬。
 
 健康检查必须 **PID 存活 + HTTP 探活且 token 相符** 双过:PID 可能已被系统回收并分配给无关进程,单看 PID 会误认;端口可能被别的程序占着,单看 HTTP 会把陌生服务当成自己人。任一不过即清理陈旧文件重启。
+
+**`ensureDaemon` 的「判断没有健康实例 → 拉起新进程」这段临界区靠 `daemon.lock` 互斥**(`wx` 独占创建,内容记持锁 PID;持锁进程不存活视为陈旧锁,可被抢占)。数据目录本该至多一个 daemon,但两次 `ensureDaemon` 并发调用(典型如网页与终端前后脚唤起)若都读到「没有健康实例」会各自拉起,默认端口递增互不冲突,最终两个进程都在监听——只是 `daemon.pid`/`port` 只会显示最后写入的那个,另一个变成无人知晓的孤儿。拿到锁后要重新 `readState`+`checkHealth` 一次才决定是否真的拉起,否则退化成「谁先排到谁拉起,后面的等到锁后又各自拉起一次」。
 
 启动用 `detached: true` + `stdio: 'ignore'` + `unref()`,三者缺一都会让 CLI 退出时带走后端。
 
@@ -372,7 +374,7 @@ onEvent(fn)  订阅事件流
 左上角切换两个模式,偏好存 localStorage:
 
 - **任务**(默认)— 项目 / 任务 / 任务详情三栏。左栏(复用 aside)列项目,带任务数、运行中 agent 数、待批准数;中栏列任务,带状态点、agent 数、待批准数;右栏是任务详情:头部只留标题 + 状态 + 编辑,下接三个 tab(`state.taskTab`,切任务重置为默认值),不再是早期版本的纵向堆叠、目标/验收也不再常驻头部:
-    - **对话**(默认)— 主 agent 会话的完整对话时间线,与会话视图「对话」页签同一套降噪规则(轮次分组、进程折叠,见下方「对话页签的降噪」),复用同一份 `renderTurns`/`reduceSessionEvent` 归约,不各写一份。没有活跃主 agent 时,这里显示「开始任务」主操作区(启动主 agent);有主 agent 但会话详情还没异步拉回来时给加载态。默认不 autostart 主 agent —— 唯一入口是这块的「▶ 启动主 agent」按钮,点击后走 §5.2 的预检对话框。
+    - **对话**(默认)— 主 agent 会话的完整对话时间线,与会话视图「对话」页签同一套降噪规则(轮次分组、进程折叠,见下方「对话页签的降噪」),复用同一份 `renderTurns`/`reduceSessionEvent` 归约,不各写一份。没有活跃主 agent 时,这里显示「开始任务」主操作区(启动主 agent);有主 agent 但会话详情还没异步拉回来时给加载态。默认不 autostart 主 agent —— 唯一入口是这块的「▶ 启动主 agent」按钮,点击后走 §5.2 的预检对话框。对话内容上方常驻一条 config bar(状态 / context / session / attach)。
     - **Metadata** — 目标 / 验收(原头部副标题搬过来,未填写时灰字占位)、Agents 区(主 agent 卡片排在子 agent 前,transport / state / context / cost / pending,主 agent 绿底,自建 tmux 主 agent 卡片带 attach 动作,视觉是发丝线分隔的 list 而非卡片网格,窄栏下不会被挤成多列)、任务流事件(newest-first,`state.taskFlowExpanded` 控制默认折叠 —— 低频追溯信息不常驻占屏幕,点标题展开)。任务流首次拉取(`GET /api/tasks/:id`)与 WS 增量(`task_event` 消息)push 进同一个 `events` 数组、同一套渲染(「服务端归约与前端增量必须对齐」的老问题,见 `notes/implementation-lessons.md`)。
     - **Artifacts** — 同会话视图的 Artifacts 页签,**后端采集未实现**,占位空态(见 §7)。
 
