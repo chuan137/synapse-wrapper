@@ -4,7 +4,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync, existsSync, statSync, writeFileSync, readdirSync } from 'node:fs';
+import { mkdtempSync, rmSync, existsSync, statSync, writeFileSync, readFileSync, readdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { TaskStore } from './taskStore.ts';
@@ -109,6 +109,38 @@ test('attachAgent 接受预生成的 binding id', async () => {
       store.attachAgent({ taskId: task.id, id: preId, localId: 'sess-2', role: 'sub', transportKind: 'tmux' }),
     );
     await store.flush();
+  } finally {
+    cleanup();
+  }
+});
+
+test('worktreePath 存下、重启后读回;旧 binding 无此字段补 null', async () => {
+  const { path, cleanup } = tmpTasksPath();
+  try {
+    const s1 = new TaskStore(path);
+    const project = s1.ensureProjectForWorkspace('/tmp/repo-a');
+    const task = s1.createTask({ projectId: project.id, title: 't' });
+    s1.attachAgent({
+      taskId: task.id,
+      localId: 'sess-wt',
+      role: 'sub',
+      transportKind: 'stream-json',
+      worktreePath: '/home/u/.synapse/worktrees/repo-a-task-abcd1234',
+    });
+    s1.attachAgent({ taskId: task.id, localId: 'sess-plain', role: 'sub', transportKind: 'stream-json' });
+    await s1.flush();
+
+    const s2 = new TaskStore(path);
+    const [wt, plain] = s2.listBindings(task.id);
+    assert.equal(wt!.worktreePath, '/home/u/.synapse/worktrees/repo-a-task-abcd1234');
+    assert.equal(plain!.worktreePath, null);
+
+    // 手写一个缺 worktreePath 字段的旧文件 → 加载时补 null,不是 undefined。
+    const legacy = JSON.parse(readFileSync(path, 'utf8'));
+    for (const b of legacy.agentBindings) delete b.worktreePath;
+    writeFileSync(path, JSON.stringify(legacy));
+    const s3 = new TaskStore(path);
+    for (const b of s3.listBindings(task.id)) assert.equal(b.worktreePath, null);
   } finally {
     cleanup();
   }

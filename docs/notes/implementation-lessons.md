@@ -226,4 +226,4 @@ stream-json 子 agent 不受影响 —— 那条路径 claude headless 跑,没�
 
 这不是「多子 agent 并行非近期需求」(§1.3 当初延后的理由)——**多个任务各有主 agent 本身就是并行**,只要同时开两个任务就撞。第 6 步的 worktree 隔离在 `spawn` 里落地之前,规避手段只有:同一时间只跑一个任务的主 agent;或主 agent 在 spawn 前自己 `git worktree add ../synapse-wt/<任务简名> -b wt/<任务简名>`、把新路径传给 `--workspace`,子 agent 在里面改 / 测 / 提交,主 agent 事后 `git worktree remove` 并把分支合回。
 
-修正:见落地顺序第 6 步 —— `spawn` 按 spec §1.3 的 `dirtyStrategy` 建 worktree,`bin/agent.ts` 加 `--worktree`(或复用 `--strategy`)让主 agent 不用手搓;任务结束 daemon 侧或 UI 给「移除 worktree」入口。
+修正(已落地,第 6 步薄版本):`synapse agent spawn --worktree` —— 后端 `backend/worktree.ts` 从干净 `HEAD` `git worktree add --detach ~/.synapse/worktrees/<slug>`,子 agent 在里面改 / 测 / 提交,`AgentBinding.worktreePath` 记路径,`DELETE /agents/:bindingId` 与任务归档时 `git worktree remove --force` 回收。主 agent system prompt 已写「spawn 务必带 `--worktree`」。完整 `dirtyStrategy`(`require-clean` / `carry-stash`)、`linkFiles`、显式「移除 worktree」入口仍按 §1.3 后续补。

@@ -113,9 +113,9 @@ Synapse 后端提供 agent bus,而不是依赖某个 CLI 内部的 session 间�
 
 若未来选择由 Synapse 实现,这层 bus 应作为 Synapse 自有能力:第一版只需要支持 Claude -> Codex 的单向调度和结果回收,不要把生产路径押在 Codex 内部 experimental collab/subagent 协议上。Codex app-server 暴露的 `collabAgentToolCall`、`spawnAgent`、`sendInput` 等事件可以展示和研究,但暂不作为稳定控制面。
 
-### 1.3 任务 agent 的 worktree 隔离(设计,未实现)
+### 1.3 任务 agent 的 worktree 隔离(薄版本已落地,完整策略层未实现)
 
-> **状态**:`backend/worktree.ts` 与 policy 存储层**尚未落地**。Phase 1 收尾时评估「多子 agent 并行」不是近期需求,连同 §7 的未决项一起延后。当前从任务启动的子 agent 直接在传入 workspace 上跑(见 §5.2)。本节是待实现时的设计约束。
+> **状态**:`backend/worktree.ts` 已有**薄版本** —— `synapse agent spawn --worktree` 从干净 `HEAD` 拉一个 detached worktree 给子 agent(等价于下表 `ignore` 策略),解绑 / 任务归档时 `git worktree remove` 回收。完整的 `dirtyStrategy` 三策略选择、`linkFiles` 搬运、clone 变体、policy 存储层**仍未落地**。网页 UI 直接启动的子 agent(§5.2)也还没接 `--worktree`,仍直接在传入 workspace 上跑。本节其余部分是完整实现时的设计约束。
 
 从任务启动子 agent 时,让 agent 在一个独立的 `git worktree` 上工作,而非直接进主工作区 —— 多个子 agent 并行改同一个仓库、或用户自己正在主库里操作时,不互相踩。这一节定死这个机制在「主库 dirty」下的行为。
 
@@ -135,7 +135,7 @@ Synapse 后端提供 agent bus,而不是依赖某个 CLI 内部的 session 间�
 
 **worktree vs 本地 clone。** worktree 共享 `.git`,主库的 `git gc` / `git rebase` / 切分支会经 HEAD 引用、reflog 影响所有 worktree。agent 跑很久、或用户会在主库频繁操作时,`git clone --shared <repo> <path>`(甚至完整 `clone`)隔离性更好,代价是磁盘与 `npm install` 时间。子 agent 场景默认用 worktree(轻、快),clone 作为可选项留在这里。
 
-**清理。** worktree 目录 `~/.synapse/worktrees/<project>-<taskId>`,任务结束后**不自动删**(和 tmux pane 同样的处置原则:里面可能有未提交/未合并的产物)——UI 给一个显式的「移除 worktree」入口,执行 `git worktree remove` + 分支删除 + `carry-stash` 时提示主库残留的 stash。
+**清理。** worktree 目录 `~/.synapse/worktrees/<project>-<taskId>[-<binding 前缀>]`,完整设计里任务结束后**不自动删**(和 tmux pane 同样的处置原则:里面可能有未提交/未合并的产物)——UI 给一个显式的「移除 worktree」入口,执行 `git worktree remove` + 分支删除 + `carry-stash` 时提示主库残留的 stash。薄版本先跟随解绑 / 归档动作自动 `git worktree remove --force`(`AgentBinding.worktreePath` 记路径),显式入口留待完整实现。
 
 拟新增 `backend/worktree.ts`:
 
@@ -427,7 +427,7 @@ Project 分组默认展开,用户手动收起的记入 localStorage(键存收起
 
 **主 agent(启动路径已实现,受限 settings 未做 —— 见 `docs/design/main-agent-orchestration.md` 落地顺序第 3/4 步)。** 网页直接启动 tmux 主 agent,走 `TmuxTransport` **自建会话**模式(会话名 `synapse-main-<taskId>`),**不是**接管用户 pane —— 早期「`role:'main' + transport:'tmux'` 返回 400」的约束只针对接管模式,自建会话放开。`POST /api/tasks/:id/agents/start` 的 `role:'main'` 分支:`realpathSync` work dir(避开自建会话的信任对话框坑)、已有活跃 main binding → 409、`manager.create()` 注入 `SYNAPSE_TASK_ID` / `SYNAPSE_AGENT_BINDING` / `SYNAPSE_DATA_DIR` + 基线调度者 `appendSystemPrompt`、`agent_started` 事件、`send()` 首轮 prompt。详情页「启动主 agent」对话框(work dir + model)+ 绿卡「attach」动作(复制 `tmux attach -t synapse-main-<taskId>`)。**待做**:受限 `permissions`(第 4 步 —— 当前主 agent 有全套工具)、预检框的 `permissions` 预览、解绑 `tmux kill-session`、daemon 重启按会话名扫回。
 
-**未实现(子 agent + 主 agent 共通)。** worktree 隔离(`dirtyStrategy` 三策略)与 policy 存储层 —— agent 目前直接在传入工作区上跑,见 §1.3 / §7。对话框里的 worktree 策略选择、`--add-dir` 列表、「设为该工作区默认」也随之留白。
+**worktree 隔离(薄版本已落地)。** `synapse agent spawn --worktree` 让主 agent 分派的子 agent 在 `~/.synapse/worktrees/<slug>` 的独立 detached worktree 上跑(从干净 `HEAD`,`backend/worktree.ts`),解绑 / 归档时 `git worktree remove` 回收。**仍未实现**:`dirtyStrategy` 三策略选择与 policy 存储层、网页 UI 直接启动的子 agent 接 `--worktree`、预检框的 worktree 策略选择 / `--add-dir` 列表 / 「设为该工作区默认」。见 §1.3 / §7。
 
 运行中的会话不进入这个流程 —— 无法改 system prompt,唯一「动态」的手段是往对话里 `send()` 一条要求消息,效果弱且会污染时间线,不作为正式路径。
 
@@ -460,7 +460,7 @@ tmux agent 卡片:会话 `exited` 且 `transport === 'tmux'` 时状态标「pane
 - **中断能力** — `interrupt()` 目前发 SIGINT,stream-json 下的正确中断方式尚未实测确认,可能会终止整个会话。
 - **崩溃恢复** — 后端退出会带走所有子进程。`--resume <session_id>` 可恢复对话上下文,但不恢复进行中的轮次。恢复流程尚未设计。
 - **stream-json 会话的进程存活** — tmux 会话在后端重启后可重新探活接管(`notes/implementation-lessons.md`),stream-json 子进程随后端退出而消失(见「崩溃恢复」),这层还没补。
-- **任务 agent 的 worktree 隔离** — 设计见 §1.3,预检步见 §5.2;`backend/worktree.ts` 与 policy 存储层未实现,Phase 1 收尾时评估「多子 agent 并行」非近期需求而延后。**但主 agent 调度上线后这条已经在阻塞**:两个任务各自的主 agent 同时跑,子 agent 的改动写进同一工作树、缠在一起没法按任务提交(实测,见 `notes/implementation-lessons.md`「并行主 agent 共用同一工作树」)。近期止血:`synapse agent spawn` 加 `--worktree` 让主 agent 每子任务开一个独立 worktree(见 `docs/design/main-agent-orchestration.md` 落地顺序第 6 步),不必等完整 `dirtyStrategy`。
+- **任务 agent 的 worktree 隔离** — 薄版本已落地:`synapse agent spawn --worktree`(`backend/worktree.ts`,从干净 `HEAD` 的 detached worktree,解绑 / 归档时回收),止住了「两个任务的主 agent 并行 → 子 agent 改动缠进同一工作树」(实测,见 `notes/implementation-lessons.md`「并行主 agent 共用同一工作树」)。**仍未实现**:`dirtyStrategy` 三策略与 policy 存储层、网页 UI 直接启动子 agent 接 `--worktree`、预检步的策略选择(§5.2)。设计见 §1.3,落地顺序见 `docs/design/main-agent-orchestration.md` 第 6 步。
 - **Artifacts 采集** — §0.2 定了落盘路径规范,§5 的 Artifacts 页签在位,但后端未采集会话产出物,页签暂空。
 - **主 agent 调度** — 设计见 `docs/design/main-agent-orchestration.md`(交互协议已定:每次 `synapse agent` 调用是短请求,`poll --since <seq>` 拿增量事件,`await` 的轮询在 CLI 侧、退出码 `0/10/11/20`)。待实现:`TaskEvent.seq` 自增、`turn_end` 的结论/改动文件带进 `TaskEvent.data`、daemon 重启窗口内漏记 turn 的对账。
 - **`synapse agent` 子命令** — §0.1 的 `agent` 分支(daemon HTTP 瘦客户端)。`wrapper` → `synapse` 的代码 sweep 已完成;`agent` 分发与端点见 `docs/design/main-agent-orchestration.md` 落地顺序。

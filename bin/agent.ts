@@ -179,9 +179,12 @@ async function cmdContext(conn: Conn): Promise<void> {
   }
 }
 
+/** 布尔 flag(没有值,出现即 true)。其它 flag 都是 `--key value` / `--key=value`。 */
+const BOOL_FLAGS = new Set(['worktree']);
+
 /**
- * 摘出 `--key value` 与 `--key=value` 形式的 flag,余下的当位置参数。
- * synapse agent 的子命令不需要更复杂的解析(没有 short flag、没有布尔 flag)。
+ * 摘出 `--key value` / `--key=value` 形式的 flag(BOOL_FLAGS 里的不带值),
+ * 余下的当位置参数。synapse agent 的子命令不需要更复杂的解析(没有 short flag)。
  */
 function parseFlags(argv: string[]): { flags: Record<string, string>; positional: string[] } {
   const flags: Record<string, string> = {};
@@ -192,6 +195,8 @@ function parseFlags(argv: string[]): { flags: Record<string, string>; positional
       const eq = a.indexOf('=');
       if (eq !== -1) {
         flags[a.slice(2, eq)] = a.slice(eq + 1);
+      } else if (BOOL_FLAGS.has(a.slice(2))) {
+        flags[a.slice(2)] = 'true';
       } else {
         const v = argv[i + 1];
         if (v === undefined || v.startsWith('--')) die(`${a} 需要一个值`);
@@ -220,7 +225,9 @@ async function cmdSpawn(conn: Conn, argv: string[]): Promise<void> {
   }
   if (flags.prompt) body.prompt = flags.prompt;
   if (flags.model) body.model = flags.model;
-  if (flags.strategy) body.strategy = flags.strategy; // 第 6 步才实现,后端暂忽略
+  // --worktree:子 agent 在独立 git worktree 上跑,不进主工作区(spec §1.3)。
+  // 并行子任务的改动因此不缠在一起、能按任务提交。返回的 workspace 是 worktree 路径。
+  if (flags.worktree) body.worktree = true;
 
   const out = await apiPost<{ bindingId: string; workspace: string }>(
     conn,
@@ -320,9 +327,11 @@ export async function agentMain(argv: string[]): Promise<void> {
   context   打印当前任务的 work dir / 目标 / 验收 / 每个子 agent 的状态行。
             主 agent 每次决策前先拉一次 —— 这是它的唯一真相源。
 
-  spawn --workspace <dir> [--handoff <file>] [--prompt <text>] [--model <m>]
+  spawn --workspace <dir> [--handoff <file>] [--prompt <text>] [--model <m>] [--worktree]
             起一个 stream-json 子 agent,--handoff 文件内容拼进它的首轮 prompt。
             立即返回新 binding id(NDJSON 一行),不等子 agent 干完。
+            --worktree:子 agent 在独立 git worktree 上跑(从干净 HEAD),
+            返回的 workspace 是 worktree 路径;解绑 / 任务归档时自动回收。
 
   poll <bindingId> [--since <seq>]
             打印该子 agent 自 <seq>(不含)以来的事件,每条一行 NDJSON,

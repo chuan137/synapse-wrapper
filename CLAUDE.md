@@ -7,9 +7,9 @@ Synapse Wrapper 是用于驱动 Claude Code 多工作区会话的生产级 Web �
 调度用 `synapse agent {context,spawn,poll,await}` 子命令,不用 MCP(spec §1.5)。
 所有 agent 共用同一个 git 工作树,子 agent 直接在传入 workspace 上改文件会和
 并行任务的改动缠在一起、没法按任务提交 —— **子 agent 要在独立 git worktree 上
-工作**:`spawn` 的 worktree 隔离见 spec §1.3;它在 CLI 里落地前(见
-`docs/design/main-agent-orchestration.md` 落地顺序第 6 步),主 agent 自己
-`git worktree add` 再把新路径传 `--workspace`,事后 `git worktree remove` 合回。
+工作**:`synapse agent spawn --worktree`(`backend/worktree.ts`,从干净 `HEAD`
+的 detached worktree,解绑 / 归档时自动回收)。完整的 `dirtyStrategy` 三策略见
+spec §1.3,尚未落地。
 
 ## 注释规范
 

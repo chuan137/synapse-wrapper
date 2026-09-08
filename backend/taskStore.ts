@@ -68,6 +68,12 @@ export interface AgentBinding {
   transportKind: AgentTransportKind;
   createdAt: number;
   endedAt: number | null;
+  /**
+   * 子 agent 隔离用的 git worktree 绝对路径(`synapse agent spawn --worktree`,
+   * spec §1.3 的薄版本)。解绑 / 归档时据此 `git worktree remove`。直接进主
+   * 工作区的 agent 为 null。
+   */
+  worktreePath: string | null;
 }
 
 export interface TaskEvent {
@@ -112,6 +118,8 @@ export interface AttachAgentInput {
    * 就已 spawn —— 调用方先生成 id、注入、再带着同一个 id attach。
    */
   id?: string;
+  /** 子 agent 隔离 worktree 的路径,见 AgentBinding.worktreePath。 */
+  worktreePath?: string | null;
 }
 
 export interface AppendTaskEventInput {
@@ -169,7 +177,11 @@ export class TaskStore {
         version: 1,
         projects: parsed.projects ?? [],
         tasks: parsed.tasks ?? [],
-        agentBindings: parsed.agentBindings ?? [],
+        // 旧 binding 没有 worktreePath 字段 —— 补 null(它们没走 --worktree)。
+        agentBindings: (parsed.agentBindings ?? []).map((b) => ({
+          ...b,
+          worktreePath: b.worktreePath ?? null,
+        })),
         events,
         // 旧文件没有 eventSeq —— 从已有事件的最大 seq 恢复(升级前的事件没 seq
         // 字段,按 0 计);之后每次 append 都 +1 并落盘,不再回落到这条路径。
@@ -328,6 +340,7 @@ export class TaskStore {
       transportKind: input.transportKind,
       createdAt: now,
       endedAt: null,
+      worktreePath: input.worktreePath ?? null,
     };
     this.#data.agentBindings.push(binding);
     this.#save();

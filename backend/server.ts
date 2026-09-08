@@ -21,6 +21,13 @@ import {
   writeState, clearState, readOrCreateToken, writeHookSettings, hookSettingsPath,
   migrateLegacyStateDir, DEFAULT_PORT, MAX_PORT_TRIES, SYNAPSE_DIR,
 } from './daemon.ts';
+import { repoRootOf, addWorktree, removeWorktree } from './worktree.ts';
+
+/** Project.name → worktree 目录名的安全 slug:空白转 -,去掉路径分隔与 . 前缀。 */
+function projectSlug(name: string | undefined): string {
+  const s = (name ?? 'project').replace(/[/\\]+/g, '-').replace(/\s+/g, '-').replace(/^\.+/, '');
+  return s || 'project';
+}
 
 // 旧版按端口分子目录,现在扁平放数据目录根 —— 升级后首次启动搬一次(见 daemon.ts)。
 migrateLegacyStateDir();
@@ -470,7 +477,7 @@ app.post('/api/tasks/from-session', (req, res) => {
 const TASK_STATUSES = new Set(['todo', 'running', 'waiting', 'blocked', 'done', 'archived']);
 const TASK_PRIORITIES = new Set(['low', 'normal', 'high']);
 
-app.patch('/api/tasks/:id', (req, res) => {
+app.patch('/api/tasks/:id', async (req, res) => {
   if (!checkOrigin(req, res)) return;
   const before = tasks.getTask(String(req.params.id));
   if (!before) {
@@ -488,6 +495,19 @@ app.patch('/api/tasks/:id', (req, res) => {
 
   const statusChanged = patch.status !== undefined && patch.status !== before.status;
   const task = tasks.updateTask(before.id, patch);
+
+  // 归档任务:回收所有 --worktree 子 agent 的隔离目录(spec §1.3 落地顺序第 6 步
+  // 「任务归档时 git worktree remove」)。
+  if (statusChanged && task.status === 'archived') {
+    for (const binding of tasks.listBindings(task.id)) {
+      if (binding.worktreePath) {
+        await removeWorktree(binding.worktreePath).catch((err) =>
+          console.error('[worktree] 归档清理失败:', err),
+        );
+      }
+    }
+  }
+
   if (statusChanged) {
     tasks.appendEvent({
       taskId: task.id,
@@ -586,25 +606,51 @@ async function spawnSubAgent(
     appendSystemPrompt?: string;
     firstPrompt: string;
     transport?: 'tmux' | 'stream-json';
+    /** `synapse agent spawn --worktree` —— 在独立 git worktree 上跑,不进主工作区。 */
+    worktree?: boolean;
+    project?: Project;
   },
 ): Promise<AgentBinding> {
-  const s = await manager.create(opts.workspace, {
-    transport: opts.transport ?? 'stream-json',
-    model: opts.model,
-    appendSystemPrompt: opts.appendSystemPrompt,
-  });
+  // worktree 目录名要 binding 前缀,而 binding 在 manager.create 之后才 attach ——
+  // 和主 agent 路径一样预生成 id,注入 + worktree 命名 + attach 用同一个。
+  const bindingId = randomUUID();
+
+  let cwd = opts.workspace;
+  let worktreePath: string | null = null;
+  if (opts.worktree) {
+    const repoRoot = await repoRootOf(opts.workspace);
+    worktreePath = await addWorktree(repoRoot, projectSlug(opts.project?.name), task.id, bindingId);
+    cwd = worktreePath;
+  }
+
+  let s: Awaited<ReturnType<typeof manager.create>>;
+  try {
+    s = await manager.create(cwd, {
+      transport: opts.transport ?? 'stream-json',
+      model: opts.model,
+      appendSystemPrompt: opts.appendSystemPrompt,
+    });
+  } catch (err) {
+    // 会话没起来就别留一个孤儿 worktree —— 回滚再把错抛给端点。
+    if (worktreePath) await removeWorktree(worktreePath).catch(() => {});
+    throw err;
+  }
   const binding = tasks.attachAgent({
     taskId: task.id,
+    id: bindingId,
     localId: s.localId,
     claudeId: s.claudeId,
     role: 'sub',
     transportKind: s.transportKind,
+    worktreePath,
   });
   tasks.appendEvent({
     taskId: task.id,
     agentBindingId: binding.id,
     kind: 'agent_started',
-    message: `启动子 agent(${opts.transport ?? 'stream-json'})于 ${opts.workspace}`,
+    message: worktreePath
+      ? `启动子 agent(${opts.transport ?? 'stream-json'})于 worktree ${worktreePath}`
+      : `启动子 agent(${opts.transport ?? 'stream-json'})于 ${opts.workspace}`,
   });
   manager.send(s.localId, opts.firstPrompt);
   return binding;
@@ -634,9 +680,9 @@ function spawnFirstPrompt(
 }
 
 /**
- * 主 agent 的 system prompt 基线(落地顺序第 3 步:只讲「该怎么做」)。
+ * 主 agent 的 system prompt 基线 —— 只讲「该怎么做」。
  *
- * 这段只是倾向 —— 真正兜住「不能做什么」的受限 permissions 是第 4 步。
+ * 这段只是倾向 —— 真正兜住「不能做什么」的受限 permissions 是落地顺序第 4 步。
  * 第 4 步落地后这里会补上受限说明和 `synapse agent doc` 流程。
  */
 function mainAgentPrompt(project: Project | undefined, task: Task): string {
@@ -653,9 +699,16 @@ function mainAgentPrompt(project: Project | undefined, task: Task): string {
     '',
     '调度用 `synapse agent` 子命令(daemon HTTP 的瘦客户端,任务 id 已通过',
     '环境变量注入,无需手动传):',
-    '  synapse agent context   —— 打印 work dir / 目标 / 验收 / 每个子 agent 的状态。',
-    '                             每次决策前先拉一次,这是你的唯一真相源。',
-    '  (spawn / poll / await / doc 后续开放)',
+    '  synapse agent context',
+    '      打印 work dir / 目标 / 验收 / 每个子 agent 的状态。每次决策前先拉一次,',
+    '      这是你的唯一真相源。',
+    '  synapse agent spawn --workspace <dir> [--handoff <file>] [--prompt <text>] --worktree',
+    '      起一个子 agent,立即返回 binding id。**务必带 --worktree** —— 子 agent 在',
+    '      独立 git worktree 上跑,并行子任务的改动才不会缠在一起、能按任务提交。',
+    '  synapse agent await <bindingId> [--timeout <秒>]',
+    '      阻塞到该子 agent 本轮结束(退出码 0)或异常退出(10),打印它的结论。',
+    '  synapse agent poll <bindingId> [--since <seq>]',
+    '      要并行等多个子 agent 时,用它自己轮询,不用 await。',
     '',
     '现在:先跑 `synapse agent context` 看清任务全貌,再规划子任务拆解。',
   ].join('\n');
@@ -795,7 +848,9 @@ app.post('/api/tasks/:id/agents/start', async (req, res) => {
  *  - `handoff` 是 CLI 侧读出的文件内容,替换 subAgentPrompt 的模板拼进首轮 prompt
  *  - 返回 `{ bindingId, workspace }`,不是 taskDetail —— 主 agent 只要这个 id 去 poll
  *
- * `strategy`(worktree 隔离,spec §1.3)本步不实现,收下即忽略 —— 落地顺序第 6 步。
+ * `worktree: true`(`synapse agent spawn --worktree`)让子 agent 在独立 git
+ * worktree 上跑(spec §1.3 的薄版本 = `ignore` 策略,见 backend/worktree.ts)。
+ * 返回的 `workspace` 是 worktree 路径。完整 `dirtyStrategy` 仍留 §1.3 后续。
  */
 app.post('/api/tasks/:id/agents/spawn', async (req, res) => {
   if (!checkOrigin(req, res)) return;
@@ -814,6 +869,7 @@ app.post('/api/tasks/:id/agents/spawn', async (req, res) => {
   const model = typeof b.model === 'string' && b.model.trim() ? b.model.trim() : undefined;
   const handoff = typeof b.handoff === 'string' ? b.handoff : undefined;
   const prompt = typeof b.prompt === 'string' ? b.prompt : undefined;
+  const worktree = b.worktree === true;
 
   if (!handoff?.trim() && !prompt?.trim() && !task.goal.trim()) {
     res.status(400).json({ error: '需要 handoff 文件、prompt,或先给任务填写目标' });
@@ -825,9 +881,11 @@ app.post('/api/tasks/:id/agents/spawn', async (req, res) => {
     const binding = await spawnSubAgent(task, {
       workspace,
       model,
+      worktree,
+      project,
       firstPrompt: spawnFirstPrompt(project, task, workspace, handoff, prompt),
     });
-    res.json({ bindingId: binding.id, workspace });
+    res.json({ bindingId: binding.id, workspace: binding.worktreePath ?? workspace });
   } catch (err) {
     res.status(500).json({ error: String(err instanceof Error ? err.message : err) });
   }
@@ -861,7 +919,7 @@ app.get('/api/tasks/:id/agents/:bindingId/events', (req, res) => {
   res.json({ events, cursor });
 });
 
-app.delete('/api/tasks/:id/agents/:bindingId', (req, res) => {
+app.delete('/api/tasks/:id/agents/:bindingId', async (req, res) => {
   if (!checkOrigin(req, res)) return;
   const task = tasks.getTask(String(req.params.id));
   const binding = tasks.getBinding(String(req.params.bindingId));
@@ -877,6 +935,13 @@ app.delete('/api/tasks/:id/agents/:bindingId', (req, res) => {
     kind: 'agent_detached',
     message: '解除 agent 绑定',
   });
+  // --worktree 起的子 agent:解绑时移除隔离 worktree(spec §1.3「清理」的薄版本
+  // —— 完整设计是不自动删、给 UI 显式入口,这里先跟随解绑动作)。
+  if (binding.worktreePath) {
+    await removeWorktree(binding.worktreePath).catch((err) =>
+      console.error('[worktree] 移除失败:', err),
+    );
+  }
   res.json({ ok: true });
 });
 
