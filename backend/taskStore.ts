@@ -307,6 +307,11 @@ export class TaskStore {
     return this.#data.agentBindings.find((b) => b.id === bindingId);
   }
 
+  /** 所有 active 绑定(endedAt === null),跨 task —— daemon 重启后主 agent 扫回对账用。 */
+  activeBindings(): AgentBinding[] {
+    return this.#data.agentBindings.filter((b) => b.endedAt === null);
+  }
+
   /** 该会话当前的 active 绑定(endedAt === null),任意 task。 */
   bindingForSession(localId: string): AgentBinding | undefined {
     return this.#data.agentBindings.find((b) => b.localId === localId && b.endedAt === null);

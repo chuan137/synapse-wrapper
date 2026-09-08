@@ -121,6 +121,53 @@ export function hookSettingsPath(): string {
 }
 
 /**
+ * 主 agent 专属的受限 settings 文件路径。只发给 role:'main' 的会话,
+ * 叠在共用 hooks.settings.json 之后(--settings 可传多个,叠加,见 spec §3.1)。
+ */
+export function mainAgentSettingsPath(): string {
+  return join(SYNAPSE_DIR, 'main-agent.settings.json');
+}
+
+/**
+ * 写入主 agent 的受限 settings —— 只有 permissions,内容固定,启动时写一遍即可。
+ *
+ * 主 agent 是完整的 Claude 会话,默认手握全套工具。靠 --append-system-prompt 讲
+ * 「你只是调度者」没有强制力,它随时可能顺手改代码、或用原生 Task 绕开
+ * `synapse agent spawn`(那些子代理不进任务视图、不受 worktree 隔离、不进事件
+ * 日志)。真正的约束落在这里:
+ *
+ * - allow 是能力全集:调度(synapse agent)+ 只读观测(git 只读子命令、Read、rg)。
+ *   主 agent 想推进任务,唯一出口是 `synapse agent spawn`。
+ * - Bash 是白名单不是黑名单 —— 黑名单挡不住 `python -c "open(...,'w')"` 这类绕过
+ *   Write 的写法。deny 里的 Write/Edit 等是「即使将来有人往 allow 加了通配也要挡住」
+ *   的第二道;主防线是「不在 allow 里的 Bash 一律不自动放行」。
+ * - 白名单外的 Bash 会卡住,这是有意的 fail-safe:主 agent 会话按 spec §2.1 默认
+ *   (PreToolUse 只拦 AskUserQuestion),未 allow 的 Bash 交回 Claude Code 内置权限,
+ *   default 模式下弹终端确认 —— 自建 tmux 会话默认没人 attach,确认没人点,命令挂住。
+ *   卡住比放行安全,且主 agent 本就不该跑白名单外的命令。
+ * - attach 进主 agent 会话的用户手敲的命令同样受这份约束(Claude Code 不区分来源)——
+ *   接受的取舍:主 agent 会话是只读调度控制台,想手动干活另开普通 synapse 会话。
+ */
+export function writeMainAgentSettings(): string {
+  const path = mainAgentSettingsPath();
+  const settings = {
+    permissions: {
+      allow: [
+        'Bash(synapse agent:*)',
+        'Bash(git log:*)', 'Bash(git status:*)', 'Bash(git diff:*)', 'Bash(git show:*)',
+        'Bash(git branch:*)', 'Bash(git worktree list:*)',
+        'Bash(ls:*)', 'Bash(cat:*)', 'Bash(rg:*)', 'Bash(find:*)',
+        'Read(**)',
+      ],
+      deny: ['Write(**)', 'Edit(**)', 'NotebookEdit(**)', 'Task', 'WebFetch', 'WebSearch'],
+    },
+  };
+  mkdirSync(SYNAPSE_DIR, { recursive: true, mode: 0o700 });
+  writeFileSync(path, JSON.stringify(settings, null, 2), { mode: 0o600 });
+  return path;
+}
+
+/**
  * 写入 daemon 级 hook 配置。必须在 server.ts 确定「实际监听端口」之后调用 ——
  * 钩子 URL 里的端口写错等同 fail-open(见 §2.3/§6),所有工具无审批执行。
  * daemon 每次启动都重写一遍(幂等),顺带处理默认端口偶尔因占用而偏移的情况。

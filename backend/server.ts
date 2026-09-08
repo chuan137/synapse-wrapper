@@ -19,6 +19,7 @@ import { PermissionEngine, HOOK_TIMEOUT_S, type PendingApproval } from './permis
 import { TaskStore, tasksPath, type AgentBinding, type Project, type Task } from './taskStore.ts';
 import {
   writeState, clearState, readOrCreateToken, writeHookSettings, hookSettingsPath,
+  writeMainAgentSettings, mainAgentSettingsPath,
   migrateLegacyStateDir, DEFAULT_PORT, MAX_PORT_TRIES, SYNAPSE_DIR,
 } from './daemon.ts';
 import { repoRootOf, addWorktree, removeWorktree } from './worktree.ts';
@@ -60,6 +61,32 @@ const permissions = new PermissionEngine();
 // 任务存储落 <数据目录>/tasks.json —— 和 sessions.json 同目录(见 spec §1.4)。
 const tasks = new TaskStore(tasksPath());
 const stopLivenessWatch = manager.startLivenessWatch();
+
+/**
+ * daemon 重启后的主 agent 扫回对账。
+ *
+ * 网页自建的 tmux 主 agent 长命、扛 daemon restart —— SessionManager 的 tmux
+ * 扫回(#reclaimOwnTmuxSessions)按会话名 synapse-main-* 把还活着的接回来。
+ * 这里补对账那一面:扫回后仍是 exited 的 main binding(用户在重启窗口里
+ * kill 过会话),把 binding endedAt 落上,详情页显示「已退出」而不是永远
+ * 挂着一个连不上的主 agent。
+ */
+async function reconcileMainAgentsAfterRestart(): Promise<void> {
+  await manager.reclaimDone;
+  for (const b of tasks.activeBindings()) {
+    if (b.role !== 'main' || b.transportKind !== 'tmux') continue;
+    const s = manager.get(b.localId);
+    if (s && s.state !== 'exited') continue;  // 扫回接住了,还活着
+    tasks.detachAgent(b.id);
+    tasks.appendEvent({
+      taskId: b.taskId,
+      agentBindingId: b.id,
+      kind: 'agent_exited',
+      message: 'daemon 重启后未找到主 agent 的 tmux 会话',
+    });
+  }
+}
+void reconcileMainAgentsAfterRestart();
 
 const app = express();
 app.use(express.json({ limit: '10mb' }));
@@ -682,8 +709,9 @@ function spawnFirstPrompt(
 /**
  * 主 agent 的 system prompt 基线 —— 只讲「该怎么做」。
  *
- * 这段只是倾向 —— 真正兜住「不能做什么」的受限 permissions 是落地顺序第 4 步。
- * 第 4 步落地后这里会补上受限说明和 `synapse agent doc` 流程。
+ * 这段只是倾向。真正兜住「不能做什么」的是受限 permissions(daemon.ts
+ * writeMainAgentSettings:Bash 白名单、无 Write/Edit/Task)—— 两者配合,
+ * 不互相替代。`synapse agent doc` 流程留待落地顺序第 7 步。
  */
 function mainAgentPrompt(project: Project | undefined, task: Task): string {
   return [
@@ -696,6 +724,9 @@ function mainAgentPrompt(project: Project | undefined, task: Task): string {
     '',
     '你的职责:确定 work dir、把任务拆成子任务、分派给子 agent、跟踪进度。',
     '你自己不改代码 —— 所有文件改动交给你 spawn 的子 agent。',
+    '你的工具被限制过:只有 `synapse agent` 调度命令和只读观测(git 只读、Read、rg);',
+    '没有 Write / Edit,也不能用原生 Task 子代理(那些不进任务视图、不受 worktree',
+    '隔离)。白名单外的 Bash 会卡住 —— 那是有意的,不要尝试绕过。',
     '',
     '调度用 `synapse agent` 子命令(daemon HTTP 的瘦客户端,任务 id 已通过',
     '环境变量注入,无需手动传):',
@@ -783,6 +814,9 @@ app.post('/api/tasks/:id/agents/start', async (req, res) => {
         sessionId,
         model,
         appendSystemPrompt: mainAgentPrompt(project, task),
+        // 受限 permissions(Bash 白名单、无 Write/Edit/Task)叠在共用 hook 配置
+        // 之后 —— system prompt 只是倾向,这份才兜住「不能做什么」(spec §1.5)。
+        settingsPaths: [mainAgentSettingsPath()],
         env: {
           SYNAPSE_TASK_ID: task.id,
           SYNAPSE_AGENT_BINDING: bindingId,
@@ -928,12 +962,28 @@ app.delete('/api/tasks/:id/agents/:bindingId', async (req, res) => {
     return;
   }
   tasks.detachAgent(binding.id);
-  // 只解绑,不关会话 —— 用户的 tmux pane / 后台 worker 继续跑(方案 §366)。
+
+  // 网页自建的 tmux 主 agent(会话名 synapse-main-<taskId>):解绑 = kill-session。
+  // 自建会话没有「pane 归用户」的顾虑(那条原则只管接管用户 pane 的普通会话)。
+  // 普通 tmux 会话(synapse CLI 起的、接管 pane 的)解绑仍只断绑定不碰会话。
+  const s = manager.get(binding.localId);
+  const isOwnMainSession =
+    binding.role === 'main' &&
+    binding.transportKind === 'tmux' &&
+    s?.tmuxName === `synapse-main-${task.id}` &&
+    s?.paneId == null;
+  if (isOwnMainSession) {
+    await manager.stop(binding.localId, true).catch((err) =>
+      console.error('[main-agent] kill-session 失败:', err),
+    );
+  }
+
+  // 普通会话:只解绑,不关会话 —— 用户的 tmux pane / 后台 worker 继续跑(方案 §366)。
   tasks.appendEvent({
     taskId: task.id,
     agentBindingId: binding.id,
     kind: 'agent_detached',
-    message: '解除 agent 绑定',
+    message: isOwnMainSession ? '解除主 agent 绑定并关闭其 tmux 会话' : '解除 agent 绑定',
   });
   // --worktree 起的子 agent:解绑时移除隔离 worktree(spec §1.3「清理」的薄版本
   // —— 完整设计是不自动删、给 UI 显式入口,这里先跟随解绑动作)。
@@ -1125,6 +1175,8 @@ function listenWithRetry(port: number, triesLeft: number): void {
     // 钩子 URL 必须用实际监听端口(port),不是请求端口(PORT)——
     // 默认端口被占用递增后二者不等,写错等同 fail-open(见 §2.3/§6)。
     writeHookSettings(port);
+    // 主 agent 受限 settings 内容固定(不含端口),启动时写一遍即可 —— 幂等。
+    writeMainAgentSettings();
 
     console.log(`\n  Synapse`);
     console.log(`  钩子超时: ${HOOK_TIMEOUT_S}s(后端 fail-closed 兜底更短)`);

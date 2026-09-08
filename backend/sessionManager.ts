@@ -13,7 +13,7 @@
 import { randomUUID } from 'node:crypto';
 import { basename } from 'node:path';
 import { StreamJsonTransport } from './streamJson.ts';
-import { TmuxTransport, findClaimedPanes } from './tmuxTransport.ts';
+import { TmuxTransport, findClaimedPanes, tmuxSessionExists } from './tmuxTransport.ts';
 import { summarizeInput } from './risk.ts';
 import { transcriptPathFor, replayTranscript } from './transcript.ts';
 import { loadSessions, SessionStore } from './store.ts';
@@ -51,6 +51,13 @@ export interface CreateOptions {
    * 接管模式不生效 —— 那条路径的 claude 由 synapse CLI 启动,继承 CLI 的环境。
    */
   env?: Record<string, string>;
+  /**
+   * 追加的 --settings 路径,叠在共用 hook 配置之后(claude --settings 可传多个,
+   * 叠加,见 spec §3.1)。主 agent 用它挂受限 permissions(daemon.ts
+   * mainAgentSettingsPath)—— 普通会话不传,只吃共用那份 hook 配置。
+   * 接管模式不生效:那条路径的 claude 由 synapse CLI 启动。
+   */
+  settingsPaths?: string[];
 }
 
 /** 会话内累积的一次文件改动。 */
@@ -431,6 +438,8 @@ export class SessionManager {
   #listeners: ((e: ManagerEvent) => void)[] = [];
   #hookSettingsPath: string;
   #store: SessionStore;
+  /** 构造时启动的异步 tmux 扫回何时结束 —— server.ts 启动扫回据此对账 main binding。 */
+  readonly reclaimDone: Promise<void>;
 
   /**
    * hookSettingsPath 指向 daemon 级 hook 配置文件,所有会话经 --settings 共用 ——
@@ -445,7 +454,9 @@ export class SessionManager {
     // 立刻可用,tmux 接管会话的重新探活异步补上(见 #reclaimTmuxSessions)。
     // 空窗期内这些会话在网页上短暂显示"已退出" —— 存活巡检对 exited 会话
     // 直接跳过(#sweep 的 continue 条件),不会跟这里的异步重建产生竞态。
-    void this.#reclaimTmuxSessions();
+    this.reclaimDone = this.#reclaimTmuxSessions().catch((err) => {
+      console.error('[session] tmux 扫回失败:', err);
+    });
   }
 
   /**
@@ -463,6 +474,13 @@ export class SessionManager {
     const all = [...this.#sessions.values()].filter((s) => s.fromDisk && s.transportKind === 'tmux');
     if (!all.length) return;
 
+    await this.#reclaimOwnTmuxSessions(all);
+
+    // 自建会话(有 tmuxName、无 paneId)已由上面按名扫回,不能再进 pane 认领 ——
+    // findClaimedPanes 会查到它的 claude 进程所在 pane,把 s.paneId 填上就等于
+    // 把一个自建会话错当成接管模式,stop() 语义随之翻转(不再 kill-session)。
+    const paneOnly = all.filter((s) => !(s.tmuxName && !s.paneId));
+
     // 全局反查一次,同时喂给下面两处用途:paneId 缺失的补全,以及
     // paneId 已知的仍要核实 —— pane 容器还在不代表里面还是这个会话的 claude
     // 进程(用户可能已在 pane 内退出 claude 回到 shell,paneExists 单看
@@ -470,14 +488,14 @@ export class SessionManager {
     // 到 shell 提示符同样会被判定就绪 —— 见 daemon restart 后 exited 会话
     // 显示成 ready 的问题)。
     const claimed = await findClaimedPanes();
-    for (const s of all) {
+    for (const s of paneOnly) {
       if (!s.claudeId) continue;
       const pane = claimed.get(s.claudeId);
       if (!s.paneId) { if (pane) s.paneId = pane; continue; }
       if (pane !== s.paneId) s.paneId = null;  // pane 已不再跑这个会话,交回 exited
     }
 
-    const candidates = all.filter((s) => s.paneId);
+    const candidates = paneOnly.filter((s) => s.paneId);
     if (!candidates.length) return;
 
     await Promise.all(
@@ -501,6 +519,48 @@ export class SessionManager {
       }),
     );
     this.#store.scheduleSave();  // paneId 反查补全的结果落盘,下次重启不必再猜
+  }
+
+  /**
+   * 自建 tmux 会话(网页起的主 agent,会话名 synapse-main-*,无 paneId)的
+   * 重启扫回。和接管模式不同:锚点是会话名而非 pane —— `has-session -t <name>`
+   * 判在不在,在就用会话名重建 TmuxTransport(start() 里 #sessionExists 命中会
+   * 跳过创建,只 #waitReady + 接管转写文件)。会话已没(用户 kill 过)则维持
+   * exited,交给上层把 main binding endedAt(见 server.ts 启动扫回)。
+   *
+   * settingsPath / extraSettingsPaths 在这里给不给都不影响已恢复的会话 ——
+   * claude 早已带着启动时的 --settings 在跑,那个参数只在进程启动读一次。
+   */
+  async #reclaimOwnTmuxSessions(tmuxSessions: Session[]): Promise<void> {
+    const candidates = tmuxSessions.filter((s) => !s.paneId && s.tmuxName);
+    if (!candidates.length) return;
+
+    await Promise.all(
+      candidates.map(async (s) => {
+        if (!(await tmuxSessionExists(s.tmuxName!))) return;  // 会话已没,维持 exited
+
+        const transport = new TmuxTransport({
+          cwd: s.workspace,
+          settingsPath: s.settingsPath,
+          sessionName: s.tmuxName!,
+          sessionId: s.claudeId ?? undefined,
+        });
+        s.transport = transport;
+        s.fromDisk = false;
+        // #loadPersisted 把历史会话标成 exited;要接回一个还活着的会话,得先把
+        // state 退回 starting —— #absorb 的 status 分支只认 starting→ready 这条
+        // 迁移,exited 上不会因为 transport 再 emit ready 而恢复。
+        s.state = 'starting';
+        transport.onEvent((ev) => this.#absorb(s, ev));
+
+        try {
+          await transport.start();
+        } catch (err) {
+          console.error(`[session ${s.localId}] 重新接管 tmux 会话 ${s.tmuxName} 失败:`, err);
+          this.#markExited(s, '重新接管失败');
+        }
+      }),
+    );
   }
 
   /** 启动时把历史记录接回内存,标 exited(进程已经不在,只是记录还在)。 */
@@ -692,21 +752,25 @@ export class SessionManager {
       ? ['--append-system-prompt', opts.appendSystemPrompt]
       : [];
 
+    const extraSettings = opts.settingsPaths ?? [];
+
     const transport =
       kind === 'tmux'
         ? new TmuxTransport({
             cwd: workspace,
             settingsPath,
+            extraSettingsPaths: extraSettings,
             sessionName: opts.tmuxName,
             paneId: opts.paneId,
             sessionId: opts.sessionId,
-            // paneId 接管模式下 claude 由 CLI 启动,这两个参数只对自建会话生效。
+            // paneId 接管模式下 claude 由 CLI 启动,这些参数只对自建会话生效。
             extraArgs: sys,
             env: opts.env,
           })
         : new StreamJsonTransport({
             cwd: workspace,
             settingsPath,
+            extraSettingsPaths: extraSettings,
             extraArgs: [...(opts.model ? ['--model', opts.model] : []), ...sys],
           });
 
@@ -889,11 +953,14 @@ export class SessionManager {
    * 停掉会话进程但保留记录(标 exited)—— 用于任务子 agent:进程不再跑,
    * 但任务详情页仍要看到「这个 agent 跑过、改了什么、已停止」。
    * 与 close() 的区别是 close() 连记录一起摘除。已 exited 的会话直接返回。
+   *
+   * killSession 透传给 transport —— 主 agent 解绑时传 true,让自建 tmux 会话
+   * 一并 kill-session(自建会话没有「pane 归用户」的顾虑)。
    */
-  async stop(localId: string): Promise<void> {
+  async stop(localId: string, killSession = false): Promise<void> {
     const s = this.#sessions.get(localId);
     if (!s || s.state === 'exited') return;
-    await s.transport.stop();
+    await s.transport.stop(killSession);
     this.#markExited(s, '已手动停止');
   }
 
@@ -913,11 +980,20 @@ export class SessionManager {
    * 后端进程退出(SIGINT/SIGTERM)时调用 —— 只停子进程,记录留着标 exited。
    * 与 close() 语义不同:close() 是用户主动删除,这里是宿主进程退出,
    * 目的正是让下次启动时左栏仍能看到这些会话(持久化的意义所在)。
+   *
+   * tmux 会话不 #markExited —— 那个进程独立于 daemon 存活(§2.5),标 exited
+   * 只是误报,而且 #markExited 会 #emit('session_updated', exited),server.ts
+   * 的 endBindingForExited 监听器据此把该会话的 active binding endedAt 落盘,
+   * 相当于「daemon 重启」自己把主 agent 的绑定断了 —— 下一个进程的 tmux 扫回
+   * (#reclaimOwnTmuxSessions/#reclaimTmuxSessions)再怎么把会话接回来,binding
+   * 已经在旧进程退出前被断掉,补不回去。stream-json 子进程确实随 daemon 一起
+   * 死(§1 对照表),标 exited 才是准确描述。
    */
   async stopAll(): Promise<void> {
     await Promise.all(
       [...this.#sessions.values()].map(async (s) => {
         await s.transport.stop();
+        if (s.transportKind === 'tmux') return;
         this.#markExited(s, s.lastAction);
       }),
     );

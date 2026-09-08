@@ -13,6 +13,8 @@ import { EventEmitterBase, type SessionTransport } from './transport.ts';
 export interface StreamJsonOptions {
   cwd: string;
   settingsPath: string;
+  /** 追加的 --settings 路径,叠在 settingsPath 之后(claude 叠加多份,见 spec §3.1)。 */
+  extraSettingsPaths?: string[];
   /** 透传给 CLI 的额外参数(如 --model)。 */
   extraArgs?: string[];
 }
@@ -42,6 +44,7 @@ export class StreamJsonTransport extends EventEmitterBase implements SessionTran
       '--verbose',
       '--include-partial-messages',
       '--settings', this.#opts.settingsPath,
+      ...(this.#opts.extraSettingsPaths ?? []).flatMap((p) => ['--settings', p]),
       // headless 下没有终端弹批准框,PreToolUse hook 又只拦 AskUserQuestion
       // (daemon.ts APPROVAL_MATCHER),写文件的默认判断无处应答,子 agent 只能
       // 在对话里干问「approve?」并卡住。acceptEdits 放行文件编辑、Bash 等仍走

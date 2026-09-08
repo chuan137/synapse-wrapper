@@ -93,6 +93,19 @@ export async function paneExists(paneId: string): Promise<boolean> {
 }
 
 /**
+ * 指定名字的 tmux 会话是否还在。独立于任何 TmuxTransport 实例 —— 后端重启后
+ * 扫回自建的主 agent 会话(synapse-main-*)时,实例还不存在。
+ */
+export async function tmuxSessionExists(name: string): Promise<boolean> {
+  try {
+    await exec('tmux', ['has-session', '-t', name]);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * 反查每个 pane 里正在跑的 claude 进程,取其 --session-id。
  *
  * 兜底手段:PersistedSession.paneId 字段是后加的(见 spec §2.16),旧数据落盘
@@ -147,6 +160,12 @@ export async function findClaimedPanes(): Promise<Map<string, string>> {
 export interface TmuxOptions {
   cwd: string;
   settingsPath: string;
+  /**
+   * 追加的 --settings 路径,叠在 settingsPath 之后(claude 叠加多份,见 spec §3.1)。
+   * 仅自建会话模式生效 —— 接管模式下 claude 由 synapse CLI 启动,不经本类。
+   * 主 agent 的受限 permissions 走这里。
+   */
+  extraSettingsPaths?: string[];
   sessionName?: string;
   /**
    * 接管已有 pane(如 %3)而非新建会话 —— synapse 在用户当前 tmux 里就地启动
@@ -289,6 +308,7 @@ export class TmuxTransport extends EventEmitterBase implements SessionTransport 
         '-c', this.#opts.cwd,
         ...envArgs,
         'claude', '--settings', this.#opts.settingsPath,
+        ...(this.#opts.extraSettingsPaths ?? []).flatMap((p) => ['--settings', p]),
         ...idArgs,
         ...(this.#opts.extraArgs ?? []),
       ]);

@@ -62,8 +62,15 @@ export interface SessionTransport {
   /** 中断当前轮次。 */
   interrupt(): void;
 
-  /** 关闭会话并释放资源。 */
-  stop(): Promise<void>;
+  /**
+   * 关闭会话并释放资源。
+   *
+   * killSession 仅 tmux 自建会话有意义:true 时额外 `tmux kill-session`
+   * (主 agent 解绑走这条);默认 false —— tmux 会话存活于后端重启正是
+   * 选它的理由,stop() 通常只停观察不杀会话。接管模式下 pane 属于用户,
+   * killSession 无论真假都不会销毁它。
+   */
+  stop(killSession?: boolean): Promise<void>;
 
   /**
    * 承载体是否还在。
