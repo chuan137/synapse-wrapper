@@ -23,6 +23,7 @@ import {
   migrateLegacyStateDir, DEFAULT_PORT, MAX_PORT_TRIES, SYNAPSE_DIR,
 } from './daemon.ts';
 import { repoRootOf, addWorktree, removeWorktree } from './worktree.ts';
+import { readDoc, writeDoc, appendChangelog, ensureTasksRepo, DOC_KINDS, type DocKind } from './taskDocs.ts';
 
 /** Project.name → worktree 目录名的安全 slug:空白转 -,去掉路径分隔与 . 前缀。 */
 function projectSlug(name: string | undefined): string {
@@ -711,7 +712,7 @@ function spawnFirstPrompt(
  *
  * 这段只是倾向。真正兜住「不能做什么」的是受限 permissions(daemon.ts
  * writeMainAgentSettings:Bash 白名单、无 Write/Edit/Task)—— 两者配合,
- * 不互相替代。`synapse agent doc` 流程留待落地顺序第 7 步。
+ * 不互相替代。
  */
 function mainAgentPrompt(project: Project | undefined, task: Task): string {
   return [
@@ -740,8 +741,14 @@ function mainAgentPrompt(project: Project | undefined, task: Task): string {
     '      阻塞到该子 agent 本轮结束(退出码 0)或异常退出(10),打印它的结论。',
     '  synapse agent poll <bindingId> [--since <seq>]',
     '      要并行等多个子 agent 时,用它自己轮询,不用 await。',
+    '  synapse agent doc <handoff|progress|changelog>',
+    '      无 stdin 输入则读、有则写(整体替换;changelog 是追加)。落进独立',
+    '      synapse-tasks git repo,每次写入自动 commit。这是你写交接文档的唯一',
+    '      出口 —— 你没有 Write/Edit。写 / 更新前先加载 synapse-handoff skill',
+    '      (在这个 repo 的 .claude/skills/ 下,已通过 --add-dir 纳入)。',
     '',
-    '现在:先跑 `synapse agent context` 看清任务全貌,再规划子任务拆解。',
+    '现在:先跑 `synapse agent context` 看清任务全貌,再 `synapse agent doc handoff`',
+    '写初版交接文档,再规划子任务拆解并逐个 spawn 子 agent。',
   ].join('\n');
 }
 
@@ -808,6 +815,9 @@ app.post('/api/tasks/:id/agents/start', async (req, res) => {
     const sessionId = randomUUID();
 
     try {
+      // synapse-tasks repo 要在 --add-dir 之前存在 —— 不能指望第一次
+      // `synapse agent doc` 写入才 git init,那时主 agent 已经带着 --add-dir 起来了。
+      const tasksRepo = await ensureTasksRepo();
       const s = await manager.create(workspace, {
         transport: 'tmux',
         tmuxName: sessionName,
@@ -817,6 +827,9 @@ app.post('/api/tasks/:id/agents/start', async (req, res) => {
         // 受限 permissions(Bash 白名单、无 Write/Edit/Task)叠在共用 hook 配置
         // 之后 —— system prompt 只是倾向,这份才兜住「不能做什么」(spec §1.5)。
         settingsPaths: [mainAgentSettingsPath()],
+        // synapse-tasks 的 .claude/skills/synapse-handoff 只有纳入信任边界才会
+        // 被 Claude Code 加载 —— 主 agent 的 work dir 是用户仓库,不是这个 repo。
+        addDir: [tasksRepo],
         env: {
           SYNAPSE_TASK_ID: task.id,
           SYNAPSE_AGENT_BINDING: bindingId,
@@ -951,6 +964,73 @@ app.get('/api/tasks/:id/agents/:bindingId/events', (req, res) => {
   // 这批为空则 cursor 停在传入的 since —— 下次 poll 从同一处继续。
   const cursor = events.length ? events[events.length - 1]!.seq : since;
   res.json({ events, cursor });
+});
+
+/**
+ * 交接文档端点 —— `synapse agent doc` 的后端(落地顺序第 7 步)。主 agent 没有
+ * Write/Edit,读写 `synapse-tasks` repo 只能经这里;`:kind` 白名单挡掉畸形请求。
+ */
+app.get('/api/tasks/:id/docs/:kind', (req, res) => {
+  if (!checkOrigin(req, res)) return;
+  const task = tasks.getTask(String(req.params.id));
+  if (!task) {
+    res.status(404).json({ error: 'task 不存在' });
+    return;
+  }
+  const kind = String(req.params.kind);
+  if (!DOC_KINDS.includes(kind as DocKind)) {
+    res.status(400).json({ error: `未知文档类型: ${kind}` });
+    return;
+  }
+  const project = tasks.getProject(task.projectId);
+  res.json({ content: readDoc(project, task, kind as DocKind) });
+});
+
+app.put('/api/tasks/:id/docs/:kind', async (req, res) => {
+  if (!checkOrigin(req, res)) return;
+  const task = tasks.getTask(String(req.params.id));
+  if (!task) {
+    res.status(404).json({ error: 'task 不存在' });
+    return;
+  }
+  const kind = String(req.params.kind);
+  if (kind !== 'handoff' && kind !== 'progress') {
+    res.status(400).json({ error: `PUT 只接受 handoff / progress,changelog 用 POST 追加` });
+    return;
+  }
+  const body = typeof req.body?.content === 'string' ? req.body.content : '';
+  if (!body.trim()) {
+    res.status(400).json({ error: '内容不能为空' });
+    return;
+  }
+  const project = tasks.getProject(task.projectId);
+  try {
+    await writeDoc(project, task, kind, body);
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: String(err instanceof Error ? err.message : err) });
+  }
+});
+
+app.post('/api/tasks/:id/docs/changelog', async (req, res) => {
+  if (!checkOrigin(req, res)) return;
+  const task = tasks.getTask(String(req.params.id));
+  if (!task) {
+    res.status(404).json({ error: 'task 不存在' });
+    return;
+  }
+  const entry = typeof req.body?.content === 'string' ? req.body.content : '';
+  if (!entry.trim()) {
+    res.status(400).json({ error: '内容不能为空' });
+    return;
+  }
+  const project = tasks.getProject(task.projectId);
+  try {
+    await appendChangelog(project, task, entry);
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: String(err instanceof Error ? err.message : err) });
+  }
 });
 
 app.delete('/api/tasks/:id/agents/:bindingId', async (req, res) => {

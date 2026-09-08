@@ -7,7 +7,8 @@
  * —— 主 agent 启动时由 daemon 注入,不必手动传。
  *
  * `context` 是主 agent 的唯一真相源;`spawn` / `poll` / `await` 是调度链的三步
- * (起子 agent → 轮询它的事件 → 等它本轮结束)。`doc` 见后续步骤。
+ * (起子 agent → 轮询它的事件 → 等它本轮结束)。`doc` 读写交接文档
+ * (handoff/progress/changelog,落 synapse-tasks repo,见落地顺序第 7 步)。
  *
  * CLI 侧不维持长连接:每次调用都是一次短 HTTP 请求立即返回。`await` 的轮询
  * 循环跑在这个 CLI 进程里,不在 daemon 侧(设计文档「交互协议」是硬约束)。
@@ -74,11 +75,16 @@ async function apiGet<T>(conn: Conn, path: string): Promise<T> {
   return (await res.json()) as T;
 }
 
-async function apiPost<T>(conn: Conn, path: string, body: unknown): Promise<T> {
+async function apiWrite<T>(
+  conn: Conn,
+  method: 'POST' | 'PUT',
+  path: string,
+  body: unknown,
+): Promise<T> {
   let res: Response;
   try {
     res = await fetch(`${conn.base}${path}`, {
-      method: 'POST',
+      method,
       headers: {
         'content-type': 'application/json',
         'x-auth-token': conn.token,
@@ -91,6 +97,18 @@ async function apiPost<T>(conn: Conn, path: string, body: unknown): Promise<T> {
   }
   if (!res.ok) die(`daemon 返回 HTTP ${res.status}: ${(await res.text()).slice(0, 200)}`);
   return (await res.json()) as T;
+}
+
+async function apiPost<T>(conn: Conn, path: string, body: unknown): Promise<T> {
+  return apiWrite<T>(conn, 'POST', path, body);
+}
+
+/** 整段读 stdin —— `doc` 子命令用它判断"有输入就写、没有就读"(管道 / 重定向时非 TTY)。 */
+async function readStdin(): Promise<string> {
+  if (process.stdin.isTTY) return '';
+  const chunks: Buffer[] = [];
+  for await (const chunk of process.stdin) chunks.push(chunk as Buffer);
+  return Buffer.concat(chunks).toString('utf8');
 }
 
 interface PollBatch {
@@ -317,6 +335,37 @@ async function cmdAwait(conn: Conn, argv: string[]): Promise<never> {
   process.exit(AWAIT_EXIT.timeout);
 }
 
+const DOC_KINDS = new Set(['handoff', 'progress', 'changelog']);
+
+/**
+ * `synapse agent doc <kind>` —— stdin 有内容则写、无则读(见落地顺序第 7 步)。
+ * 主 agent 没有 Write/Edit,读写 handoff/progress/changelog 只能经这条通道
+ * (后端 taskDocs.ts 代写进 synapse-tasks repo + git commit)。
+ *
+ * handoff/progress 是整体替换(PUT),changelog 是追加(POST)—— 与后端端点
+ * 语义一致,这里不重复判断哪个方法对应哪个 kind,直接按 kind 分派。
+ */
+async function cmdDoc(conn: Conn, argv: string[]): Promise<void> {
+  const kind = argv[0];
+  if (!kind || !DOC_KINDS.has(kind)) {
+    die(`doc 需要 <kind>,可用: handoff / progress / changelog`);
+  }
+
+  const input = await readStdin();
+  if (!input.trim()) {
+    const out = await apiGet<{ content: string }>(conn, `/api/tasks/${conn.taskId}/docs/${kind}`);
+    console.log(out.content);
+    return;
+  }
+
+  if (kind === 'changelog') {
+    await apiWrite(conn, 'POST', `/api/tasks/${conn.taskId}/docs/changelog`, { content: input });
+  } else {
+    await apiWrite(conn, 'PUT', `/api/tasks/${conn.taskId}/docs/${kind}`, { content: input });
+  }
+  console.log(`${c.green('✓')} ${kind} 已更新`);
+}
+
 export async function agentMain(argv: string[]): Promise<void> {
   const sub = argv[0];
 
@@ -342,7 +391,12 @@ export async function agentMain(argv: string[]): Promise<void> {
             或 agent_exited(退出码 10)。--timeout 到点仍在跑退出码 11;
             daemon 连不上退出码 20。
 
-  (doc 见后续实现)
+  doc <handoff|progress|changelog>
+            stdin 有内容(管道 / 重定向)则写,没有则读并打印到 stdout。
+            handoff / progress 整体替换,changelog 追加一条。落进独立
+            synapse-tasks git repo(SYNAPSE_TASKS_REPO 覆盖路径),每次写入自动
+            commit。标记区(<!-- synapse:begin state -->…)由后端渲染,写入内容
+            请留在标记区外。
 
   任务 id 从 SYNAPSE_TASK_ID 环境变量取,daemon 地址从数据目录的 port/token 取
   —— 都由 daemon 起主 agent 时注入,无需手动传。
@@ -350,15 +404,16 @@ export async function agentMain(argv: string[]): Promise<void> {
     return;
   }
 
-  if (sub === 'context' || sub === 'spawn' || sub === 'poll' || sub === 'await') {
+  if (sub === 'context' || sub === 'spawn' || sub === 'poll' || sub === 'await' || sub === 'doc') {
     const conn = await connect();
     const rest = argv.slice(1);
     if (sub === 'context') return cmdContext(conn);
     if (sub === 'spawn') return cmdSpawn(conn, rest);
     if (sub === 'poll') return cmdPoll(conn, rest);
+    if (sub === 'doc') return cmdDoc(conn, rest);
     await cmdAwait(conn, rest);
     return;
   }
 
-  die(`未知子命令: ${sub} —— 可用: context / spawn / poll / await`);
+  die(`未知子命令: ${sub} —— 可用: context / spawn / poll / await / doc`);
 }

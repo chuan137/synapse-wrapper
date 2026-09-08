@@ -58,6 +58,13 @@ export interface CreateOptions {
    * 接管模式不生效:那条路径的 claude 由 synapse CLI 启动。
    */
   settingsPaths?: string[];
+  /**
+   * 仅 tmux 自建会话:`claude --add-dir <path>`,额外纳入信任边界的目录。
+   * 主 agent 用它把 `synapse-tasks` repo 带进来(那个目录的 `.claude/skills/`
+   * 才会被 Claude Code 加载,见 mainAgentPrompt 里的 synapse-handoff 提示)。
+   * 接管模式不生效:那条路径的 claude 由 synapse CLI 启动。
+   */
+  addDir?: string[];
 }
 
 /** 会话内累积的一次文件改动。 */
@@ -751,6 +758,7 @@ export class SessionManager {
     const sys = opts.appendSystemPrompt?.trim()
       ? ['--append-system-prompt', opts.appendSystemPrompt]
       : [];
+    const addDir = (opts.addDir ?? []).flatMap((d) => ['--add-dir', d]);
 
     const extraSettings = opts.settingsPaths ?? [];
 
@@ -764,7 +772,7 @@ export class SessionManager {
             paneId: opts.paneId,
             sessionId: opts.sessionId,
             // paneId 接管模式下 claude 由 CLI 启动,这些参数只对自建会话生效。
-            extraArgs: sys,
+            extraArgs: [...addDir, ...sys],
             env: opts.env,
           })
         : new StreamJsonTransport({
